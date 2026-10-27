@@ -362,3 +362,26 @@ func TestUserPromptOmitsRequestBlockWhenNil(t *testing.T) {
 		t.Fatalf("prompt 必须以事件块开头：\n%s", got)
 	}
 }
+
+// D1 的第一次真模型跑挂在 expectedDiff 的形状上：模型既没被告知必须含 field/from/to，
+// 也不知道字符串寻址得是三段（实测它写了 {op,note} 与裸主键）。把形状写进 system prompt
+// 并锁住——这是「D1 能不能开始判定」的前提，不是调参凑绿。
+func TestPromptStatesExpectedDiffShape(t *testing.T) {
+	p := systemPrompt()
+	for _, want := range []string{
+		"恰好含 entity、field、from、to",
+		`"module":"<模块id>","type":"<类型>","id":"<主键>"`,
+		`"<模块id>:<类型>/<主键>"`,
+		"只写主键",
+	} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("system prompt 缺少 %q——模型只能照着猜，最终撞 schema", want)
+		}
+	}
+	// system prompt 仍须保持静态：不得出现任何真实模块名或动作 id（动态清单只在 user prompt）。
+	for _, forbidden := range []string{"inventory", "procurement", "quote.", "DeductStock"} {
+		if strings.Contains(p, forbidden) {
+			t.Fatalf("system prompt 不许含业务标识 %q（否则可测性消失）", forbidden)
+		}
+	}
+}

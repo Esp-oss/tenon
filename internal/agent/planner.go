@@ -292,7 +292,11 @@ func systemPrompt() string {
    dependsOn 是前序 stepId 数组（无依赖写 []）；kind 只能是 read 或 write。
 6. action 只能取自输入里「可调动作」清单，逐字照抄，不得发明、不得猜测、不得改写。
    清单里没有的能力就是没有——不要用别的模块或别的命名去凑。
-7. expectedDiff 是数组，纯读计划可以是空数组；元素的 entity 用 module:Type/id 字符串或实体对象。
+7. expectedDiff 是数组，纯读计划可以是空数组；每个元素必须恰好含 entity、field、from、to 四个键，
+   不得追加 op、note 之类自造键。entity 是实体寻址，两种等价写法任选其一（<…> 是占位，照抄输入里的真实实体）：
+   {"module":"<模块id>","type":"<类型>","id":"<主键>"}   或   "<模块id>:<类型>/<主键>"
+   字符串形式必须是三段；只写主键（例 "STD-1001"）是错的。field 是被改的字段名，
+   from / to 是改前与改后的值（新建时 from 为 null，删除时 to 为 null）。
 8. dryRun.status 只能是 verified、unsafe、unsupported、pending 之一。
 9. estimatedRisk 只能是 low、medium、high；rationale 是一句人能读懂的理由，或 null。
 能力不足时：仍然输出一份只做清单内能力的计划；把「做不到的部分」写进 rationale，

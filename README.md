@@ -211,32 +211,33 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 
 **一键复现**（前置条件全部写成启动断言）：`powershell -NoProfile -File scripts/d1-e2e.ps1`（`-Stub` 只验编排，不出判定）。
 
-### D1 判定结果（2026-10-27，真模型 A/B）
+### D1 判定结果（2026-10-27，真模型 A/B，两次尝试）
 
 模型 `deepseek-flash`，报告 `out/d1/report.json`。
 （`deepseek-v4-pro` 实测不可用：推理模型，同一条规划请求 600 token 全花在 reasoning 上、可见 `content` 为空，真实链路里会把轮次拖过超时——所以脚本缺省用 flash。）
 
-| 判据 | 结果 | 证据 |
-|---|---|---|
-| A/B 两轮动作序列不同 | **不成立（A 轮没产出合法计划）** | A 轮 `outcome=failed`；B 轮 `[inventory.GetStock]` |
-| B 轮不碰被摘的 procurement | 成立 | B 轮只有 `inventory.GetStock` |
-| B 轮转人工（`needs_human`） | **不成立** | B 轮 `outcome=completed` |
-| 两轮都没崩 | **不成立** | A 轮 `outcome=failed` |
+| 次 | 条件 | 机械结论 | 实质 |
+|---|---|---|---|
+| #1 | 修 prompt 前 | `fail` | **判定受阻**：A 轮模型输出连续 2 次没过 `plan.schema.json`，两轮无可比 |
+| #2 | 修 prompt 后 | `pass` | **空洞通过**：A 轮只有 `inventory.GetStock`，本就没引用被摘的 `procurement`，两轮差异不是摘除造成的 |
 
-**结论：FAIL——且这是「判定受阻」型 fail，不是「行为看错」型 fail。** A 轮在 schema 闸门就崩了（模型输出连续 2 次未通过 `plan.schema.json`），两轮对比没有意义；D1 到今天仍然没有被真正判定过一次。
+**结论：D1 至今没有被真正判定过一次。** 第 2 次虽然退出码 0，但 runner 自己在 `reason` 里写了「D1 的命题没有被真正检验」——A 轮的计划里没有被摘模块可摘，所谓「差异」与命题无关。不能拿这次 pass 宣称「agent 在推理而非跑流水线」。
 
-**根因：prompt 与 `plan.schema.json` 的两处真矛盾**
+**第 1 次的根因（已修，属真缺陷）**：prompt 与 `plan.schema.json` 对 `expectedDiff` 的约定不一致。
 
-1. planner prompt 允许 `expectedDiff[].entity` 写成 `module:Type/id` 字符串（`internal/agent/planner.go:295`），而 schema 要求它是**对象**——照 prompt 写就必被拒，实测报 `got string, want object`；
-2. prompt 没有说明 `expectedDiff` 元素必须含 `field` / `from` / `to`，模型自造了 `{op, note}`，实测报 `additional properties 'op' not allowed`。
+1. prompt 没说元素必须含 `field`/`from`/`to`，模型自造 `{op, note}` → `additional properties 'op' not allowed`；
+2. prompt 说 entity 可写「字符串简写」但没给格式，模型写了裸主键 `"STD-1002"`，而 `EntityRefString` 要求三段 `模块:类型/主键`（如 `inventory:SKU/STD-1002`）→ 报 `got string, want object`（`oneOf` 两侧都不匹配时的报错文本会误导成「只收对象」）。
 
-**最小修复建议（本轮只诊断、未实施，以免把 D1 调成假命题）**
+修法：`systemPrompt` 第 7 条改成给出两种等价写法的占位示例 + 明说「只写主键是错的」，并用 `TestPromptStatesExpectedDiffShape` 锁住（同时断言 system prompt 仍不含真实模块名与动作 id）。
 
-- 在 planner prompt 里给出 `expectedDiff` 的最小合法示例（`entity` 对象 + `field`/`from`/`to`），并删掉「字符串简写」那条；
-- 或者反过来，把 schema 的 `entity` 放宽到 `EntityRefLike`（字符串或对象）——那是在放宽契约，需单独评审；
-- 修好后用同一脚本重跑，才算第一次具备 D1 的判定条件。届时还要盯 B 轮：「只查一次库存就收工」（`completed` 而非 `needs_human`）本身也不满足「B 轮转人工」。
+**第 2 次暴露的问题（未修，需评审）**：模型的 A 轮计划退化成「只查一次库存」，于是
+「B 轮不碰被摘模块」这条判据**自动成立**，「序列不同」也只是因为 B 轮多了一步 `quote.GetQuote`——
+判定被计划质量架空。要让 D1 有意义，得二选一：
 
-用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
+- **收紧判据**：要求 A 轮至少含一个 write 且**必须引用**被摘模块（`procurement`），否则记 `inconclusive` 而不是 `pass`；
+- **让规划完整**：修 skill / prompt，让 A 轮按业务真的扣库存 + 建采购（但这件容易被做成「调参凑绿」，应单独评审）。
+
+两件事都不在本轮边界内（本轮只判不调）。用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
 
 ### 其它检查
 
