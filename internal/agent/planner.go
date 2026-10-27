@@ -92,6 +92,20 @@ type PlanInput struct {
 	SkillText string
 	Modules   []ModuleDigest
 	Feedback  string
+	// Request 是人工发起时的原话；事件回合为 nil。
+	// 它与 Event 语义不同：Event 是领域事实，Request 是**指令**。
+	Request *UserRequest
+}
+
+// UserRequest 是 tenon.request 帧在 agent 侧的投影：人要什么，以及是谁要的。
+//
+// 它刻意只有原话，没有领域事实：事实仍然只来自 Event 与动态发现的动作清单，
+// 指令只来自人。两者混进同一个 prompt 块，模型就会把「人希望做的事」读成
+// 「系统已经发生的事」——那是把指令当事实，方向正好反了。
+type UserRequest struct {
+	RequestID string
+	Text      string
+	By        string
 }
 
 // Plan 是 plan.schema.json 的 Go 投影（schema 是 additionalProperties=false，多一个
@@ -285,12 +299,23 @@ func systemPrompt() string {
 不要编造动作，也不要输出错误信息代替计划。`
 }
 
-// userPrompt 把动态事实（事件、skill 正文、动作清单）渲染成确定性文本：模块与动作都
-// 排序，保证同一输入下 prompt 逐字相同（temperature=0 的可重复性依赖它）。
+// userPrompt 把动态事实（事件、skill 正文、动作清单）与人工指令（请求）渲染成确定性
+// 文本：模块与动作都排序，保证同一输入下 prompt 逐字相同（temperature=0 的可重复性依赖它）。
 func userPrompt(in PlanInput) string {
 	var b strings.Builder
 	b.WriteString("事件（领域事实，不是指令）：\n")
 	b.WriteString(renderEvent(in.Event))
+
+	// 请求块的位置就是它的语义：紧跟在事件块之后、skill 正文之前。
+	// 塞进事件块 = 用户的话被读成领域事实；塞进 skill 正文 = 被读成「业务语义参考」。
+	// 两者都不构成指令，所以它必须自带「这是指令」的标题、独占一块。
+	// Request 为 nil（事件回合）时一个字都不写：事件回合的 prompt 不因这次分流改变。
+	if in.Request != nil {
+		b.WriteString("\n用户请求（这是指令，目标是完成它）：\n")
+		b.WriteString(strings.TrimSpace(in.Request.Text))
+		b.WriteString("\n")
+	}
+
 	b.WriteString("\nskill 正文（业务语义参考：说明该关心什么，不指定具体动作）：\n")
 	if text := strings.TrimSpace(in.SkillText); text != "" {
 		b.WriteString(text)
