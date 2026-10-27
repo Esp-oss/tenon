@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -139,15 +140,18 @@ type Action struct {
 	Title   string `json:"title"`
 	// SummaryTemplate 是给人看的一句话模板（module-manifest / action schema 的可选字段）。
 	// 占位符只从本次 args 取值：它渲染的是「这一次要做什么」，不是动作说明书。
-	SummaryTemplate string           `json:"summaryTemplate,omitempty"`
-	Kind            string           `json:"kind"` // read | write
-	InputSchema     json.RawMessage  `json:"inputSchema"`
-	OutputSchema    json.RawMessage  `json:"outputSchema,omitempty"`
-	Risk            Risk             `json:"risk"`
-	Idempotency     *Idempotency     `json:"idempotency,omitempty"`
-	Compensation    *Compensation    `json:"compensation,omitempty"`
-	TimeoutMs       int              `json:"timeoutMs,omitempty"`
-	DryRun          DryRunCapability `json:"dryRun"`
+	SummaryTemplate string `json:"summaryTemplate,omitempty"`
+	// RequiredArgs 是「调起来至少要给哪些字段」，取自 InputSchema.required。
+	// 只给字段名不给类型：类型由模块侧入参校验兜住，agent 侧只需要知道必须写什么。
+	RequiredArgs []string         `json:"requiredArgs,omitempty"`
+	Kind         string           `json:"kind"` // read | write
+	InputSchema  json.RawMessage  `json:"inputSchema"`
+	OutputSchema json.RawMessage  `json:"outputSchema,omitempty"`
+	Risk         Risk             `json:"risk"`
+	Idempotency  *Idempotency     `json:"idempotency,omitempty"`
+	Compensation *Compensation    `json:"compensation,omitempty"`
+	TimeoutMs    int              `json:"timeoutMs,omitempty"`
+	DryRun       DryRunCapability `json:"dryRun"`
 }
 
 // Module 是一个模块的声明与回调集合。
@@ -460,10 +464,12 @@ type actionSummary struct {
 	Title   string `json:"title"`
 	// SummaryTemplate 必须出现在摘要线：agent 的能力发现只读这条（D15），
 	// 少了它，agent 每次渲染白话都要回拉完整 Action。
-	SummaryTemplate string           `json:"summaryTemplate,omitempty"`
-	Kind            string           `json:"kind"`
-	Risk            Risk             `json:"risk"`
-	DryRun          DryRunCapability `json:"dryRun"`
+	SummaryTemplate string `json:"summaryTemplate,omitempty"`
+	// RequiredArgs 同样走摘要线：规划 prompt 靠它写 args，等执行期才发现缺字段就太晚。
+	RequiredArgs []string         `json:"requiredArgs,omitempty"`
+	Kind         string           `json:"kind"`
+	Risk         Risk             `json:"risk"`
+	DryRun       DryRunCapability `json:"dryRun"`
 }
 
 type eventSummary struct {
@@ -542,6 +548,9 @@ func (m *Module) build() error {
 		required, err := requiredOf(a.InputSchema)
 		if err != nil {
 			return fmt.Errorf("action %q 的 inputSchema 不可用：%w", a.ID, err)
+		}
+		if err := checkRequiredArgs(a, required); err != nil {
+			return err
 		}
 		if len(bytes.TrimSpace(a.OutputSchema)) == 0 {
 			return fmt.Errorf("action %q 必须声明 outputSchema（action.schema.json 的 required）", a.ID)
@@ -641,6 +650,18 @@ func checkIdempotency(a *Action, required []string) error {
 		seen[f] = struct{}{}
 		if _, ok := requiredSet[f]; !ok {
 			return fmt.Errorf("action %q 的 idempotency.keyFields 含 %q，但它不在 inputSchema.required %v 里（semantics.md §5.3，C1 用例会断言这一点）", a.ID, f, required)
+		}
+	}
+	return nil
+}
+
+// checkRequiredArgs 把「声明与契约不一致」挡在启动期：requiredArgs 必须是
+// inputSchema.required 的子集。不挡的话，模块会装上一个 agent 永远规划不出
+// 合法 args 的动作——错误会推迟到执行期的 400，排障成本高一个数量级。
+func checkRequiredArgs(a *Action, required []string) error {
+	for _, name := range a.RequiredArgs {
+		if !slices.Contains(required, name) {
+			return fmt.Errorf("action %q 的 requiredArgs 含 %q，但它不在 inputSchema.required %v 里（声明与契约不一致）", a.ID, name, required)
 		}
 	}
 	return nil
@@ -835,7 +856,8 @@ func (h *handler) serveManifest(w http.ResponseWriter, r *http.Request) {
 		a := &m.Actions[i]
 		out.Actions = append(out.Actions, actionSummary{
 			ID: a.ID, Version: a.Version, Title: a.Title, Kind: a.Kind,
-			Risk: a.Risk, DryRun: a.DryRun, SummaryTemplate: a.SummaryTemplate,
+			Risk: a.Risk, DryRun: a.DryRun,
+			SummaryTemplate: a.SummaryTemplate, RequiredArgs: a.RequiredArgs,
 		})
 	}
 	for _, ev := range m.Events {

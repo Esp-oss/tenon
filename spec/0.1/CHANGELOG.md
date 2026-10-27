@@ -75,6 +75,7 @@
 - `approval.json` 与平台 `config/policies*.json` **同 schema、同加载器、同池合并**（先按 `outcome` 强弱，同 outcome 内按 `priority`），**不设文件级覆盖**。因此业务级规则**只能收紧、不能放宽**：平台若有「该动作一律 approve」，业务级写 auto 是无效的。
 - 加载期校验：`arg.*` 必须存在于该动作 `inputSchema.properties`（只比首段）；`risk.*` 必须存在于动作声明的 `risk`；规则还要**试编译**一次（未知算子/非法路径语法在此暴露，按 skill 粒度整份丢弃，而不是让整个宿主起不来）。业务级文件**必须写明 `match.actions`**——模块级规则的覆盖面无法枚举，其 `arg.*` 无从校验，一律拒收。
 - `module-manifest.schema.json` 的 action 增可选 `summaryTemplate`（人话模板，占位符取自 `args`），供渲染「从标准件仓扣掉 12 件」这类白话；`title` 早已是必填项，本轮未改。
+- `module-manifest.schema.json` 与 `action.schema.json` 的 action 增可选 `requiredArgs`（**必填字段名**数组，取自 `inputSchema.required`）。它只给字段名、不给类型：agent 的规划 prompt 需要它才能写出合法 `args`（2026-10-27 真模型实测：漏 `referenceNo` 导致预演 400 `SCHEMA_MISMATCH`）。模块加载期断言 `requiredArgs ⊆ inputSchema.required`，声明与契约不一致即启动失败（与 `idempotency.keyFields` 同源）。
 - **威胁模型变化**：规则放进 `skills/` 等于「改文档即改权限」，需要 CODEOWNERS + review 或只读挂载。
 
 ## 0.1.0 - 2026-10-27

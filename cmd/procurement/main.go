@@ -78,6 +78,7 @@ func createPurchaseRequestAction() module.Action {
 		Version:         "0.1.0",
 		Title:           "创建采购申请",
 		SummaryTemplate: "缺 {qty} 件 {sku}，发起采购申请（单据 {referenceNo}）",
+		RequiredArgs:    []string{"sku", "qty", "referenceNo"},
 		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",

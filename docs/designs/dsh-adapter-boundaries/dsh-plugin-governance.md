@@ -1,3 +1,5 @@
+> **状态：未实现（占位包的职责边界；M2 之后按 [ADR-0001](../../adr/0001-driver-dsh-vs-go.md) §6 重建）。**
+> 本文件原在 `packages/<pkg>/README.md`。ADR-0001 删除无 `src` 的占位包，但保留职责边界——实现时按本文件重建，不要照抄目录结构。
 # @tenon/dsh-plugin-governance
 
 治理控制平面（§7）：模块 / agent 注册、Grant 授权矩阵、Policy 引擎、Approval、审计存储与查询、对账 job。与运行时无关，可被任意宿主复用。

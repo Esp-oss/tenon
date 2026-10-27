@@ -72,11 +72,12 @@ type LLMClient interface {
 	ChatJSON(ctx context.Context, system, user string) ([]byte, error)
 }
 
-// ActionMeta 是渲染白话所需的最小信息：标题（R2 兜底）与模板（R1 主路径）。
-// 它随能力发现一起回来，**不进 prompt**——模板是给人看的，不是给模型的指令。
+// ActionMeta 是渲染白话与规划 prompt 所需的最小信息：标题、白话模板、必填字段名。
+// 它随能力发现一起回来，模板那部分给人看，标题与必填字段给模型看。
 type ActionMeta struct {
 	Title           string
 	SummaryTemplate string
+	RequiredArgs    []string
 }
 
 // ModuleDigest 是一个**可达**模块的动作清单摘要。
@@ -348,7 +349,7 @@ func userPrompt(in PlanInput) string {
 			continue
 		}
 		for _, a := range sortedActions(m.Actions) {
-			fmt.Fprintf(&b, "    - %s\n", a)
+			fmt.Fprintf(&b, "    - %s%s\n", a, actionMetaSuffix(m.ActionMeta[a]))
 		}
 	}
 	b.WriteString("\n请只输出一个 JSON 对象：plan.schema.json 定义的 Plan。steps 里每个 action 都必须逐字来自上面的清单。\n")
@@ -358,6 +359,25 @@ func userPrompt(in PlanInput) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// actionMetaSuffix 渲染「（标题；必填：a, b）」。字段名按字典序输出：prompt 必须
+// 逐字可复现（temperature=0 的可重复性依赖它），模块声明顺序不能影响字节。
+// 两者都缺时返回空串——老模块的 prompt 保持原样，不多一对空括号。
+func actionMetaSuffix(meta ActionMeta) string {
+	var parts []string
+	if title := strings.TrimSpace(meta.Title); title != "" {
+		parts = append(parts, title)
+	}
+	if len(meta.RequiredArgs) > 0 {
+		names := append([]string(nil), meta.RequiredArgs...)
+		sort.Strings(names)
+		parts = append(parts, "必填："+strings.Join(names, ", "))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "（" + strings.Join(parts, "；") + "）"
 }
 
 // renderEvent 把事件渲染成 prompt 里的事实块。编组失败时退回一个只含关键字段的文本：

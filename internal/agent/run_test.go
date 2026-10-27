@@ -144,6 +144,8 @@ type fakeModule struct {
 	Actions  []string
 	// Templates 是 action id → 人话模板；空表示该动作没声明（渲染侧走 R2）。
 	Templates map[string]string
+	// Meta 是 action id → manifest 里的额外键（当前用于 requiredArgs）。
+	Meta map[string]map[string]any
 
 	DryRunStatus  string // 默认 verified
 	DryRunMissing bool   // 声明「不支持预演」：回 404 空体
@@ -180,6 +182,9 @@ func (m *fakeModule) serve(w http.ResponseWriter, r *http.Request) {
 			item := map[string]any{"id": id, "version": "0.1.0", "title": id, "kind": "write"}
 			if tpl, ok := m.Templates[id]; ok {
 				item["summaryTemplate"] = tpl
+			}
+			for k, v := range m.Meta[id] {
+				item[k] = v
 			}
 			actions = append(actions, item)
 		}
@@ -390,6 +395,11 @@ func TestPolicyDeniedGoesNeedsHumanWithoutWorkaround(t *testing.T) {
 	}
 	if !strings.Contains(res.Detail, "NO_POLICY_MATCH_DEFAULT_DENY") {
 		t.Fatalf("结局必须带上理由码，实际：%s", res.Detail)
+	}
+	// 同一条 detail 还要说清「是哪个动作被拒」：否则排障只能猜
+	// （2026-10-27 的真实教训——结果行里 动作=[]，没人知道是谁触发了 deny）。
+	if !strings.Contains(res.Detail, "计划动作=[inventory.DeductStock]") {
+		t.Fatalf("detail 必须列出被拒的计划动作，实际：%s", res.Detail)
 	}
 }
 
@@ -1167,5 +1177,41 @@ func TestBuildPendingRendersPlainLanguage(t *testing.T) {
 	}
 	if got.Summary != got.Labels[0] {
 		t.Fatalf("单步计划的 summary 应等于该步白话：%q", got.Summary)
+	}
+}
+
+// 发现结果必须带上 requiredArgs：它是 prompt 渲染必填字段的唯一来源。
+func TestDiscoverCarriesRequiredArgs(t *testing.T) {
+	mod := newFakeModule(t, "inventory", []string{"inventory.DeductStock"}, new([]string))
+	mod.Meta = map[string]map[string]any{
+		"inventory.DeductStock": {"requiredArgs": []string{"sku", "qty"}},
+	}
+	r := newRunnerForDiscover(t, mod.Server.URL)
+
+	got, err := r.discover(context.Background())
+	if err != nil {
+		t.Fatalf("能力发现失败：%v", err)
+	}
+	meta := got[0].ActionMeta["inventory.DeductStock"]
+	if len(meta.RequiredArgs) != 2 || meta.RequiredArgs[0] != "sku" {
+		t.Fatalf("requiredArgs 没带回来：%+v", meta)
+	}
+}
+
+// 被拒时必须能看出「是哪个动作被拒」：否则排障只能猜（2026-10-27 那次真实发生：
+// 结果行里 动作=[]，谁也不知道是哪个动作触发了 NO_POLICY_MATCH_DEFAULT_DENY）。
+func TestPolicyDenyDetailListsPlannedActions(t *testing.T) {
+	plan := Plan{PlanID: "pln_1", Steps: []PlanStep{
+		{StepID: "s1", Action: "inventory.ReleaseStock", Kind: "write"},
+		{StepID: "s2", Action: "inventory.GetStock", Kind: "read"},
+	}}
+	got := planActionsNote(plan)
+	if got != "计划动作=[inventory.ReleaseStock, inventory.GetStock]" {
+		t.Fatalf("计划动作描述不符：%q", got)
+	}
+
+	// 空计划不该产出「计划动作=[]」这种噪音：审批人都看不懂它在说什么。
+	if empty := planActionsNote(Plan{}); empty != "" {
+		t.Fatalf("空计划应返回空串，得到 %q", empty)
 	}
 }
