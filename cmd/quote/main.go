@@ -90,9 +90,10 @@ func main() {
 // 另一份定义。
 func newQuoteModule(store *quoteStore) *module.Module {
 	mod := &module.Module{
-		ID:      moduleID,
-		Title:   moduleTitle,
-		Version: moduleVersion,
+		ID:       moduleID,
+		Title:    moduleTitle,
+		Version:  moduleVersion,
+		TestMode: os.Getenv("TENON_TEST_MODE") == "1", // D1 的 A/B 两轮要靠 /tenon/admin/reset 造同输入
 		Actions: []module.Action{
 			createStandardPartQuoteAction(),
 			getQuoteAction(),

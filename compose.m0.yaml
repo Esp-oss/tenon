@@ -1,40 +1,49 @@
-# Tenon M0 目标拓扑（构建契约，非当前可运行状态）
+# Tenon M0.5 目标拓扑：宿主 + agent + 三个模块 + 两个一次性客户端
 #
-# 这份文件的用途是**把接口钉死在拓扑上**：哪个容器开哪个端口、谁调谁、
-# 用什么凭据、按什么顺序起。它现在可以 `docker compose -f compose.m0.yaml config`
-# 校验语法，但 `up` 会在构建阶段失败——因为 M0 的代码还没写。
+# 这份文件把接口钉在拓扑上：谁开哪个端口、谁调谁、用什么凭据、按什么顺序起。
+# 端口与端点对照见 docs/interfaces.md，环境变量的取值口径见同文件 §6。
 #
-# 判定「能不能跑」的方法：
-#   docker compose -f compose.m0.yaml config   # 语法：现在就能过
-#   docker compose -f compose.m0.yaml build    # 现在必失败（cmd/ 与 dist/ 都还不存在）
+# 判据（两条都可以现在就跑）：
+#   docker compose -f compose.m0.yaml config --quiet   # 语法与引用完整性
+#   docker compose -f compose.m0.yaml build            # 逐个镜像构建；host/agent/quote 已是 Go 服务
 #
-# 端口与端点对照见 docs/interfaces.md。
+# 未验证的部分（完整镜像启动、端到端 up、HMAC 实际握手）记在 docker/README.md 的
+# 「已验证」表里，不要从这份文件的完整性推断它们已经跑通。
+#
+# 需要先准备两个文件（都在 .gitignore 里）：
+#   mkdir -p docker/secrets
+#   openssl rand -hex 32 > docker/secrets/hmac.txt     # 模块侧事件验签
+#   printf '%s' '<LLM API key>' > docker/secrets/llm.key
 
 name: tenon-m0
 
 services:
-  # Agent 运行时（dsh）+ 控制平面（registry/grant/policy/audit）+ 共驾 WS。
-  # 持有【宿主侧 4 个端点】；不实现模块侧端点。
+  # 控制平面（决策 D-A 选 Go）：策略、授权、审计链、注册表、共驾帧 REST 中转。
+  # 不含任何 LLM 调用，也不主动调模块——所以换 agent 或换模型都不必动它。
   host:
     build:
       context: .
-      dockerfile: docker/node-service.Dockerfile
+      dockerfile: docker/go-service.Dockerfile
       args:
-        PKG: "@tenon/dsh-plugin-module-host"
+        ENTRY: ./cmd/host
     image: tenon/host:m0
     ports:
       - "8080:8080"
     environment:
       PORT: "8080"
-      TENON_VERSION: "0.1"
-      TENON_MODULE_ID: "host"
-      TENON_AUDIT_PATH: "/var/lib/tenon/audit.jsonl"
-      TENON_POLICY_FILE: "/etc/tenon/policies.yaml"
-      TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
-    secrets:
-      - tenon_hmac
+      # 两份治理数据用只读挂载，不进 docker inspect；路径是容器内路径。
+      TENON_POLICY_FILE: "/etc/tenon/policies.json"
+      TENON_GRANT_FILE: "/etc/tenon/grants.json"
+      TENON_AUDIT_PATH: "/var/lib/tenon/audit-host.jsonl"
+      # 注册表初始内容，形如 id=url,id=url；agent 靠 GET /tenon/modules 读它。
+      TENON_MODULES: "quote=http://quote:8083,inventory=http://inventory:8081,procurement=http://procurement:8082"
+      # 仅测试拓扑：挂载 POST /tenon/admin/modules（差异测试靠它摘掉一个模块）。
+      # 生产部署必须删掉这一行——该端点能改调度面。
+      TENON_TEST_MODE: "1"
     volumes:
-      - tenon-audit:/var/lib/tenon
+      - ./config/policies.dev.json:/etc/tenon/policies.json:ro
+      - ./config/grants.dev.json:/etc/tenon/grants.json:ro
+      - tenon-host-state:/var/lib/tenon
     networks:
       - edge
       - core
@@ -45,21 +54,99 @@ services:
       retries: 12
       start_period: 5s
 
-  # 库存模块：Go HTTP 侧车，实现【模块侧 6 个端点】。
+  # agent 运行时：纯客户端，不开端口、不实现任何协议端点。
+  # 它做四件事——读注册表（自己按 enabled 过滤）→ 轮询各模块发件箱 → 按 skill 决定
+  # 是否开回合 → 规划、过闸门、两段审计、执行、发 Intent 帧。
+  agent:
+    build:
+      context: .
+      dockerfile: docker/go-service.Dockerfile
+      args:
+        ENTRY: ./cmd/agent
+    image: tenon/agent:m0
+    environment:
+      TENON_HOST_URL: "http://host:8080"
+      # 必须与 config/grants.dev.json 里 grant.agent 对齐（dev 授权表写的是
+      # ag_fulfillment）；agent 缺省 id 是 ag_tenon，不一致时 G3 会 fail-closed 全拒。
+      TENON_AGENT_ID: "ag_fulfillment"
+      # 必填，没有默认值：缺了 agent 启动即失败（审计要能追到代谁执行）。
+      TENON_ON_BEHALF_OF: "user:alice"
+      TENON_SKILL_DIR: "/skills"
+      TENON_SPEC_DIR: "/spec/0.1/schemas"
+      # 游标落盘：不落盘时进程重启会从头读发件箱，重放会产出新 planId 与新幂等键。
+      TENON_CURSOR_FILE: "/var/lib/tenon/cursors.json"
+      # 每回合追加一行结局（outcome/planId/规划出来的动作序列）。
+      # `tenon d1 run --agent-result` 读的就是这个文件，是 D1 的观测入口。
+      TENON_RESULT_FILE: "/var/lib/tenon/agent-result.jsonl"
+      TENON_POLL_INTERVAL: "1s"
+      # 差异测试取「一轮」的语义时置 1；常驻部署保持 0。
+      TENON_ONCE: "0"
+      TENON_LLM_BASE_URL: "https://api.deepseek.com"
+      TENON_LLM_MODEL: "deepseek-flash"
+      TENON_LLM_TIMEOUT: "60s"
+      # key 走文件不走环境变量，避免进 docker inspect。
+      TENON_LLM_API_KEY_FILE: "/run/secrets/tenon_llm_key"
+    secrets:
+      - tenon_llm_key
+    volumes:
+      # schema 是判据：读不到 plan.schema.json 时 agent 拒绝启动（不静默降级）。
+      - ./spec:/spec:ro
+      - ./skills:/skills:ro
+      - tenon-agent-state:/var/lib/tenon
+    networks:
+      # core：访问 host 与各模块。edge：只为出网调 LLM（core 是 internal，出不去）。
+      # 不发布端口——它没有任何入站接口。
+      - edge
+      - core
+    depends_on:
+      host:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 报价模块：数据流的第一跳。建单成功后把 quote.completed 写进**发件箱**，
+  # 由 agent 用 GET /tenon/events?direction=out 轮询取走。
+  quote:
+    build:
+      context: .
+      dockerfile: docker/go-service.Dockerfile
+      args:
+        ENTRY: ./cmd/quote
+    image: tenon/quote:m0
+    environment:
+      PORT: "8083"
+      TENON_MODULE_ID: "quote"
+      TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
+      TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-quote.jsonl"
+    secrets:
+      - tenon_hmac
+    volumes:
+      - tenon-quote-audit:/var/lib/tenon
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8083/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+
+  # 库存模块：实现模块侧六个端点，承担协议最重的写路径（幂等、补偿声明、预演）。
   inventory:
     build:
       context: .
       dockerfile: docker/go-service.Dockerfile
       args:
-        ENTRY: "./cmd/inventory"
+        ENTRY: ./cmd/inventory
     image: tenon/inventory:m0
     environment:
       PORT: "8081"
       TENON_MODULE_ID: "inventory"
-      TENON_HOST_URL: "http://host:8080"
       TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
+      TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-inventory.jsonl"
     secrets:
       - tenon_hmac
+    volumes:
+      - tenon-inventory-audit:/var/lib/tenon
     networks:
       - core
     healthcheck:
@@ -69,21 +156,23 @@ services:
       retries: 12
       start_period: 3s
 
-  # 采购模块：Go HTTP 侧车，D1 差异测试里被「摘掉」的那一个。
+  # 采购模块：差异测试里被「摘掉」的那一个（摘除只改注册表，不动 agent 一行代码）。
   procurement:
     build:
       context: .
       dockerfile: docker/go-service.Dockerfile
       args:
-        ENTRY: "./cmd/procurement"
+        ENTRY: ./cmd/procurement
     image: tenon/procurement:m0
     environment:
       PORT: "8082"
       TENON_MODULE_ID: "procurement"
-      TENON_HOST_URL: "http://host:8080"
       TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
+      TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-procurement.jsonl"
     secrets:
       - tenon_hmac
+    volumes:
+      - tenon-procurement-audit:/var/lib/tenon
     networks:
       - core
     healthcheck:
@@ -93,18 +182,32 @@ services:
       retries: 12
       start_period: 3s
 
-  # 一致性套件：一次性任务，跑完退出；退出码即结论（0 = 全绿）。
+  # 一致性套件：一次性任务，退出码即结论（0 = 全绿）。
+  # 给 --host 之后 C4（两段写 + 哈希链）与 C5（fail-closed）才可判定；不给就仍是 SKIP。
   conformance:
     build:
       context: .
       dockerfile: docker/go-service.Dockerfile
       args:
-        ENTRY: "./cmd/tenon"
+        ENTRY: ./cmd/tenon
     image: tenon/tool:m0
-    command: ["conformance", "run", "--target", "http://host:8080", "--report", "/out/report.json"]
-    environment:
-      TENON_TARGET: "http://host:8080"
+    command:
+      - "conformance"
+      - "run"
+      - "--target"
+      - "http://inventory:8081"
+      - "--host"
+      - "http://host:8080"
+      - "--module"
+      - "inventory"
+      - "--fixtures"
+      - "/work/conformance/fixtures/mini-erp.json"
+      - "--source-dir"
+      - "/work"
+      - "--report"
+      - "/out/report.json"
     volumes:
+      - ./:/work:ro
       - ./out:/out
     depends_on:
       host:
@@ -117,13 +220,13 @@ services:
       - core
     restart: "no"
 
-  # 反模式扫描：一次性任务，对仓库源码做 C10 检查。
+  # 反模式扫描（C10）：一次性任务，对仓库源码做只读扫描。
   lint:
     build:
       context: .
       dockerfile: docker/go-service.Dockerfile
       args:
-        ENTRY: "./cmd/tenon"
+        ENTRY: ./cmd/tenon
     image: tenon/tool:m0
     command: ["lint", "--path", "/work"]
     volumes:
@@ -137,9 +240,19 @@ secrets:
   #   mkdir -p docker/secrets && openssl rand -hex 32 > docker/secrets/hmac.txt
   tenon_hmac:
     file: ./docker/secrets/hmac.txt
+  # agent 调 LLM 用的 key；内容去首尾空白后整段当 key 用。
+  tenon_llm_key:
+    file: ./docker/secrets/llm.key
 
 volumes:
-  tenon-audit:
+  # 审计与游标必须持久化：宿主与模块的 JSONL 是唯一可对账的凭据。
+  # 运行时用户是 uid 10001，命名卷首次挂载的属主是 root——可写性尚未验证，
+  # 见 docker/README.md 的「已验证」表。
+  tenon-host-state:
+  tenon-agent-state:
+  tenon-quote-audit:
+  tenon-inventory-audit:
+  tenon-procurement-audit:
 
 networks:
   # 对外：只有 host 发布端口

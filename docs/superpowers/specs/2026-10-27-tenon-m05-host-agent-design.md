@@ -196,3 +196,14 @@ POST /tenon/admin/reset        # 仅 TENON_TEST_MODE=1
 | **P2 框架缺口 + quote** | outbox、TEST_MODE reset、`cmd/quote` | 模块能产出事件且 agent 能轮询到；reset 使两轮输入完全一致 |
 | **P3 agent** | `internal/llm` + `internal/agent` + `cmd/agent` | 假 LLM 单测全绿；真 LLM 能跑通 A 轮（含审计两段） |
 | **P4 D1 + 收口** | `tenon d1 run`、文档/容器、compose.m0 | A≠B 且 B 为 `needs_human`；报告可归档 |
+
+---
+
+## 10. 执行期调整（记录在案，避免文档与事实脱节）
+
+| 调整 | 原计划 | 实际 | 理由 |
+|---|---|---|---|
+| **共驾通道** | `WS /tenon/intents` | **本轮只做 REST 三端点**：`POST /tenon/intents`、`GET …/poll`、`POST …/ack`；WS 升级留 M1 | Go 标准库没有 WebSocket 服务端；为 M0.5 引入一个 WS 依赖不值得。REST 三端点语义等价（能发帧、能回放、能确认），只是少了实时推送 |
+| **并发验证** | 所有并发用例跑 `-race` | **本机不跑 `-race`**（`CGO_ENABLED=0` 且无 gcc/clang）；并发用例保留，靠 Mutex 临界区 + 端到端不变量论证；`registry` 已在容器内（`golang:1.26-alpine` + gcc）补跑 `-count=3 -race` 全绿 | 环境限制。**这是验证强度的真实缺口**：内存模型层面的竞争无法在本机机械排除，需在有 gcc 的 CI 补跑 |
+| **controlplane 目录结构** | `internal/controlplane/{policy,grant,audit,registry}.go` 同包 | 拆成四个子包 `internal/controlplane/{policy,grant,audit,registry}/` | 四个部分并行实现时同包会互相打断编译；拆开后职责边界也更干净 |
+| **审计记录字段** | 计划的字段清单不含 `trigger`/`inputHash`/`idempotencyKey`/`tokenUsage` | 已补齐 | 这四个是 `audit-event.schema.json` 的必填项；缺了会让落库记录不是 schema 完整事件，且**静默丢字段**比报错更难发现 |

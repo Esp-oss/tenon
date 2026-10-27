@@ -1,12 +1,14 @@
 # 容器化
 
-容器分三层，**状态说明比目录结构重要**——只有第一层现在能跑。
+容器分三层，**状态说明比目录结构重要**。
 
 | 层 | 文件 | 现在能跑吗 |
 |---|---|---|
 | ① 检查与文档 | `checks.Dockerfile`（target `spec` / `go`）、`docs.Dockerfile` | ✅ 能 |
-| ② 构建契约 | `go-service.Dockerfile`、`node-service.Dockerfile` | ❌ 不能（代码未写，构建会失败——这是预期信号） |
-| ③ 拓扑 | 根目录 `compose.yaml`（现状）、`compose.m0.yaml`（M0 目标） | `compose.yaml` ✅ / `compose.m0.yaml` 仅 `config` 可验 |
+| ② 服务镜像 | `go-service.Dockerfile`（**4 个 Go 入口的 build 阶段实测通过**）、`node-service.Dockerfile`（仍在契约点失败） | ✅ / ❌ 见下 |
+| ③ 拓扑 | 根目录 `compose.yaml`（现状）、`compose.m0.yaml`（M0.5 目标） | 两份 `config` 都能过；端到端 `up` 未验 |
+
+M0.5 之后，`host`、`agent`、`quote` 都是 **Go 服务**，不再有「dsh 宿主 / TS 插件」那两条路径——那部分（进程内接入路径）整体 deferred，见 [`docs/interfaces.md`](../docs/interfaces.md) §1。
 
 ## ① 现在就能用的
 
@@ -41,54 +43,85 @@ docker compose build
 
 默认值取的是**通用可用**而非最小体积：`node:24-bookworm-slim`、`nginx:alpine`、`golang:1.26-alpine`。生产环境请把 `NGINX_IMAGE` 换成 `nginx:1.27.0-alpine`（或 digest）。
 
-## ② 为什么「构建契约」镜像现在构建会失败
+## ② 服务镜像
 
-`go-service.Dockerfile` 假定存在 `./cmd/${ENTRY}`，`node-service.Dockerfile` 假定存在 `packages/<pkg>/dist/index.js`。M0 尚未实现任何命令与构建产物，所以构建会在那一刻失败。
+### `go-service.Dockerfile`：M0.5 起是真实构建
 
-**这不是缺陷，是刻意的**：镜像即契约。它把「M0 该产出什么」写成了可执行的断言，而不是写在文档里的愿望。等 `cmd/tenon` 落地，同一个文件不加改动就能构建出镜像。
-
-受限网络下想验证契约仍然成立，只建 build 阶段即可（不需要运行时基础镜像）：
+它假定存在 `./cmd/${ENTRY}`，编译成单二进制后放进 `alpine` 运行时。四个入口的 build 阶段本轮都实测通过（见文末「已验证」）：
 
 ```bash
-docker build -f docker/go-service.Dockerfile   --target build --build-arg ENTRY=./cmd/inventory .
+docker build -f docker/go-service.Dockerfile --target build --build-arg ENTRY=./cmd/host .
+docker build -f docker/go-service.Dockerfile --target build --build-arg ENTRY=./cmd/agent .
+docker build -f docker/go-service.Dockerfile --target build --build-arg ENTRY=./cmd/quote .
+docker build -f docker/go-service.Dockerfile --target build --build-arg ENTRY=./cmd/tenon .
+```
+
+**只验 build 阶段**是有意的：运行时基础镜像 `alpine:3.20` 在本机拉不到（网络），所以「完整镜像 → 容器内启动 → `/readyz`」这条链路仍未验。
+
+### `node-service.Dockerfile`：仍然是契约信号
+
+`packages/*` 至今没有 `build` 脚本、也没有 `dist/index.js`，因此：
+
+```bash
 docker build -f docker/node-service.Dockerfile --target build --build-arg PKG=@tenon/dsh-plugin-module-host .
 ```
 
-两者都会在契约点失败，报错分别指向 `go build ./cmd/inventory`（无 Go 文件）与
-`ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT`（没有 build 脚本）——正是「未实现」该有的信号。
+会在 `pnpm run build` 处失败（`ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT`）。**这不是缺陷**：镜像即契约，它把「packages/ 该产出什么」写成可执行断言。注意它现在已经**不是** `host` 的构建路径了（`host` 是 `./cmd/host` 的 Go 服务），契约对象只剩 M1 的 dsh 集成。
 
-## ③ M0 拓扑
+## ③ M0.5 拓扑
 
 ```bash
-docker compose -f compose.m0.yaml config   # 语法现在就能验
-docker compose -f compose.m0.yaml build    # 预期失败：go build ./cmd/... 无输入
+docker compose -f compose.m0.yaml config --quiet   # 语法与引用完整性，现在就能过
+docker compose -f compose.m0.yaml build            # 逐服务构建；build 阶段可过，完整镜像受制于运行时基础镜像
 ```
 
-拓扑里有 5 个服务 + 2 个网络（`edge` 对外、`core` internal），端口与端点对照见 [`docs/interfaces.md`](../docs/interfaces.md)。
+7 个服务 + 2 个网络（`edge` 对外、`core` internal）+ 2 个 secret + 5 个命名卷：
 
-判据：`host`、`inventory`、`procurement` 的 `/readyz` 全 200 → `conformance` 全绿（退出码 0）→ `lint` 零命中。
+| 服务 | 端口 | 说明 |
+|---|---|---|
+| `host` | **8080 发布** | 控制平面：策略 / 授权 / 审计链 / 注册表 / 共驾帧 REST |
+| `agent` | 无端口 | 纯客户端：读注册表 → 轮询发件箱 → 规划 → 过闸门 → 两段审计 → 执行 |
+| `quote` | 8083（不发布） | 触发器模块，产出 `quote.completed` 进发件箱 |
+| `inventory` | 8081（不发布） | 主写路径：幂等、预演、补偿声明 |
+| `procurement` | 8082（不发布） | 差异测试里被摘掉的那一个 |
+| `conformance` | 一次性 | `conformance run --target … --host …`，退出码即结论 |
+| `lint` | 一次性 | 只读扫描源码（C10） |
+
+端口与端点对照见 [`docs/interfaces.md`](../docs/interfaces.md) §1、§4。
+
+判据：`host`、三个模块的 `/readyz` 全 200 → `conformance`（带 `--host`）里 C4/C5 判 PASS → `lint` 零命中。D1 不在这些容器里：它要真 LLM 凭据，而且卡在模块 reset 的环境变量接线（[`docs/interfaces.md`](../docs/interfaces.md) §9 缺口 8）。
 
 ## 几个刻意的选择
 
-- **模块不发布端口**：只有 `host` 暴露 8080，`core` 网络 `internal: true`。模块只能被宿主访问，最小暴露面。
-- **密钥走文件不走环境变量**：`TENON_HMAC_SECRET_FILE` 指向挂载的 secret 文件，避免密钥出现在 `docker inspect` 与镜像层里。
-- **`quote` 模块没有容器**：它是跑在 `host` 进程内的 cordis 插件。用容器包一个进程内插件只会造出假的边界。
+- **模块不发布端口**：只有 `host` 暴露 8080，`core` 网络 `internal: true`。模块只能被宿主与 agent 访问，最小暴露面。
+- **agent 不发布端口，但必须挂在 `edge` 上**：它没有任何入站接口；挂 `edge` 纯粹是为了出网调 LLM——`core` 是 `internal: true`，待在里面的进程连不出去。
+- **密钥与 key 走文件不走环境变量**：`TENON_HMAC_SECRET_FILE`、`TENON_LLM_API_KEY_FILE` 都指向挂载的 secret 文件，避免进 `docker inspect` 与镜像层。
+- **`quote` 是容器，不是进程内插件**：本轮宿主选了 Go，没有 TS 宿主，进程内路径 deferred。用容器包一个不存在的进程内插件只会造出假的边界。
 - **`conformance` / `lint` 是一次性任务**：退出码就是结论，不常驻、不健康检查。
-- **`/healthz` 不检查依赖**：否则 MySQL 挂了会把健康容器一起杀掉。依赖就绪走 `/readyz`。
+- **`/healthz` 不检查依赖**：否则依赖挂了会把健康容器一起杀掉。依赖就绪走 `/readyz`（两侧检查项不同，见 `interfaces.md` §7）。
+- **测试态端点只在测试拓扑里给**：`host` 段写了 `TENON_TEST_MODE: "1"`（差异测试靠它摘模块），生产部署必须删掉。模块段**没有**声明 `TENON_TEST_MODE`——`internal/module` 目前不读这个变量，写了也不生效（`interfaces.md` §9 缺口 8）。
+- **agent 的观测产物也落盘**：`TENON_RESULT_FILE` 指向 `/var/lib/tenon/agent-result.jsonl`（每回合一行：结局、planId、规划出来的动作序列）。它是 `tenon d1 run --agent-result` 的输入；与审计、游标同一块卷，才有 A/B 两轮可比的起点。
+- **审计与游标都要落盘**：命名卷承载 JSONL 与游标文件。运行时用户是 uid 10001，而命名卷首次挂载的属主是 root，**可写性还没在容器里验过**。
 
-## 已验证（本次实际构建并运行）
+## 已验证（本次实际执行）
 
-| 验证项 | 结果 |
-|---|---|
-| `docker compose config` / `-f compose.m0.yaml config` | 两份都通过（exit 0） |
-| `docker compose build docs spec go` | 三个镜像构建成功 |
-| `docker compose run --rm spec` | `✓ spec 校验通过：11 项检查，0 失败`，exit 0 |
-| `docker compose run --rm go` | gofmt / vet / build 全 ok，exit 0 |
-| `docker compose up -d docs` | `Up (healthy)`；`/healthz` 返回 `ok`；首页 `<title>Tenon · 规范与架构</title>`；`screens/design-1-layers.html`、`spec/0.1/schemas/action.schema.json` 均 200 |
-| `go-service --target build`（`./cmd/tenon`） | ✅ **现已真实构建成功**（M0 代码落地后契约自动兑现） |
-| `node-service --target build` | ❌ 仍在 `pnpm run build` 处失败：`ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT`（`packages/*` 尚无 build 脚本） |
-| `go-service` 完整镜像 | ⚠️ 未验：运行时基础镜像 `alpine:3.20` 在本机拉不到（网络） |
-| `compose.m0.yaml` 端到端启动 | ❌ 未验：缺 `host`（dsh 宿主）实现 |
-| 模块 ↔ 宿主 HMAC 实际握手 | ❌ 未验：同上；模块侧验签已有单测覆盖 |
+| 验证项 | 结果 | 验于 |
+|---|---|---|
+| `docker compose config --quiet`（`compose.yaml`） | ✅ exit 0 | 本轮 |
+| `docker compose -f compose.m0.yaml config --quiet` | ✅ exit 0 | 本轮 |
+| `go-service --target build`，`./cmd/host` | ✅ exit 0 | 本轮（10:59 前） |
+| `go-service --target build`，`./cmd/agent` | ✅ exit 0 | 本轮 |
+| `go-service --target build`，`./cmd/quote` | ✅ exit 0 | 本轮 |
+| `go-service --target build`，`./cmd/tenon` | ✅ exit 0 | 本轮 |
+| `docs` 容器 | ✅ `Up (healthy)`；`/healthz` → 200 `ok` | 容器此前起的，本轮复查探针 |
+| `docker compose run --rm spec` | ✅ `✓ spec 校验通过：11 项检查，0 失败` | M0 轮 |
+| `docker compose run --rm go` | ✅ gofmt / vet / build 全 ok | M0 轮 |
+| `node-service --target build` | ❌ 预期失败：`ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT` | M0 轮 |
+| `go-service` **完整镜像**（运行时阶段） | ❌ 未验：`alpine:3.20` 本机拉不到 | — |
+| `compose.m0.yaml` 端到端 `up` | ❌ 未验 | — |
+| 命名卷对 uid 10001 的可写性 | ❌ 未验 | — |
+| 模块 ↔ 宿主 HMAC 实际握手 | ❌ 未验：M0.5 走的是发件箱轮询，这个方向没有调用方 | — |
 
-**未验证的部分不许当成已实现来宣称。** `host` 与 `quote` 模块是 M0 剩下的主要工作量。
+补充一条不属于容器、但决定本层判据的实测：真宿主（`cmd/host`）+ 真模块（`cmd/inventory`）在**本机进程**上跑了宿主模式一致性，C4/C5 判 PASS、pass 8 / fail 0 / skip 1（D1），exit 0。证据与复现命令在 [`docs/interfaces.md`](../docs/interfaces.md) §11——它证明的是**协议能用**，不是**容器能起**。
+
+**未验证的部分不许当成已实现来宣称。** 本层剩下的工作量是：完整镜像（运行时基础镜像 + 卷权限）、端到端 `up`、以及 D1 的执行器。
