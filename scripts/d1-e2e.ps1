@@ -139,6 +139,10 @@ try {
 		PORT = '8081'; TENON_MODULE_ID = 'inventory'; TENON_TEST_MODE = '1'
 		TENON_HMAC_SECRET_FILE = $hmacFile
 		TENON_MODULE_AUDIT_PATH = "$out/audit-inventory.jsonl"
+		# 库存种子改 0：需求 12、在库 0 ⇒ 扣减在业务上不成立，唯一合理的写路径就是
+		# 被摘的那个模块（procurement）。否则模型可以只做「先扣 3、缺 9 再采购」，
+		# A 轮不引用 procurement 时判据会被架空（2026-10-27 的「空洞通过」）。
+		TENON_INVENTORY_SEED = 'STD-1002:0,STD-1001:120'
 	}
 	$procs += Start-Svc 'procurement' @{
 		PORT = '8082'; TENON_MODULE_ID = 'procurement'; TENON_TEST_MODE = '1'
@@ -213,6 +217,14 @@ try {
 		# 报告是 UTF-8：Windows PowerShell 5.1 的 Get-Content 默认按 ANSI 读，
 		# 不显式给 -Encoding UTF8 会把中文理由打成乱码。
 		Get-Content $reportPath -Raw -Encoding UTF8
+
+		# 判定收紧要落在脚本上：inconclusive 说明 A 轮没引用被摘模块（命题未被检验），
+		# 本轮验收不通过——不要让它以「也算跑过了」的姿态混过去。
+		$verdict = (Get-Content $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json).verdict
+		if ($verdict -eq 'inconclusive') {
+			Write-Host '✗ D1 判定为 inconclusive：A 轮没有引用被摘模块，命题未被检验' -ForegroundColor Red
+			exit 1
+		}
 	} else {
 		Write-Host '没有产出报告：说明前置条件没满足（host/模块/agent 有一环没起来）' -ForegroundColor Yellow
 	}
