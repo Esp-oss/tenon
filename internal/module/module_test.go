@@ -1,0 +1,1099 @@
+package module
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"tenon.dev/internal/protocol"
+)
+
+const (
+	fixtureModuleID = "demo"
+	readActionID    = "demo.GetThing"
+	writeActionID   = "demo.CreateThing"
+	rejectName      = "boom"
+)
+
+// eventBody 是一份符合 domain-event.schema.json 的事件信封。
+const eventBody = `{"eventId":"evt_01JBTEST0001","type":"quote.completed","version":"0.1.0",` +
+	`"subject":"quote:Quote/Q-2026-0417","occurredAt":"2026-10-27T09:15:00Z","causationId":null,` +
+	`"correlationId":"cor:quote/Q-2026-0417","payload":{"qty":12}}`
+
+// TestMain 把环境变量的缺省值指到用例专属临时目录：即使某个用例忘了 t.Setenv，
+// 审计文件也不会写进工作区（本任务只允许出现受版本控制的文件）。
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "tenon-module-test-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "创建临时目录失败：%v\n", err)
+		os.Exit(1)
+	}
+	_ = os.Setenv(EnvAuditPath, filepath.Join(dir, "audit.jsonl"))
+	_ = os.Setenv(EnvHMACSecretFile, filepath.Join(dir, "absent-secret.txt"))
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// prepareEnv 给用例准备独占的密钥文件与审计路径，并返回密钥原文（= 文件内容去掉首尾空白）。
+func prepareEnv(t *testing.T) []byte {
+	t.Helper()
+	secret := []byte("test-secret-" + t.Name())
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "hmac.txt")
+	if err := os.WriteFile(secretPath, append(append([]byte(nil), secret...), '\n'), 0o600); err != nil {
+		t.Fatalf("写入密钥文件失败：%v", err)
+	}
+	t.Setenv(EnvHMACSecretFile, secretPath)
+	t.Setenv(EnvAuditPath, filepath.Join(dir, "audit.jsonl"))
+	return secret
+}
+
+// fixture 是一个最小可用的模块：一个 read、一个 write（带幂等声明），
+// 计数器用来证明「重复提交没有产生第二次副作用」。
+type fixture struct {
+	module   *Module
+	executed atomic.Int32
+}
+
+func newFixture() *fixture {
+	f := &fixture{}
+	f.module = &Module{
+		ID:      fixtureModuleID,
+		Title:   "演示模块",
+		Version: "0.1.0",
+		Actions: []Action{
+			{
+				ID:      readActionID,
+				Version: "0.1.0",
+				Title:   "读一个东西",
+				Kind:    "read",
+				InputSchema: json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name"],
+  "properties": {"name": {"type": "string"}}
+}`),
+				OutputSchema: json.RawMessage(`{"type":"object","required":["onHand"],"properties":{"onHand":{"type":"integer"}}}`),
+				Risk:         Risk{Level: "low", Reversible: true},
+				TimeoutMs:    30000,
+				DryRun:       DryRunCapability{Supported: false},
+			},
+			{
+				ID:      writeActionID,
+				Version: "0.1.0",
+				Title:   "写一个东西",
+				Kind:    "write",
+				InputSchema: json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name"],
+  "properties": {"name": {"type": "string"}}
+}`),
+				OutputSchema: json.RawMessage(`{"type":"object","required":["seq"],"properties":{"seq":{"type":"integer"}}}`),
+				Risk:         Risk{Level: "medium", Reversible: true},
+				Idempotency: &Idempotency{
+					KeyFields:         []string{"name"},
+					Scope:             "module",
+					DuplicateBehavior: "return_first_result",
+				},
+				TimeoutMs: 30000,
+				DryRun:    DryRunCapability{Supported: true},
+			},
+		},
+		Events: []string{"demo.created"},
+		Handle: func(ctx context.Context, actionID string, args json.RawMessage) (json.RawMessage, *protocol.Error) {
+			var in struct {
+				Name string `json:"name"`
+			}
+			if actionID == readActionID {
+				// 未知字段被忽略是契约要求，所以这里不做任何严格模式处理。
+				return json.RawMessage(`{"onHand":7}`), nil
+			}
+			if actionID != writeActionID {
+				return nil, testError(protocol.ClassContractViolation, "UNKNOWN_ACTION", "测试模块不提供 "+actionID)
+			}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return nil, testError(protocol.ClassContractViolation, "SCHEMA_MISMATCH", err.Error())
+			}
+			if in.Name == rejectName {
+				e := protocol.NewError(protocol.ClassBusinessRejection, "STOCK_INSUFFICIENT", "可用 3，需求 12")
+				e.Details = map[string]any{"available": 3}
+				return nil, &e
+			}
+			body, err := json.Marshal(map[string]any{"seq": f.executed.Add(1), "name": in.Name})
+			if err != nil {
+				return nil, testError(protocol.ClassContractViolation, "TEST_MARSHAL_FAILED", err.Error())
+			}
+			return body, nil
+		},
+		DryRun: func(ctx context.Context, actionID string, args json.RawMessage) (json.RawMessage, *protocol.Error) {
+			if actionID != writeActionID {
+				return nil, testError(protocol.ClassContractViolation, "DRY_RUN_UNSUPPORTED", "测试模块不预演 "+actionID)
+			}
+			return json.RawMessage(`{"status":"verified","diff":[{"entity":"demo:Thing/x","field":"onHand","from":0,"to":1}]}`), nil
+		},
+	}
+	return f
+}
+
+func (f *fixture) actionIndex(t *testing.T, id string) int {
+	t.Helper()
+	for i := range f.module.Actions {
+		if f.module.Actions[i].ID == id {
+			return i
+		}
+	}
+	t.Fatalf("测试夹具里没有 action %q", id)
+	return -1
+}
+
+func testError(class protocol.ErrorClass, code, message string) *protocol.Error {
+	e := protocol.NewError(class, code, message)
+	return &e
+}
+
+func serve(t *testing.T, m *Module) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(m.Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// do 发一个请求。body 为 nil 表示无请求体；extra 里的头覆盖默认头（值留空即置空该头）。
+func do(t *testing.T, method, url string, body []byte, extra map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		t.Fatalf("构造请求失败：%v", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set(protocol.HeaderVersion, protocol.Version)
+	for k, v := range extra {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s 失败：%v", method, url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取响应失败：%v", err)
+	}
+	return resp, raw
+}
+
+func doJSON(t *testing.T, method, url string, payload any, extra map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	if payload == nil {
+		return do(t, method, url, nil, extra)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("编组请求体失败：%v", err)
+	}
+	return do(t, method, url, body, extra)
+}
+
+func idem(key string) map[string]string {
+	return map[string]string{protocol.HeaderIdempotencyKey: key}
+}
+
+func decodeTenonError(t *testing.T, raw []byte) protocol.Error {
+	t.Helper()
+	var env protocol.ErrorEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("错误响应不是 tenonError 信封：%v（原文 %s）", err, raw)
+	}
+	return env.TenonError
+}
+
+func eventBodyWithID(id string) []byte {
+	return []byte(strings.Replace(eventBody, "evt_01JBTEST0001", id, 1))
+}
+
+// readAuditLines 读回模块侧审计 JSONL。
+func readAuditLines(t *testing.T) []auditRecord {
+	t.Helper()
+	raw, err := os.ReadFile(os.Getenv(EnvAuditPath))
+	if err != nil {
+		t.Fatalf("读取审计文件失败：%v", err)
+	}
+	var records []auditRecord
+	for _, line := range bytes.Split(bytes.TrimSpace(raw), []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var rec auditRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatalf("审计行不是合法 JSON：%v（原文 %s）", err, line)
+		}
+		records = append(records, rec)
+	}
+	return records
+}
+
+// 1. manifest 是摘要级：动作项只有六个字段，且原始 JSON 里不含 inputSchema。
+func TestManifestIsSummaryOnly(t *testing.T) {
+	prepareEnv(t)
+	srv := serve(t, newFixture().module)
+
+	resp, raw := doJSON(t, http.MethodGet, srv.URL+"/.well-known/tenon", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+	if got := resp.Header.Get(protocol.HeaderVersion); got != protocol.Version {
+		t.Errorf("响应头 %s = %q，期望 %q", protocol.HeaderVersion, got, protocol.Version)
+	}
+	for _, forbidden := range []string{"inputSchema", "outputSchema", "idempotency"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("manifest 摘要不得包含 %q，原文：%s", forbidden, raw)
+		}
+	}
+
+	var got struct {
+		Tenon  string `json:"tenon"`
+		Module struct {
+			ID      string `json:"id"`
+			Version string `json:"version"`
+			Title   string `json:"title"`
+		} `json:"module"`
+		Actions      []map[string]json.RawMessage `json:"actions"`
+		Events       []eventSummary               `json:"events"`
+		Transports   []string                     `json:"transports"`
+		Capabilities []string                     `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("manifest 不是合法 JSON：%v（原文 %s）", err, raw)
+	}
+	if got.Tenon != protocol.Version {
+		t.Errorf("manifest.tenon = %q，期望 %q", got.Tenon, protocol.Version)
+	}
+	if got.Module.ID != fixtureModuleID || got.Module.Version != "0.1.0" || got.Module.Title == "" {
+		t.Errorf("manifest.module 不完整：%+v", got.Module)
+	}
+	if len(got.Actions) != 2 {
+		t.Fatalf("manifest.actions 长度 = %d，期望 2", len(got.Actions))
+	}
+	wantKeys := []string{"id", "version", "title", "kind", "risk", "dryRun"}
+	for i, summary := range got.Actions {
+		if len(summary) != len(wantKeys) {
+			t.Fatalf("actions[%d] 有 %d 个字段 %v，期望恰好 %v", i, len(summary), keysOf(summary), wantKeys)
+		}
+		for _, key := range wantKeys {
+			if _, ok := summary[key]; !ok {
+				t.Errorf("actions[%d] 缺少字段 %q", i, key)
+			}
+		}
+	}
+	if len(got.Events) != 1 || got.Events[0].Type != "demo.created" || got.Events[0].Version == "" {
+		t.Errorf("manifest.events = %+v，期望一条带 version 的 demo.created", got.Events)
+	}
+	if len(got.Transports) != 1 || got.Transports[0] != "http" {
+		t.Errorf("manifest.transports = %v，期望 [\"http\"]", got.Transports)
+	}
+	if !contains(got.Capabilities, "dry-run") || !contains(got.Capabilities, "event-replay") {
+		t.Errorf("manifest.capabilities = %v，期望同时含 dry-run 与 event-replay", got.Capabilities)
+	}
+}
+
+func keysOf(m map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func contains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+// 2. 写操作缺 Idempotency-Key → 400 contract_violation，且不执行。
+func TestWriteRequiresIdempotencyKey(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+
+	resp, raw := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/"+writeActionID, map[string]any{"name": "alpha"}, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 400（原文 %s）", resp.StatusCode, raw)
+	}
+	got := decodeTenonError(t, raw)
+	if got.Class != protocol.ClassContractViolation {
+		t.Errorf("class = %q，期望 %q", got.Class, protocol.ClassContractViolation)
+	}
+	if got.Code != "MISSING_IDEMPOTENCY_KEY" {
+		t.Errorf("code = %q，期望 MISSING_IDEMPOTENCY_KEY", got.Code)
+	}
+	if got.Retryable {
+		t.Error("contract_violation 必须 retryable=false（errors.md §3）")
+	}
+	if n := f.executed.Load(); n != 0 {
+		t.Errorf("业务回调被调用 %d 次，期望 0 次", n)
+	}
+}
+
+// 3. 同键重复提交 → 两次响应体逐字节相同，业务计数器只 +1（真幂等）。
+func TestWriteIsIdempotent(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+	url := srv.URL + "/tenon/actions/" + writeActionID
+	headers := idem("tenon:pln_01JB/s1")
+	payload := map[string]any{"name": "alpha"}
+
+	resp1, raw1 := doJSON(t, http.MethodPost, url, payload, headers)
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("首次调用状态码 = %d，期望 200（原文 %s）", resp1.StatusCode, raw1)
+	}
+	resp2, raw2 := doJSON(t, http.MethodPost, url, payload, headers)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("重复调用状态码 = %d，期望 200（原文 %s）", resp2.StatusCode, raw2)
+	}
+	if !bytes.Equal(raw1, raw2) {
+		t.Errorf("重复提交的响应体不同：%s vs %s", raw1, raw2)
+	}
+	if n := f.executed.Load(); n != 1 {
+		t.Errorf("业务回调被调用 %d 次，期望 1 次（重复提交不得产生第二次副作用）", n)
+	}
+
+	// 同键不同参数是调用方 bug：必须拒绝，而不是静默按首次执行（semantics.md §5.2）。
+	resp3, raw3 := doJSON(t, http.MethodPost, url, map[string]any{"name": "beta"}, headers)
+	if resp3.StatusCode != http.StatusBadRequest {
+		t.Fatalf("同键异参状态码 = %d，期望 400（原文 %s）", resp3.StatusCode, raw3)
+	}
+	if got := decodeTenonError(t, raw3); got.Code != "IDEMPOTENCY_KEY_REUSED" {
+		t.Errorf("code = %q，期望 IDEMPOTENCY_KEY_REUSED", got.Code)
+	}
+	if n := f.executed.Load(); n != 1 {
+		t.Errorf("同键异参也被执行了，计数器 = %d，期望 1", n)
+	}
+
+	// 换一个键则是另一笔业务：必须真的执行。
+	resp4, raw4 := doJSON(t, http.MethodPost, url, payload, idem("tenon:pln_01JB/s2"))
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("新键状态码 = %d，期望 200（原文 %s）", resp4.StatusCode, raw4)
+	}
+	if n := f.executed.Load(); n != 2 {
+		t.Errorf("新键调用后计数器 = %d，期望 2", n)
+	}
+}
+
+// 4. 未知字段必须被忽略（json.Decoder 不设 DisallowUnknownFields）。
+func TestUnknownFieldsAreIgnored(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+
+	resp, raw := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/"+writeActionID, map[string]any{
+		"name":           "alpha",
+		"totallyUnknown": 1,
+		"nested":         map[string]any{"deep": []any{1, 2, 3}},
+	}, idem("tenon:pln_unknown/s1"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+	if !bytes.Contains(raw, []byte(`"seq":1`)) {
+		t.Errorf("响应体 = %s，期望带上业务出参", raw)
+	}
+
+	respRead, rawRead := doJSON(t, http.MethodGet, srv.URL+"/tenon/actions/"+readActionID, nil, nil)
+	if respRead.StatusCode != http.StatusOK {
+		t.Fatalf("读动作定义状态码 = %d，期望 200（原文 %s）", respRead.StatusCode, rawRead)
+	}
+	if !bytes.Contains(rawRead, []byte("inputSchema")) {
+		t.Errorf("GET /tenon/actions/{id} 必须返回完整 Action（含 inputSchema）：%s", rawRead)
+	}
+	respRun, rawRun := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/"+readActionID, map[string]any{
+		"name":   "alpha",
+		"extra!": "ignored",
+	}, nil)
+	if respRun.StatusCode != http.StatusOK {
+		t.Fatalf("读动作执行状态码 = %d，期望 200（原文 %s）", respRun.StatusCode, rawRun)
+	}
+}
+
+// 5. 模块不支持预演 → POST :dry-run 返回 404 且响应体为空（能力不存在，不是错误）。
+func TestDryRunUnsupportedReturnsEmpty404(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	// 模块级：没有任何预演能力；动作级：声明 supported=false，与实现一致。
+	f.module.DryRun = nil
+	f.module.Actions[f.actionIndex(t, writeActionID)].DryRun = DryRunCapability{Supported: false}
+	srv := serve(t, f.module)
+	url := srv.URL + "/tenon/actions/" + writeActionID + ":dry-run"
+
+	resp, raw := doJSON(t, http.MethodPost, url, map[string]any{"name": "alpha"}, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("状态码 = %d，期望 404（原文 %q）", resp.StatusCode, raw)
+	}
+	if len(raw) != 0 {
+		t.Fatalf("不支持预演时必须返回空响应体，实际 %q", raw)
+	}
+
+	// 未知 action 的预演仍是「动作不存在」：404 但带报文，便于调用方区分。
+	respUnknown, rawUnknown := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/demo.Nope:dry-run", map[string]any{"name": "alpha"}, nil)
+	if respUnknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("未知动作状态码 = %d，期望 404（原文 %s）", respUnknown.StatusCode, rawUnknown)
+	}
+	if got := decodeTenonError(t, rawUnknown); got.Code != "UNKNOWN_ACTION" {
+		t.Errorf("code = %q，期望 UNKNOWN_ACTION", got.Code)
+	}
+}
+
+// 5b. 支持预演的动作 → 200 + {"dryRun":{status:"verified",diff:[...]}}，且不改状态。
+func TestDryRunSupportedReturnsReport(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+
+	resp, raw := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/"+writeActionID+":dry-run",
+		map[string]any{"name": "alpha"}, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+	var got struct {
+		DryRun struct {
+			Status string `json:"status"`
+			Diff   []struct {
+				Entity string `json:"entity"`
+				Field  string `json:"field"`
+				From   int    `json:"from"`
+				To     int    `json:"to"`
+			} `json:"diff"`
+		} `json:"dryRun"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("预演响应不是合法 JSON：%v（原文 %s）", err, raw)
+	}
+	if got.DryRun.Status != "verified" {
+		t.Errorf("dryRun.status = %q，期望 verified", got.DryRun.Status)
+	}
+	if len(got.DryRun.Diff) != 1 || got.DryRun.Diff[0].Field != "onHand" {
+		t.Errorf("dryRun.diff = %+v，期望一条 onHand 变化", got.DryRun.Diff)
+	}
+	if n := f.executed.Load(); n != 0 {
+		t.Errorf("预演产生了 %d 次副作用，期望 0", n)
+	}
+
+	// 声明 supported=false 的动作（本夹具的 read 动作）同样按能力不存在处理。
+	respRead, rawRead := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/"+readActionID+":dry-run",
+		map[string]any{"name": "alpha"}, nil)
+	if respRead.StatusCode != http.StatusNotFound || len(rawRead) != 0 {
+		t.Errorf("read 动作预演 = %d 且体长 %d，期望 404 且空体", respRead.StatusCode, len(rawRead))
+	}
+}
+
+// 6. 事件验签：正确签名 → 200 且可读回；错误签名与超容差 → 401；读不到密钥 → 一律拒。
+func TestEventSignatureVerification(t *testing.T) {
+	secret := prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+	now := time.Now().UTC()
+
+	countEvents := func() int {
+		t.Helper()
+		resp, raw := doJSON(t, http.MethodGet, srv.URL+"/tenon/events", nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("补课状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+		}
+		var page struct {
+			Events     []json.RawMessage `json:"events"`
+			NextCursor string            `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			t.Fatalf("补课响应不是合法 JSON：%v（原文 %s）", err, raw)
+		}
+		if page.NextCursor == "" {
+			t.Errorf("补课响应缺少 nextCursor：%s", raw)
+		}
+		return len(page.Events)
+	}
+
+	t.Run("正确签名可投递并可读回", func(t *testing.T) {
+		body := eventBodyWithID("evt_01JBSIGN0001")
+		resp, raw := do(t, http.MethodPost, srv.URL+"/tenon/events", body, map[string]string{
+			protocol.HeaderSignature: protocol.Sign(secret, now.Unix(), body),
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+		}
+		respPage, rawPage := doJSON(t, http.MethodGet, srv.URL+"/tenon/events", nil, nil)
+		var page struct {
+			Events []json.RawMessage `json:"events"`
+		}
+		if err := json.Unmarshal(rawPage, &page); err != nil {
+			t.Fatalf("补课响应不是合法 JSON：%v", err)
+		}
+		if respPage.StatusCode != http.StatusOK || len(page.Events) != 1 {
+			t.Fatalf("补课返回 %d 条事件，期望 1 条", len(page.Events))
+		}
+		if !bytes.Equal(bytes.TrimSpace(page.Events[0]), body) {
+			t.Errorf("读回的事件信封被改写：%s，期望 %s", page.Events[0], body)
+		}
+	})
+
+	t.Run("错误签名被拒", func(t *testing.T) {
+		body := eventBodyWithID("evt_01JBSIGN0002")
+		resp, raw := do(t, http.MethodPost, srv.URL+"/tenon/events", body, map[string]string{
+			protocol.HeaderSignature: protocol.Sign([]byte("not-the-secret"), now.Unix(), body),
+		})
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("状态码 = %d，期望 401（原文 %s）", resp.StatusCode, raw)
+		}
+		if got := decodeTenonError(t, raw); got.Code != "SIGNATURE_INVALID" {
+			t.Errorf("code = %q，期望 SIGNATURE_INVALID", got.Code)
+		}
+		if n := countEvents(); n != 1 {
+			t.Errorf("验签失败的事件入库了：事件数 = %d，期望 1", n)
+		}
+	})
+
+	t.Run("时间戳超容差被拒", func(t *testing.T) {
+		body := eventBodyWithID("evt_01JBSIGN0003")
+		stale := now.Add(-2 * protocol.SignatureTolerance)
+		resp, raw := do(t, http.MethodPost, srv.URL+"/tenon/events", body, map[string]string{
+			protocol.HeaderSignature: protocol.Sign(secret, stale.Unix(), body),
+		})
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("状态码 = %d，期望 401（原文 %s）", resp.StatusCode, raw)
+		}
+		if got := decodeTenonError(t, raw); got.Code != "SIGNATURE_EXPIRED" {
+			t.Errorf("code = %q，期望 SIGNATURE_EXPIRED", got.Code)
+		}
+		if n := countEvents(); n != 1 {
+			t.Errorf("超容差的事件入库了：事件数 = %d，期望 1", n)
+		}
+	})
+
+	t.Run("缺签名头被拒", func(t *testing.T) {
+		resp, raw := do(t, http.MethodPost, srv.URL+"/tenon/events", eventBodyWithID("evt_01JBSIGN0004"), nil)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("状态码 = %d，期望 401（原文 %s）", resp.StatusCode, raw)
+		}
+	})
+
+	t.Run("读不到密钥一律拒", func(t *testing.T) {
+		t.Setenv(EnvHMACSecretFile, filepath.Join(t.TempDir(), "absent.txt"))
+		body := eventBodyWithID("evt_01JBSIGN0005")
+		resp, raw := do(t, http.MethodPost, srv.URL+"/tenon/events", body, map[string]string{
+			protocol.HeaderSignature: protocol.Sign(secret, now.Unix(), body),
+		})
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("状态码 = %d，期望 503（fail-closed，原文 %s）", resp.StatusCode, raw)
+		}
+		if got := decodeTenonError(t, raw); got.Code != "SIGNATURE_SECRET_UNAVAILABLE" {
+			t.Errorf("code = %q，期望 SIGNATURE_SECRET_UNAVAILABLE", got.Code)
+		}
+		if n := countEvents(); n != 1 {
+			t.Errorf("无密钥时事件仍入库：事件数 = %d，期望 1", n)
+		}
+	})
+}
+
+// 7. 事件去重：同一 eventId 投两次 → 事件表里只有一条，审计也只有一行。
+func TestEventDeduplication(t *testing.T) {
+	secret := prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+	body := eventBodyWithID("evt_01JBDEDUP001")
+	signature := protocol.Sign(secret, time.Now().UTC().Unix(), body)
+
+	for i := 0; i < 2; i++ {
+		resp, raw := do(t, http.MethodPost, srv.URL+"/tenon/events", body, map[string]string{
+			protocol.HeaderSignature: signature,
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次投递状态码 = %d，期望 200（原文 %s）", i+1, resp.StatusCode, raw)
+		}
+		var got struct {
+			Duplicate bool `json:"duplicate"`
+		}
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("投递响应不是合法 JSON：%v（原文 %s）", err, raw)
+		}
+		if want := i == 1; got.Duplicate != want {
+			t.Errorf("第 %d 次投递 duplicate = %v，期望 %v", i+1, got.Duplicate, want)
+		}
+	}
+
+	resp, raw := doJSON(t, http.MethodGet, srv.URL+"/tenon/events", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("补课状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+	var page struct {
+		Events []json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil {
+		t.Fatalf("补课响应不是合法 JSON：%v", err)
+	}
+	if len(page.Events) != 1 {
+		t.Fatalf("事件表里有 %d 条，期望 1 条（按 eventId 去重）", len(page.Events))
+	}
+
+	var eventLines int
+	for _, rec := range readAuditLines(t) {
+		if rec.Kind == "event" && rec.EventID == "evt_01JBDEDUP001" {
+			eventLines++
+		}
+	}
+	if eventLines != 1 {
+		t.Errorf("审计里该事件有 %d 行，期望 1 行", eventLines)
+	}
+
+	// 另一个 eventId → 事件表与审计都要加一条。
+	other := eventBodyWithID("evt_01JBDEDUP002")
+	respOther, rawOther := do(t, http.MethodPost, srv.URL+"/tenon/events", other, map[string]string{
+		protocol.HeaderSignature: protocol.Sign(secret, time.Now().UTC().Unix(), other),
+	})
+	if respOther.StatusCode != http.StatusOK {
+		t.Fatalf("新事件状态码 = %d，期望 200（原文 %s）", respOther.StatusCode, rawOther)
+	}
+	_, rawAfter := doJSON(t, http.MethodGet, srv.URL+"/tenon/events", nil, nil)
+	if err := json.Unmarshal(rawAfter, &page); err != nil {
+		t.Fatalf("补课响应不是合法 JSON：%v", err)
+	}
+	if len(page.Events) != 2 {
+		t.Errorf("事件表里有 %d 条，期望 2 条", len(page.Events))
+	}
+}
+
+// 8. 业务拒绝 → 422，class=business_rejection、retryable=false，并落审计 error 行。
+func TestBusinessRejectionMapping(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+
+	resp, raw := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/"+writeActionID,
+		map[string]any{"name": rejectName}, idem("tenon:pln_01JB/s9"))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("状态码 = %d，期望 422（原文 %s）", resp.StatusCode, raw)
+	}
+	got := decodeTenonError(t, raw)
+	if got.Class != protocol.ClassBusinessRejection {
+		t.Errorf("class = %q，期望 %q", got.Class, protocol.ClassBusinessRejection)
+	}
+	if got.Code != "STOCK_INSUFFICIENT" {
+		t.Errorf("code = %q，期望 STOCK_INSUFFICIENT", got.Code)
+	}
+	if got.Retryable {
+		t.Error("business_rejection 必须 retryable=false（errors.md §3）")
+	}
+	if available, ok := got.Details["available"]; !ok || available != float64(3) {
+		t.Errorf("details = %v，期望含 available=3", got.Details)
+	}
+	if n := f.executed.Load(); n != 0 {
+		t.Errorf("业务拒绝前不应有成功副作用，计数器 = %d", n)
+	}
+
+	var found bool
+	for _, rec := range readAuditLines(t) {
+		if rec.Kind == "action" && rec.Action == writeActionID {
+			found = true
+			if rec.Result != "error" || rec.ErrorCode != "STOCK_INSUFFICIENT" {
+				t.Errorf("审计行 = %+v，期望 result=error、errorCode=STOCK_INSUFFICIENT", rec)
+			}
+		}
+	}
+	if !found {
+		t.Error("业务拒绝没有留下模块侧审计行")
+	}
+}
+
+// 9. 未知 action：GET 与 POST 都是 404 + contract_violation/UNKNOWN_ACTION。
+func TestUnknownAction(t *testing.T) {
+	prepareEnv(t)
+	srv := serve(t, newFixture().module)
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   any
+		extra  map[string]string
+	}{
+		{http.MethodGet, "/tenon/actions/demo.Nope", nil, nil},
+		{http.MethodPost, "/tenon/actions/demo.Nope", map[string]any{"name": "x"}, idem("tenon:pln_01JB/s1")},
+	} {
+		resp, raw := doJSON(t, tc.method, srv.URL+tc.path, tc.body, tc.extra)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s %s 状态码 = %d，期望 404（原文 %s）", tc.method, tc.path, resp.StatusCode, raw)
+		}
+		got := decodeTenonError(t, raw)
+		if got.Class != protocol.ClassContractViolation || got.Code != "UNKNOWN_ACTION" {
+			t.Errorf("%s %s 的错误 = %+v，期望 contract_violation/UNKNOWN_ACTION", tc.method, tc.path, got)
+		}
+	}
+}
+
+// 10. 版本协商：执行端点强制要求 Tenon-Version；只读端点按 versioning.md §4.3 宽松。
+func TestVersionHeaderEnforcement(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+	url := srv.URL + "/tenon/actions/" + writeActionID
+
+	t.Run("执行端点缺版本头即拒", func(t *testing.T) {
+		resp, raw := doJSON(t, http.MethodPost, url, map[string]any{"name": "alpha"},
+			map[string]string{protocol.HeaderVersion: "", protocol.HeaderIdempotencyKey: "tenon:pln_v/s1"})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("状态码 = %d，期望 400（原文 %s）", resp.StatusCode, raw)
+		}
+		if got := decodeTenonError(t, raw); got.Code != "VERSION_HEADER_MISSING" {
+			t.Errorf("code = %q，期望 VERSION_HEADER_MISSING", got.Code)
+		}
+		if n := f.executed.Load(); n != 0 {
+			t.Errorf("版本不符仍执行了业务，计数器 = %d，期望 0", n)
+		}
+	})
+
+	t.Run("major 不同即拒", func(t *testing.T) {
+		resp, raw := doJSON(t, http.MethodPost, url, map[string]any{"name": "alpha"},
+			map[string]string{protocol.HeaderVersion: "1.0", protocol.HeaderIdempotencyKey: "tenon:pln_v/s2"})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("状态码 = %d，期望 400（原文 %s）", resp.StatusCode, raw)
+		}
+		if got := decodeTenonError(t, raw); got.Code != "PROTOCOL_VERSION_UNSUPPORTED" {
+			t.Errorf("code = %q，期望 PROTOCOL_VERSION_UNSUPPORTED", got.Code)
+		}
+	})
+
+	t.Run("对端最低版本过高即拒", func(t *testing.T) {
+		resp, raw := doJSON(t, http.MethodPost, url, map[string]any{"name": "alpha"}, map[string]string{
+			protocol.HeaderMinVersion:     "0.2",
+			protocol.HeaderIdempotencyKey: "tenon:pln_v/s3",
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("状态码 = %d，期望 400（原文 %s）", resp.StatusCode, raw)
+		}
+		if got := decodeTenonError(t, raw); got.Code != "PROTOCOL_MIN_VERSION_TOO_HIGH" {
+			t.Errorf("code = %q，期望 PROTOCOL_MIN_VERSION_TOO_HIGH", got.Code)
+		}
+	})
+
+	t.Run("只读端点缺版本头仍可用", func(t *testing.T) {
+		resp, raw := doJSON(t, http.MethodGet, srv.URL+"/.well-known/tenon", nil,
+			map[string]string{protocol.HeaderVersion: ""})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("状态码 = %d，期望 200（versioning.md §4.3：缺版本按 0.1，原文 %s）", resp.StatusCode, raw)
+		}
+	})
+}
+
+// 11. 运维端点：healthz 永远 200；readyz 按密钥与审计可写决定 200/503。
+func TestHealthAndReady(t *testing.T) {
+	prepareEnv(t)
+	srv := serve(t, newFixture().module)
+
+	resp, raw := doJSON(t, http.MethodGet, srv.URL+"/healthz", nil, nil)
+	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(raw)) != "ok" {
+		t.Fatalf("healthz = %d/%q，期望 200/ok", resp.StatusCode, raw)
+	}
+
+	// 密钥不可读 → 503 并说明缺什么。
+	t.Setenv(EnvHMACSecretFile, filepath.Join(t.TempDir(), "absent.txt"))
+	resp, raw = doJSON(t, http.MethodGet, srv.URL+"/readyz", nil, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("readyz = %d，期望 503（原文 %s）", resp.StatusCode, raw)
+	}
+	var notReady struct {
+		Ready   bool     `json:"ready"`
+		Missing []string `json:"missing"`
+	}
+	if err := json.Unmarshal(raw, &notReady); err != nil {
+		t.Fatalf("readyz 响应不是合法 JSON：%v（原文 %s）", err, raw)
+	}
+	if notReady.Ready || !contains(notReady.Missing, "hmac_secret") {
+		t.Errorf("readyz 报文 = %+v，期望 ready=false 且 missing 含 hmac_secret", notReady)
+	}
+
+	// 依赖齐备 → 200。
+	prepareEnv(t)
+	resp, raw = doJSON(t, http.MethodGet, srv.URL+"/readyz", nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("readyz = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+}
+
+// 12. 模块侧审计：写操作追加一行，字段齐备且 argsHash 是入参的 sha256。
+func TestWriteAuditLine(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+	payload := map[string]any{"name": "alpha"}
+	requestBody, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("编组请求体失败：%v", err)
+	}
+
+	resp, raw := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/"+writeActionID, payload,
+		idem("tenon:pln_audit/s1"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+
+	lines := readAuditLines(t)
+	if len(lines) != 1 {
+		t.Fatalf("审计行数 = %d，期望 1（读操作不写审计）", len(lines))
+	}
+	rec := lines[0]
+	if rec.Module != fixtureModuleID {
+		t.Errorf("module = %q，期望 %q", rec.Module, fixtureModuleID)
+	}
+	if rec.Action != writeActionID || rec.Kind != "action" {
+		t.Errorf("action/kind = %q/%q，期望 %q/action", rec.Action, rec.Kind, writeActionID)
+	}
+	if rec.IdempotencyKey != "tenon:pln_audit/s1" {
+		t.Errorf("idempotencyKey = %q", rec.IdempotencyKey)
+	}
+	if rec.Result != "ok" || rec.ErrorCode != "" {
+		t.Errorf("result/errorCode = %q/%q，期望 ok/空", rec.Result, rec.ErrorCode)
+	}
+	sum := sha256.Sum256(requestBody)
+	if want := "sha256:" + hex.EncodeToString(sum[:]); rec.ArgsHash != want {
+		t.Errorf("argsHash = %q，期望 %q", rec.ArgsHash, want)
+	}
+	if _, err := time.Parse(time.RFC3339, rec.At); err != nil {
+		t.Errorf("at = %q 不是 RFC3339：%v", rec.At, err)
+	}
+}
+
+// 13. 补课/重放：游标自洽、分页不重不漏、非法游标与 limit 被拒。
+func TestEventReplayPagination(t *testing.T) {
+	secret := prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+
+	ids := []string{"evt_01JBPAGE0001", "evt_01JBPAGE0002", "evt_01JBPAGE0003"}
+	for _, id := range ids {
+		body := eventBodyWithID(id)
+		resp, raw := do(t, http.MethodPost, srv.URL+"/tenon/events", body, map[string]string{
+			protocol.HeaderSignature: protocol.Sign(secret, time.Now().UTC().Unix(), body),
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("投递 %s 状态码 = %d，期望 200（原文 %s）", id, resp.StatusCode, raw)
+		}
+	}
+
+	type page struct {
+		Events     []json.RawMessage `json:"events"`
+		NextCursor string            `json:"nextCursor"`
+	}
+	fetch := func(query string) page {
+		t.Helper()
+		resp, raw := doJSON(t, http.MethodGet, srv.URL+"/tenon/events"+query, nil, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("补课 %s 状态码 = %d，期望 200（原文 %s）", query, resp.StatusCode, raw)
+		}
+		var got page
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("补课响应不是合法 JSON：%v", err)
+		}
+		return got
+	}
+
+	first := fetch("?limit=2")
+	if len(first.Events) != 2 {
+		t.Fatalf("第一页 %d 条，期望 2 条", len(first.Events))
+	}
+	if first.NextCursor == "" {
+		t.Fatal("第一页缺少 nextCursor")
+	}
+	second := fetch("?since=" + first.NextCursor + "&limit=2")
+	if len(second.Events) != 1 {
+		t.Fatalf("第二页 %d 条，期望 1 条", len(second.Events))
+	}
+	if !bytes.Contains(second.Events[0], []byte(ids[2])) {
+		t.Errorf("第二页内容 = %s，期望最后一条事件", second.Events[0])
+	}
+	third := fetch("?since=" + second.NextCursor + "&limit=2")
+	if len(third.Events) != 0 {
+		t.Errorf("翻到底后仍有 %d 条事件", len(third.Events))
+	}
+	if third.NextCursor != second.NextCursor {
+		t.Errorf("空页游标 = %q，期望保持不变 %q", third.NextCursor, second.NextCursor)
+	}
+	// 同一个 since 重复取结果一致（天然幂等）。
+	again := fetch("?since=" + first.NextCursor + "&limit=2")
+	if len(again.Events) != len(second.Events) || again.NextCursor != second.NextCursor {
+		t.Errorf("同一个游标两次结果不同：%+v vs %+v", again, second)
+	}
+
+	for _, bad := range []string{"?since=not-a-cursor", "?limit=0", "?limit=abc"} {
+		resp, raw := doJSON(t, http.MethodGet, srv.URL+"/tenon/events"+bad, nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s 状态码 = %d，期望 400（原文 %s）", bad, resp.StatusCode, raw)
+			continue
+		}
+		want := "INVALID_CURSOR"
+		if strings.HasPrefix(bad, "?limit") {
+			want = "INVALID_LIMIT"
+		}
+		if got := decodeTenonError(t, raw); got.Code != want {
+			t.Errorf("%s 的 code = %q，期望 %q", bad, got.Code, want)
+		}
+	}
+}
+
+// 14. 启动自检：C1 的跨文档约束（keyFields ⊆ required）必须在启动时就失败。
+func TestValidateRejectsInconsistentDefinitions(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(f *fixture)
+		want   string
+	}{
+		{
+			name: "keyFields 不在 required 里",
+			mutate: func(f *fixture) {
+				f.module.Actions[1].Idempotency = &Idempotency{
+					KeyFields:         []string{"name", "absentField"},
+					Scope:             "module",
+					DuplicateBehavior: "return_first_result",
+				}
+			},
+			want: "keyFields",
+		},
+		{
+			name: "read 动作声明了 idempotency",
+			mutate: func(f *fixture) {
+				f.module.Actions[0].Idempotency = &Idempotency{
+					KeyFields:         []string{"name"},
+					Scope:             "module",
+					DuplicateBehavior: "return_first_result",
+				}
+			},
+			want: "idempotency",
+		},
+		{
+			name:   "声明了预演却没有回调",
+			mutate: func(f *fixture) { f.module.DryRun = nil },
+			want:   "dryRun",
+		},
+		{
+			name: "补偿动作不存在",
+			mutate: func(f *fixture) {
+				f.module.Actions[1].Compensation = &Compensation{
+					Action: "demo.MissingAction",
+					ArgMap: map[string]string{"name": "$in.name"},
+				}
+			},
+			want: "补偿动作",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture()
+			tc.mutate(f)
+			err := f.module.Validate()
+			if err == nil {
+				t.Fatal("期望 Validate 失败，实际通过")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("错误信息 = %q，期望包含 %q", err.Error(), tc.want)
+			}
+		})
+	}
+
+	// 反过来：健康定义必须通过自检，且 TimeoutMs=0 被显式化为协议兜底值。
+	f := newFixture()
+	f.module.Actions[1].TimeoutMs = 0
+	if err := f.module.Validate(); err != nil {
+		t.Fatalf("合法定义自检失败：%v", err)
+	}
+	if got := f.module.Actions[1].TimeoutMs; got != DefaultTimeoutMs {
+		t.Errorf("timeoutMs = %d，期望兜底为 %d", got, DefaultTimeoutMs)
+	}
+}
+
+// 16. TENON_MODULE_ID 覆盖 manifest.module.id 与审计的 module 字段（interfaces.md §6）。
+func TestModuleIDOverride(t *testing.T) {
+	prepareEnv(t)
+	t.Setenv(EnvModuleID, "inventory-shadow")
+	f := newFixture()
+	srv := serve(t, f.module)
+
+	_, raw := doJSON(t, http.MethodGet, srv.URL+"/.well-known/tenon", nil, nil)
+	var got struct {
+		Module struct {
+			ID      string `json:"id"`
+			Version string `json:"version"`
+		} `json:"module"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("manifest 不是合法 JSON：%v（原文 %s）", err, raw)
+	}
+	if got.Module.ID != "inventory-shadow" {
+		t.Errorf("manifest.module.id = %q，期望被 TENON_MODULE_ID 覆盖", got.Module.ID)
+	}
+	if got.Module.Version != "0.1.0" {
+		t.Errorf("manifest.module.version = %q，期望 0.1.0", got.Module.Version)
+	}
+
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/tenon/actions/"+writeActionID,
+		map[string]any{"name": "alpha"}, idem("tenon:pln_override/s1"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（原文 %s）", resp.StatusCode, body)
+	}
+	lines := readAuditLines(t)
+	if len(lines) != 1 {
+		t.Fatalf("审计行数 = %d，期望 1", len(lines))
+	}
+	if lines[0].Module != "inventory-shadow" {
+		t.Errorf("审计 module = %q，期望随 TENON_MODULE_ID 一起被覆盖", lines[0].Module)
+	}
+}
+
+// 15. Content-Type：头存在却不是 JSON → 400；缺头按 JSON 处理。
+func TestContentTypeEnforcement(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+	url := srv.URL + "/tenon/actions/" + writeActionID
+
+	resp, raw := doJSON(t, http.MethodPost, url, map[string]any{"name": "alpha"}, map[string]string{
+		"Content-Type":                "text/plain",
+		protocol.HeaderIdempotencyKey: "tenon:pln_ct/s1",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d，期望 400（原文 %s）", resp.StatusCode, raw)
+	}
+	if got := decodeTenonError(t, raw); got.Code != "UNSUPPORTED_CONTENT_TYPE" {
+		t.Errorf("code = %q，期望 UNSUPPORTED_CONTENT_TYPE", got.Code)
+	}
+	if n := f.executed.Load(); n != 0 {
+		t.Errorf("content-type 不符仍执行了业务，计数器 = %d，期望 0", n)
+	}
+
+	resp, raw = doJSON(t, http.MethodPost, url, map[string]any{"name": "alpha"}, map[string]string{
+		"Content-Type":                "application/json; charset=utf-8",
+		protocol.HeaderIdempotencyKey: "tenon:pln_ct/s2",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("带 charset 的 application/json 状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+}
