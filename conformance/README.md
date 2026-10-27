@@ -1,6 +1,8 @@
-# @tenon/conformance
+# conformance（Go）
 
 可执行规范：把 §10 的 C1–C10 与 D1 差异测试做成 runner。规范的可信度来自「第三方跑测即可自证合规」，而不是文档措辞（§1.1 目标 3）。
+
+**实现语言是 Go**，交付形态是单二进制：第三方下载一个文件就能自证合规，不必先装 Node 或 Python（D17）。
 
 ## 职责边界
 
@@ -10,15 +12,17 @@
   - 通过全部用例后签发 badge `tenon-conformant-0.1`（§10.2；签发流程属 M2）。
 - 不负责：
   - 不规定协议：用例只是 §4 / §5 规范条款的投影。按 §2.1 判据，写不出用例的条款就不该进协议。
-  - 不做反模式静态扫描本身：C10 的扫描器在 `@tenon/lint`，本包只调用它并汇总结果。
+  - 不做反模式静态扫描本身：C10 的扫描器在 `tools/lint`（Go），本包调用它并汇总结果。
   - 不替代人工验收：一致性通过不等于业务正确，更不等于体验合格。
   - 不做性能压测与安全渗透测试。
 
 ## 依赖
 
 - 对 dsh：**无依赖**。任何语言的实现都应能跑这套用例（§10、§12 M2 出口判据），runner 绑死 dsh 就失去意义。
-- 包间依赖：→ `@tenon/lint`（C10 扫描器）、→ `@tenon/core`（manifest / Action / Audit 的 schema 校验，C1 与 C4 需要）。
-- 方向：conformance → lint / tenon-core；被测目标通过 `--target` 以 HTTP / MCP 交互，不被 import。
+- 对 Node：**无依赖**。套件自身不装 Node；被测目标是 TS 实现时，只是把它的地址交给 `--target`。
+- 仓内依赖：→ `tenon.dev/tools/lint`（C10 扫描器，同仓 Go 包）。
+- schema 校验（C1/C4 需要）：用 Go 的 JSON Schema 库解析 `spec/0.1/schemas/`。**库选型是 M0 的阻塞项**，必须是支持 draft 2020-12 的实现，且用「一份已知应失败的实例」做正反对拍（设计文档 §15 未决问题 6）。
+- 方向：conformance → lint；被测目标通过 `--target` 以 HTTP / MCP 交互，不被 import。
 
 ## 用例表
 
@@ -38,15 +42,17 @@
 
 ## 命令形态（计划提供）
 
-本阶段**不发布 `bin`**：`package.json` 里没有 `bin` 字段，因为 `dist/cli.js` 尚不存在，先声明就会骗人。计划提供的形态是：
+本阶段**不发布二进制**：仓库里没有 `cmd/`，因为实现尚不存在，先声明就会骗人。计划提供的形态是单二进制 `tenon`，子命令区分工具：
 
 ```
 tenon conformance run --target http://localhost:8080 --report out.json
+tenon lint --path .                                 # C10 扫描，见 tools/lint
 ```
 
 - `--target`：被测实现的基地址（模块侧 6 端点 + 宿主侧 4 端点所在的同一 origin）。
 - `--report`：机器可读报告输出路径，内容为逐用例结果与证据。
 - 退出码：全绿 `0`，任一用例失败非 `0`（便于直接进 CI）。
+- 分发：单文件二进制，`go install tenon.dev/...` 或直接下载 release 产物；无运行时依赖。
 
 ## badge
 
@@ -68,7 +74,7 @@ tenon conformance run --target http://localhost:8080 --report out.json
 
 ## 阶段状态
 
-M0（当前）：只有骨架，未实现。M0 计划实现 C1–C5 / C8 / C9 / C10 与 D1 的 runner 及报告输出，达成 M0 出口判据「D1 与 C10 全绿」。
+M0（当前）：Go 包只有包声明与文档（`doc.go`），未实现。M0 计划实现 C1–C5 / C8 / C9 / C10 与 D1 的 runner 及报告输出，达成 M0 出口判据「D1 与 C10 全绿」。
 
 M1 计划实现 C6（事件重放）与 C7（补偿），并把 C5 从桩切到真引擎对真引擎。
 

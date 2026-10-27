@@ -9,6 +9,18 @@ Tenon 纵切面演示：标准件报价完成 → 核对库存 → 扣减（或�
 
 quote 是触发器，inventory 是主路径 + 补偿，procurement 是**分支路径**。只有存在两条可能路径，才能用差异测试（D1）证明 agent 在**推理**而不是在跑流水线（§6.1、D12）。
 
+## 模块实现语言：1 个 TS + 2 个 Go（按测试目的分配，不为好看）
+
+| 模块 | 语言 / 形态 | 为什么是它 |
+|---|---|---|
+| quote | TypeScript，in-process cordis 插件 | 它是事件源头，必须验证 `dsh-plugin-module-host` 的**进程内**路径（注册 action、发事件、HMR 热插拔）。这条路径只有 TS 能测，Go 侧车测不到 |
+| inventory | Go，HTTP 侧车 | 协议最重的写路径（幂等 / 补偿 / 前置条件 / 审计双写 / dry-run）。**用侧车是为了强制走真实 HTTP 报文**——写成 in-process 插件就能直接 import 类型、绕过 schema 校验，协议的空洞会被掩盖掉 |
+| procurement | Go，HTTP 侧车 | 分支路径的第二跳，与 inventory 同构，顺便验证「模块清单里有两个 HTTP 模块时，能力发现能否都看见」 |
+
+所以这不是「三种语言秀多样性」，而是**两条接入路径各测一次**：进程内（TS 插件）与跨进程（Go 侧车）。少任何一条，M0 的出口判据都缺一半。
+
+为什么侧车不选 Python：`conformance/` 与 `tools/lint/` 已经是 Go，模块也用 Go 就只需装一套工具链；Python SDK 是 M2 要交付的**接入示例**，不该成为 M0 demo 的运行依赖。
+
 ## 模块与能力清单
 
 | 模块 | actions | events | 用途 |

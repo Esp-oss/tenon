@@ -695,7 +695,7 @@ tenon conformance run --target http://localhost:8080 --report out.json
 2. 错误码 → action 的映射（`case STOCK_INSUFFICIENT: call(...)`）
 3. skill 正文里出现 `模块.action` 标识符
 
-任一命中 → 失败。可对任意接入方仓库运行（`@tenon/lint`）。
+任一命中 → 失败。可对任意接入方仓库运行（`tools/lint`，Go 单二进制）。
 
 通过者获 badge：`tenon-conformant-0.1`。
 
@@ -705,6 +705,7 @@ tenon conformance run --target http://localhost:8080 --report out.json
 
 ```
 tenon/
+├── go.mod                      # Go 模块 tenon.dev（conformance / lint）
 ├── spec/0.1/
 │   ├── schemas/*.json          # 唯一真源：manifest/action/event/plan/intent/grant/policy/audit/error
 │   ├── manifest.md action.md event.md plan.md intent.md
@@ -713,21 +714,23 @@ tenon/
 │   ├── semantics.md            # §5.2 的执行参数
 │   └── CHANGELOG.md
 ├── scripts/build-spec.mts      # 由 schema 生成 md 字段表（md 不手写字段定义）
-├── conformance/
-│   ├── cases/*.yaml            # C1–C10 + D1
-│   └── src/runner.ts
-├── packages/
+├── conformance/                # Go 包：可执行规范（C1–C10 + D1）
+│   ├── doc.go
+│   └── cases/*.yaml            # 用例与断言
+├── tools/lint/                 # Go 包：C10 反模式扫描（纯词法，不引 cgo）
+├── packages/                   # TypeScript：dsh 侧
 │   ├── tenon-core/             # 类型 + schema 校验 + 幂等/哈希/寻址工具（不依赖 dsh）
-│   ├── tenon-lint/             # C10 AST lint
 │   ├── dsh-plugin-module-host/ # 参考实现#1：cordis 插件，把模块挂进 dsh
 │   ├── dsh-plugin-governance/  # 控制平面（registry/grant/policy/audit）
 │   ├── dsh-plugin-intent-ui/   # 共驾三帧服务 + 前端 UI 插件
 │   ├── dsh-plugin-skill-biz/   # 业务流程 skill 仓库（复用 dsh-skill）
-│   └── sidecar-http/           # 参考实现#2：任意语言接入的 HTTP 侧车
-├── demo/mini-erp/              # quote + inventory + procurement + 前端页面
+│   └── sidecar-http/           # 参考实现#2：非 TS 模块的 HTTP 侧车
+├── demo/mini-erp/              # quote（TS 插件）+ inventory / procurement（Go 侧车）+ 前端页面
 ├── docs/                       # 架构图、接入指南
 └── .gitignore                  # 含 .superpowers/
 ```
+
+语言分工的原则见 §0 与 D17：**工具链用 Go（单二进制分发）、宿主用 TS（dsh 硬约束）、协议用 JSON**。
 
 ---
 
@@ -735,7 +738,7 @@ tenon/
 
 | 阶段 | 内容 | 出口判据 | 估算 |
 |---|---|---|---|
-| **M0 骨架** | `spec/0.1` schema + conformance C1–C5/C8/C9/C10 + D1 + `tenon-lint` + mini-erp 三模块 + `dsh-plugin-module-host` + 「报价→扣库存」端到端 | 一条命令起 demo；**D1 与 C10 全绿**；注入 `dispatched` 写失败必须拒绝执行（可测） | 2 人周 |
+| **M0 骨架** | `spec/0.1` schema + conformance C1–C5/C8/C9/C10 + D1（Go）+ `tools/lint`（Go）+ mini-erp 三模块（1 TS 插件 + 2 Go 侧车）+ `dsh-plugin-module-host` + 「报价→扣库存」端到端 | 一条命令起 demo；**D1 与 C10 全绿**；注入 `dispatched` 写失败必须拒绝执行（可测）；Go 侧 schema 库正反对拍通过 | 2 人周 |
 | **M1 治理** | grant 矩阵 + policy 引擎 + 审批 UI + 审计查询/回放 + 对账 job + C6/C7 | 高风险路径必须人工；对账能发现人为篡改 | 1.5 人周 |
 | **M2 兼容** | HTTP sidecar SDK + MCP 双向 + Python 示例 + 一致性 badge | 非 TS 模块接入跑通全套用例 | 2 人周 |
 | **M3 知识** | skill 仓库 + 轨迹蒸馏半自动 + 发布审计/回滚 | 新业务流程只改 skill 即可上线 | 1.5 人周 |
@@ -781,6 +784,8 @@ tenon/
 | D14 | 事件订阅粒度 | 声明订阅 + M1 补漏判检测 | 全面订阅成本不可控 |
 | D15 | 上下文成本 | 摘要优先 + 按需拉完整 schema | manifest 摘要层已现成 |
 | D16 | 命名 | Tenon（榫卯） | ASIP 与同领域 3 个项目撞名 |
+| D17 | 工具链语言 | **Go**（conformance + lint），dsh 宿主仍 TS | 套件要发给第三方自证合规，单二进制/交叉编译/零运行时依赖是硬优势；TS 只适合当宿主 |
+| D18 | demo 模块语言 | **1 TS 插件 + 2 Go 侧车**，按测试目的分配 | 进程内路径与跨进程路径各测一次；侧车强制真实报文，堵住"绕过协议直接 import" |
 
 ---
 
@@ -791,6 +796,8 @@ tenon/
 3. **配额单位扩展**：`quotaUnit` 目前只有 `calls` / `quantity`，是否需要 `money`。
 4. **策略 DSL 表达力边界**：`all/any/not` + 9 个算子是否够；何时需要引入表达式语言（会牺牲可测试性）。
 5. **skill 正文里允许的动作标识符例外**：例如"禁止调用 X"这类否定描述是否要放行。
+6. **Go 侧 JSON Schema 库选型（M0 阻塞项）**：必须支持 draft 2020-12。候选实现的能力矩阵未经本机核实（连不上 raw.githubusercontent），落地判据是**正反对拍**——同一份 `action.schema.json`，一条合法实例必须过、一条已知应失败的实例必须挂；不合格的库直接出局。
+7. **lint 词法扫描的误报率上限**：纯 Go 词法方案不引 cgo，代价是可能误报。M0 需定一个可接受阈值（真阳性 3/3 必中、demo 与 packages 零误报），否则改用 cgo + tree-sitter 并接受分发代价。
 
 ---
 

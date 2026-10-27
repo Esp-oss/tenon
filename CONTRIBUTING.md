@@ -17,17 +17,29 @@
 
 ## 反模式检查
 
-任何 PR 里如果出现「事件类型/错误码 → 具体 action」的映射代码，会被 `@tenon/lint` 拦下，也会被 review 拒绝。原因见设计文档 §2.2：
+任何 PR 里如果出现「事件类型/错误码 → 具体 action」的映射代码，会被 `tools/lint` 拦下，也会被 review 拒绝。原因见设计文档 §2.2：
 
 > 接入方为了跑通业务流程，必须写「某事件/某错误 → 调某 action」的映射代码 —— 此时系统已退化为程序驱动，Tenon 在该接入点失效。
 
 ## 本地检查
 
 ```bash
-node scripts/validate-spec.mjs
+node scripts/validate-spec.mjs   # 规范静态校验（零依赖）
+go vet ./...                     # Go 工具链骨架
+gofmt -l .                       # 应为空
 ```
 
-CI 在 Node 22 与 24 上跑同一脚本，两条都要绿。
+CI 在 Node 22 与 24 上跑规范校验，Go 侧跑 `go vet` 与 `gofmt`。
+
+## 工具链
+
+| 层 | 需要装 |
+|---|---|
+| 规范（`spec/`） | 只需 Node 22+（校验脚本零依赖） |
+| dsh 插件与类型（`packages/`） | Node 22+、pnpm 11+ |
+| 一致性套件、lint、Go 模块 | Go 1.26+ |
+
+改动 `packages/` 才需要 pnpm；只改 `spec/` 或 Go 代码时不要引入 Node 依赖。
 
 ## 提交信息
 

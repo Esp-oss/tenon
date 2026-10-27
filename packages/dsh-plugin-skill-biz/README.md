@@ -11,14 +11,14 @@
   - 版本可追溯：为每次运行固定「用了哪个 skill 版本」，供复现与审计回放（§6.2 T4 加载 `quote-to-fulfillment@1.2`、R7）。
 - 不负责：
   - 不执行 skill 正文，执行是 agent 的职责。
-  - 不扫描正文里的 `模块.action` 标识符——规则 3 属 `@tenon/lint`（C10），本包只要求在发布前调用它并记录结果。
+  - 不扫描正文里的 `模块.action` 标识符——规则 3 属 `tools/lint`（C10），本包只要求在发布前调用它并记录结果。
   - 不规定 skill 怎么写业务语义：那是知识，不是协议。
   - 不设审批卡口：D8 明确用「强审计 + 可回滚」替代发布审批。
 
 ## 依赖
 
 - 对 dsh：`peerDependencies` 声明 `@deepseek-ai/cordis: ">=3"`；直接复用 `dsh-skill`（skill 加载与 frontmatter 解析，§0 ①），不自研 skill 格式。
-- 包间依赖：→ `@tenon/core`（`tenon:` 元数据结构校验，M3 起）；→ `@tenon/lint`（发布前 C10 规则 3 检查）；→ `@tenon/dsh-plugin-governance` 的审计写入端点（发布与回滚进审计链）。
+- 包间依赖：→ `@tenon/core`（`tenon:` 元数据结构校验，M3 起）；→ `tools/lint`（发布前 C10 规则 3 检查，进程外调用 Go 二进制）；→ `@tenon/dsh-plugin-governance` 的审计写入端点（发布与回滚进审计链）。
 - 方向：被 agent 运行时读取（T4 加载 skill）；本包不反向调用模块或控制平面的内部实现。
 
 ## 阶段状态

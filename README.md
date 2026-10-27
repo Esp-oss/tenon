@@ -40,7 +40,7 @@ Tenon 划了一条可机械检验的界线：
 
 硬编码映射的实现，摘掉模块后行为**要么不变**（说明它根本没在用那个模块）、**要么崩溃**（说明映射写死了）。只有真在按能力清单推理，行为才会自适应地改变。
 
-辅助手段是 `@tenon/lint` 的 AST 扫描（事件订阅回调里的 action 字面量、错误码→action 映射、skill 正文里的动作标识符）。
+辅助手段是 `tools/lint` 的静态扫描（事件订阅回调里的 action 字面量、错误码→action 映射、skill 正文里的动作标识符）。
 
 ## 架构
 
@@ -74,6 +74,22 @@ flowchart TB
 
 **协议住在规范里，dsh 只是第一个宿主。** 协议层不 import 任何 dsh 类型；非 TypeScript 系统通过 HTTP 侧车接入，一样合规。
 
+## 语言选型：按层选，不按偏好选
+
+| 层 | 语言 | 为什么 |
+|---|---|---|
+| 协议线格式 | JSON Schema | 语言无关是**设计要求**，不是实现偏好 |
+| dsh 宿主 | TypeScript | 硬约束：dsh 是 cordis 插件树，原生插件入口就是 JS |
+| 一致性套件 + lint | **Go** | 交付形态是单文件二进制——第三方下载即自证合规，不必先装 Node/Python |
+| HTTP 侧车 / demo 模块 | Go | 与套件共用一套工具链；跨进程强制走真实报文，堵住"绕过协议直接 import"的偷懒 |
+| 协议类型定义 | TypeScript | 由 schema 派生，供 dsh 侧编译期使用 |
+
+**为什么不用 Rust / C++**：本项目是 I/O 与编排密集型，零 GC 与零开销带来的收益接近于零，而 JSON Schema draft 2020-12 的生态成熟度与开发速度是实质收益。真出现热点（HMAC 验签、批量 schema 校验）再局部换语言，那是实现细节，不是选型。
+
+**为什么 Python 不是首发**：`jsonschema` 4.x 原生支持 2020-12，生态与可读性都最好，但交付一个需要解释器的 CLI 会显著抬高接入门槛。Python 的正确位置是 M2 的 **SDK 接入示例**，不是工具链。
+
+> 一处诚实的不确定：各语言对 draft 2020-12 的支持矩阵我没有逐条核实（本机连不上 raw.githubusercontent）。所以 Go 侧的 JSON Schema 库选型是 M0 的阻塞项，验收方式是**正反对拍**：同一份 `action.schema.json`，一条合法实例必须过、一条已知应失败的实例必须挂。
+
 ## 九类契约
 
 | 契约 | 方向 | 关键内容 |
@@ -103,10 +119,11 @@ flowchart TB
 ## 仓库结构
 
 ```
-spec/0.1/         规范：schema 是唯一真源，md 只写语义
-conformance/      可执行规范：C1–C10 + D1 差异测试
-packages/         tenon-core / tenon-lint / 4 个 dsh 插件 / sidecar-http
-demo/mini-erp/    三模块纵切面：quote + inventory + procurement
+spec/0.1/         规范：schema 是唯一真源，md 只写语义（JSON Schema）
+conformance/      可执行规范：C1–C10 + D1 差异测试（Go）
+tools/lint/       C10 反模式扫描器（Go）
+packages/         @tenon/core 类型 + 4 个 dsh 插件 + HTTP 侧车（TypeScript）
+demo/mini-erp/    quote（TS 插件）+ inventory / procurement（Go 侧车）
 docs/             设计文档与架构图
 ```
 
@@ -119,6 +136,7 @@ docs/             设计文档与架构图
 ```bash
 pnpm install
 pnpm check      # 校验 spec/0.1 全部 schema + 类型检查 @tenon/core
+go vet ./...    # Go 工具链骨架（conformance / tools/lint）
 ```
 
 - `pnpm validate` —— 只跑规范校验（零依赖）
