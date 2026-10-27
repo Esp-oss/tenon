@@ -41,6 +41,14 @@
 //     响应一律带 Tenon-Version/Tenon-Min-Version。本轮只实现 0.1，不做版本协商；
 //   - **GET /tenon/modules 返回管理面视图**（registry.List，含 enabled=false 的条目）：
 //     D1 的 B 轮要能看见「被摘除」这件事。调用方（agent）按 enabled 过滤后再做能力发现；
+//   - **读动作必须逐个登记**：G2 闸门对未命中的动作一律 deny（fail-closed），所以
+//     config/policies.dev.json 显式给 inventory.GetStock、quote.GetQuote 各写了一条
+//     outcome=auto 的低优先级规则。这里**刻意不做**「kind=read 即自动放行」的特例：
+//     M0.5 的 host 拿不到 action 定义，无法独立核实调用方自称的 kind，那种特例等于给
+//     「自称只读就放行」开一个洞。代价是接入方必须逐个登记——这正是 fail-closed 该有的
+//     样子；漏登记一个动作的后果是该动作所在的整份 plan 被判 deny（闸门上的响失败），
+//     不是静默放行。M1 引入能力发现（GET /.well-known/tenon）后，host 才能自己判定
+//     kind 并据此放宽这条口子；
 //   - **共驾帧队列是有界内存队列**（maxIntentFrames）。前端不接入时帧本就该丢弃
 //     （design §3.2 决定 1），溢出时丢最旧的，并在回放响应里给出累计 dropped；
 //   - **审计 GET 的 since 是写入顺序的 0 基序号**，不是过滤后的序号：只有它在
@@ -905,6 +913,7 @@ func (s *Server) serveIntentAck(w http.ResponseWriter, r *http.Request) {
 			"请求体必须是 {\"upto\": <序号>}："+err.Error()))
 		return
 	}
+	// 省略 upto 表示「确认到目前为止已入队的全部帧」：这是无参 ack 唯一说得通的语义。
 	upto := s.intents.highest()
 	if req.Upto != nil {
 		if *req.Upto < 0 {
@@ -1028,6 +1037,14 @@ func (q *intentQueue) highest() int64 {
 //
 // 未知字段一律报错：配置里写错一个键名会让规则静默失效，而策略静默失效的代价是
 // 本该审批的动作被 deny 或反过来——两种都不该靠人肉 review 发现。
+//
+// 但注意这里的「未知字段」只指 JSON 的**字段名**（DisallowUnknownFields 的语义），
+// 不包括 match.actions 里的**动作 id**：host 没有动作清单（M0.5 不做能力发现），
+// 无从判断一个动作 id 是否真实存在（见包注释「读动作必须逐个登记」）。因此写错动作名
+// 的规则会一直加载成功、但永不命中，代价是该动作所在的整份 plan 被 G2 判 deny——
+// 失败是闸门上的响失败（响应里有 NO_POLICY_MATCH_DEFAULT_DENY），不是启动期报错，
+// 也不是静默放行。when 里的算子/取值写法错误则相反：引擎在构造期就记下错误，
+// New 的启动自检会直接让宿主起不来。
 func LoadPolicies(path string) ([]policy.PolicyRule, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {

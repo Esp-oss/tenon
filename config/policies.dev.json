@@ -26,5 +26,25 @@
     "when": { "all": [] },
     "outcome": "approve",
     "approvers": ["role:procurement_manager"]
+  },
+  {
+    "policyId": "pol-inventory-getstock-auto",
+    "priority": 10,
+    "match": {
+      "module": "inventory",
+      "actions": ["inventory.GetStock"]
+    },
+    "when": { "all": [] },
+    "outcome": "auto"
+  },
+  {
+    "policyId": "pol-quote-getquote-auto",
+    "priority": 10,
+    "match": {
+      "module": "quote",
+      "actions": ["quote.GetQuote"]
+    },
+    "when": { "all": [] },
+    "outcome": "auto"
   }
 ]

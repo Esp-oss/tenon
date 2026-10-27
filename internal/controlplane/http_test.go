@@ -919,17 +919,30 @@ func TestLoadDevConfigFiles(t *testing.T) {
 	})
 	ts := serveHost(t, srv)
 
-	// 策略：qty 12 → approve（带审批人）；qty 3 → 无命中 deny；采购申请 → approve；读动作 → 无命中 deny。
+	// 策略：写动作靠 approve 规则；读动作在 dev 配置里显式登记成 auto（见 http.go 包注释
+	// 「读动作必须逐个登记」）；未登记的动作仍然 deny —— 这是 fail-closed 的不变量。
 	cases := []struct {
 		action        string
 		args          string
 		wantOutcome   string
 		wantApprovers []string
+		wantReasons   []string
 	}{
-		{"inventory.DeductStock", `{"sku":"STD-1001","qty":12}`, policy.OutcomeApprove, []string{"role:warehouse_manager"}},
-		{"inventory.DeductStock", `{"sku":"STD-1001","qty":3}`, policy.OutcomeDeny, []string{}},
-		{"procurement.CreatePurchaseRequest", `{"sku":"STD-1002","qty":12}`, policy.OutcomeApprove, []string{"role:procurement_manager"}},
-		{"inventory.GetStock", `{"sku":"STD-1001"}`, policy.OutcomeDeny, []string{}},
+		{"inventory.DeductStock", `{"sku":"STD-1001","qty":12}`, policy.OutcomeApprove,
+			[]string{"role:warehouse_manager"}, []string{policy.ReasonApprovalRequired}},
+		{"inventory.DeductStock", `{"sku":"STD-1001","qty":3}`, policy.OutcomeDeny,
+			[]string{}, []string{policy.ReasonNoMatch}},
+		{"procurement.CreatePurchaseRequest", `{"sku":"STD-1002","qty":12}`, policy.OutcomeApprove,
+			[]string{"role:procurement_manager"}, []string{policy.ReasonApprovalRequired}},
+		// 读动作逐个登记后的效果：读 get 放行（auto）。
+		{"inventory.GetStock", `{"sku":"STD-1001"}`, policy.OutcomeAuto,
+			[]string{}, []string{policy.ReasonAuto}},
+		// Task 9 会加的 quote 读动作：规则已在 dev 配置里登记，这里锁住它不被误删。
+		{"quote.GetQuote", `{"quoteId":"Q-2026-0417"}`, policy.OutcomeAuto,
+			[]string{}, []string{policy.ReasonAuto}},
+		// fail-closed 不变量：没登记过的动作照样 deny，不能因为「看起来是读」就放行。
+		{"inventory.Unknown", `{"sku":"STD-1001"}`, policy.OutcomeDeny,
+			[]string{}, []string{policy.ReasonNoMatch}},
 	}
 	for _, tc := range cases {
 		body := planBody(`{"stepId":"s1","action":"` + tc.action + `","args":` + tc.args + `}`)
@@ -944,10 +957,40 @@ func TestLoadDevConfigFiles(t *testing.T) {
 				tc.action, tc.args, got.Outcome, tc.wantOutcome, raw)
 		}
 		wantStrings(t, "approvers", got.Approvers, tc.wantApprovers)
+		wantStrings(t, "reasons", got.Reasons, tc.wantReasons)
 	}
 
+	// 读 + 写的多步 plan：读步骤（auto）不得把整份 plan 拉到 deny，最终仍取写步骤的 approve。
+	st, raw := postJSON(t, ts.URL+"/tenon/policies:evaluate", planBody(
+		`{"stepId":"s1","action":"inventory.GetStock","args":{"sku":"STD-1001"}},`+
+			`{"stepId":"s2","action":"inventory.DeductStock","args":{"sku":"STD-1001","qty":12}}`))
+	if st != 200 {
+		t.Fatalf("读+写多步 plan 求值失败：%d %s", st, raw)
+	}
+	var mixed policy.PolicyEvaluation
+	decodeInto(t, raw, &mixed)
+	if mixed.Outcome != policy.OutcomeApprove {
+		t.Fatalf("读+写多步 plan 应取 approve（读 auto 不拉低写 approve），得到 %s", raw)
+	}
+	wantStrings(t, "decidedBy", mixed.DecidedBy, []string{"pol-inventory-deduct-approve"})
+
+	// 写步骤未登记（qty 3 无规则）时，读步骤的 auto 也救不回来：整份 plan 仍是 deny。
+	st, raw = postJSON(t, ts.URL+"/tenon/policies:evaluate", planBody(
+		`{"stepId":"s1","action":"inventory.GetStock","args":{"sku":"STD-1001"}},`+
+			`{"stepId":"s2","action":"inventory.DeductStock","args":{"sku":"STD-1001","qty":3}}`))
+	if st != 200 {
+		t.Fatalf("读+未登记写多步 plan 求值失败：%d %s", st, raw)
+	}
+	var mixedDeny policy.PolicyEvaluation
+	decodeInto(t, raw, &mixedDeny)
+	if mixedDeny.Outcome != policy.OutcomeDeny {
+		t.Fatalf("未登记的写步骤必须把整份 plan 拉成 deny，得到 %s", raw)
+	}
+	wantStrings(t, "decidedBy", mixedDeny.DecidedBy, []string{})
+	wantStrings(t, "reasons", mixedDeny.Reasons, []string{policy.ReasonNoMatch})
+
 	// 授权：ag_fulfillment 代 user:alice 扣 12 → 放行且余量 88；委托人换人 → 权限不足。
-	st, raw := postJSON(t, ts.URL+"/tenon/grants:evaluate",
+	st, raw = postJSON(t, ts.URL+"/tenon/grants:evaluate",
 		`{"agent":"ag_fulfillment","onBehalfOf":"user:alice","action":"inventory.DeductStock","args":{"sku":"STD-1001","qty":12}}`)
 	if st != 200 {
 		t.Fatalf("授权评估失败：%d %s", st, raw)
