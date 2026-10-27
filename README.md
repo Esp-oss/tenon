@@ -153,6 +153,23 @@ go vet ./...    # Go 工具链骨架（conformance / tools/lint）
 | M2 | HTTP 侧车 SDK + MCP 双向 + 非 TS 示例 | 非 TS 模块跑通全套用例 |
 | M3 | skill 仓库 + 轨迹蒸馏 + 发布审计/回滚 | 新流程只改 skill 即可上线 |
 
+## 容器
+
+三层，**只有第一层现在能跑**（细节与判据见 [docker/README.md](docker/README.md)）：
+
+```bash
+docker compose up -d docs      # 文档站 → http://localhost:8088（规范 + 架构图 + 设计文档）
+docker compose run --rm spec   # 规范校验（与 CI 的 spec job 同源）
+docker compose run --rm go     # Go 工具链 gofmt/vet/build（与 CI 的 go job 同源）
+```
+
+M0 的目标拓扑（`host` + `inventory` + `procurement` + `conformance` + `lint`，两段网络）在 [compose.m0.yaml](compose.m0.yaml)：
+`docker compose -f compose.m0.yaml config` 现在就能过；`build` 会在 `go build ./cmd/...` 与
+`pnpm run build` 处失败——**这是「代码还没写」的契约信号，不是缺陷**。
+
+对外接口（端口分配、模块侧 6 端点、宿主侧 4 端点 + WS、请求头与 HMAC、健康探针、调用矩阵、已知缺口）：
+[**docs/interfaces.md**](docs/interfaces.md)。
+
 ## 与相邻协议的关系
 
 | | Tenon | MCP | A2A |

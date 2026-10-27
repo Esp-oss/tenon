@@ -2,6 +2,7 @@
 
 | 文档 | 内容 |
 |---|---|
+| [对外接口](interfaces.md) | 容器边界上的端口、端点、请求头与 HMAC、健康探针、调用矩阵、已知缺口 |
 | [设计文档](superpowers/specs/2026-10-27-tenon-ai-driven-system-design.md) | 可行性结论、九类契约、15 步纵切面、治理平面、健壮性 8 闸、兼容性矩阵、风险登记、里程碑 |
 | [架构方案对比](design-screens/architecture-approaches.html) | 三条候选架构的取舍，以及为什么选「协议内核 + 多运行时」 |
 | [分层与契约](design-screens/design-1-layers.html) | 分层图、九类契约表、协议内/外边界 |
