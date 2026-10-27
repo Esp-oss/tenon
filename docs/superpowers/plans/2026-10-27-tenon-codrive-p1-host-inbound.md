@@ -24,7 +24,7 @@ git worktree add ../dsh_for_sys-p1 -b feat/p1-host-inbound
 
 **已知限制（P1 不解决，记录在案）**：`Queue` 是导出接口，但签名里带未导出类型 `queuedFrame`，两个构造函数也未导出——包外无法实现或构造它，只能经 `Config.InboundDir` 间接装配。spec §8 把 Queue 定义为「内部接口」，所以本轮不修；将来要支持从 `cmd/host` 注入自定义队列实现时，需要同时导出行类型与构造函数。
 
-**运维约定（必须写进 Task 9 的启动说明）**：重置入站队列要**同时删** `requests.jsonl` 与 `requests.jsonl.meta`。只删前者时水位会从 meta 续上（序号不回 1），看起来像"队列清空了但客户端还有旧游标"。反过来说，这也是刻意设计：单删主文件时序号仍单调，不会让持旧游标的客户端漏帧。
+**运维约定（必须写进 Task 9 的启动说明）**：重置入站队列要**同时删** `requests.jsonl`、`requests.jsonl.meta` 与 `requests-index.jsonl`。前两者的理由是序号水位（只删主文件时水位从 meta 续上，序号不回 1）；**第三个是治理状态而非缓存**——判定规则是「未登记即视为 `event`」，单删索引会把在途 request 静默降级成事件驱动，绕开「对话发起必须审批」（spec §3.11）。所以清理索引必须与清空 pending 一起做。
 
 **计划勘误（执行期发现，后续任务按此为准）**
 
@@ -35,6 +35,9 @@ git worktree add ../dsh_for_sys-p1 -b feat/p1-host-inbound
 5. **`Config.SessionSecret` 零值 = 装配失败**（不是"禁用登录"）；`Config.Users` 零值 = 登录永远 401（不是"跳过鉴权"）。所有 `New()` 调用点都必须给非空密钥。
 6. **`Queue` 接口含 `Broken() error`**（Task 4 复核后追加）：`Push` 只回序号，落盘失败必须另有出口，否则「已接受但没落盘」会被伪装成「已持久化」。`memoryQueue.Broken()` 恒为 nil；`jsonlQueue` 返回第一次失败。`POST /tenon/requests` 据此回 `200 {ok,seq,durable}`，`durable:false` 时打告警——**不回 500**，理由见 spec §3.2（重试会重发用户那句话）。
 7. **入站 ack 必须拒负游标**（`400 INVALID_CURSOR`），与出站 `serveIntentAck` 同校验；否则会回一个负的 `acked`。
+8. **`TENON_REQUIRE_TRIGGER` 默认必须为 false，且只认 `== "1"`**。一旦默认 true，现有 `cmd/agent`（还不发 `triggerEventId`）会拿到 `200 + deny + MISSING_TRIGGER`——传输层与业务拒绝无法区分，agent 会把每份 plan 都报成"策略拒绝"，P1 上线即停摆。开启时必须在启动日志打一条显式告警。
+9. **不要把 HTTP 请求体直接 `Unmarshal` 进 `policy.PolicyRequest`**：它现在带 `json:"origin,omitempty"`，透传就会让"来源只能由宿主判定"的保证作废。HTTP 层必须继续用自己的 `policyEvaluateRequest`。
+10. **`origin` 不是 inputSchema 路径**：Task 7 的加载期校验只能校验 `arg.*`；`origin` 与 `risk.*` 不是动作入参，别拿它们去 `inputSchema.properties` 里找，否则合法规则会被整份丢弃。
 
 **本计划刻意包含一处受控重构**：把现有 `intentQueue` 提取成 `Queue` 端口的 `memoryQueue` 实现。出站行为**不变**，靠既有的 `TestIntentsRESTRoundTrip` / `TestIntentsRejectsBadFrame` 当安全网。不做这个提取，就要复制约 70 行队列代码，两份迟早漂移。
 
@@ -2541,12 +2544,18 @@ Expected: Go 全 PASS；`pnpm check` = `validate` + `typecheck` 全过
 - [ ] **Step 2: 回填 spec 的分阶段说明**
 
 在 spec §3.11 末尾追加：
-
 ```markdown
 **分阶段启用（实施期记录）**：`triggerEventId` 必填的强制行为由 `TENON_REQUIRE_TRIGGER` 控制。P1 默认关闭（缺失视为 `event`，保持既有 agent 可用）；P2 让 agent 全部带上该字段；P4 收口时把默认改为强制（缺失即 deny）并删除开关。在此之前，spec 记的「必填」是实现目标态，不是当期运行时行为。
 ```
 
-- [ ] **Step 3: 确认文档与实现一致后提交**
+- [ ] **Step 3: 补 `docs/interfaces.md` 的策略评估请求体**
+
+`docs/interfaces.md §4.2` 的 `POST /tenon/policies:evaluate` 请求体仍只有 `{plan:…}`，与实现已经矛盾。补两处：
+
+1. 请求体加 `triggerEventId`（可选，宿主据此判定 `origin`）；
+2. 响应说明补一句：`triggerEventId` 缺失且 `TENON_REQUIRE_TRIGGER=1` 时，回 `200` + `outcome=deny` + `reasons:["MISSING_TRIGGER"]`（不是 4xx）。
+
+- [ ] **Step 4: 确认文档与实现一致后提交**
 
 ```bash
 git add docs/superpowers/specs/2026-10-27-tenon-codrive-chat-entry-design.md
