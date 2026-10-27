@@ -72,7 +72,9 @@ flowchart TB
     X -.横切.-> MOD
 ```
 
-**协议住在规范里，宿主与运行时都可替换。** 协议层不 import 任何宿主类型：本轮的参考宿主是 Go 的 `cmd/host`，参考运行时是 `cmd/agent`；dsh 插件的进程内宿主是 M1 的另一种接入形态，不是前提。
+**协议住在规范里，宿主与运行时都可替换。** 协议层不 import 任何宿主类型：本轮的参考宿主是 Go 的 `cmd/host`，参考运行时是 `cmd/agent`。
+
+> **谁是驱动已定为决策**：[`docs/adr/0001-driver-dsh-vs-go.md`](docs/adr/0001-driver-dsh-vs-go.md) —— **DSH 做业务宿主**（回合/工具/会话/技能/审批 UI），**Tenon 控制平面仍由 Go `cmd/host` 权威提供**，`cmd/agent` 降为一致性参考实现（只服务 C/D1，不再加功能），自制 `ui/` 冻结为 demo。改动方向前先改 ADR，不要在代码里悄悄分叉。
 
 ## 语言选型：按层选，不按偏好选
 
