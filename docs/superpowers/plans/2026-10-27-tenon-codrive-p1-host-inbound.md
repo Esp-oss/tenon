@@ -26,6 +26,14 @@ git worktree add ../dsh_for_sys-p1 -b feat/p1-host-inbound
 
 **运维约定（必须写进 Task 9 的启动说明）**：重置入站队列要**同时删** `requests.jsonl` 与 `requests.jsonl.meta`。只删前者时水位会从 meta 续上（序号不回 1），看起来像"队列清空了但客户端还有旧游标"。反过来说，这也是刻意设计：单删主文件时序号仍单调，不会让持旧游标的客户端漏帧。
 
+**计划勘误（执行期发现，后续任务按此为准）**
+
+1. **`writeTenonError` / `writeTenonErrorStatus` 的最后一个参数是 `protocol.Error` 值，不是指针**。`newError(...)` 返回 `*protocol.Error`，所以调用处必须写 `*newError(...)`。Task 3 与 Task 4 的代码片段里写成了传指针，照抄会编译不过。
+2. **`newTestServer` 补 `InboundDir` 缺省属于 Task 4 而不是 Task 3**：`Config.InboundDir` 是 Task 4 才新增的字段，Task 3 阶段写进去编译不过。Task 4 必须补 `if strings.TrimSpace(cfg.InboundDir) == "" { cfg.InboundDir = t.TempDir() + "/inbound" }`，否则入站队列会落到仓库工作目录的 `out/inbound`，几十个用例互相污染。
+3. **`bearerClaims` 失败时已经把 401 响应写好了**，调用方只 `return`，**绝对不要再写一次响应**（header 重复写会让响应失效）。
+4. **`New()` 的校验顺序已是契约**：审计路径非空 → 打开审计 → **会话密钥非空** → 策略自检。任何断言"自检错误"的新用例都必须同时给 `SessionSecret`，否则测到的是密钥那条路径。
+5. **`Config.SessionSecret` 零值 = 装配失败**（不是"禁用登录"）；`Config.Users` 零值 = 登录永远 401（不是"跳过鉴权"）。所有 `New()` 调用点都必须给非空密钥。
+
 **本计划刻意包含一处受控重构**：把现有 `intentQueue` 提取成 `Queue` 端口的 `memoryQueue` 实现。出站行为**不变**，靠既有的 `TestIntentsRESTRoundTrip` / `TestIntentsRejectsBadFrame` 当安全网。不做这个提取，就要复制约 70 行队列代码，两份迟早漂移。
 
 **一处与 spec 的时序偏差（已获准，记录在案）**：spec §3.11 要求 `policies:evaluate` 的 `triggerEventId` 必填、缺失即 `deny`。但现有 `cmd/agent` 还不发这个字段，P1 若立刻强制会导致整个 agent 停摆（P2 才改 agent）。因此 P1 引入过渡开关：
@@ -1360,7 +1368,7 @@ func (s *Server) serveInboundEnqueue(w http.ResponseWriter, r *http.Request) {
 	raw, err := json.Marshal(frame)
 	if err != nil {
 		writeTenonErrorStatus(w, http.StatusInternalServerError,
-			newError(protocol.ClassContractViolation, "ENCODE_FAILED", err.Error()))
+			*newError(protocol.ClassContractViolation, "ENCODE_FAILED", err.Error()))
 		return
 	}
 	seq := s.inbound.Push(raw)
@@ -1524,9 +1532,7 @@ func newID(prefix string) string {
 		s.serveInboundAck(w, r)
 ```
 
-`Close()` 改为同时关闭入站队列：
-
-```go
+`Close()` 改为同时关闭入站队列：```go
 func (s *Server) Close() error {
 	err := s.auditStore.Close()
 	if s.inbound != nil {
@@ -1537,6 +1543,16 @@ func (s *Server) Close() error {
 	return err
 }
 ```
+
+**别漏这一步**：给 `newTestServer` 补 `InboundDir` 缺省（Task 3 只补了 `SessionSecret`，见 §0 勘误 2）：
+
+```go
+	if strings.TrimSpace(cfg.InboundDir) == "" {
+		cfg.InboundDir = t.TempDir() + "/inbound"
+	}
+```
+
+不补的话，入站队列会落到 `defaultInboundDir = out/inbound`，几十个用例共用仓库工作目录、互相污染，`git status` 里还会冒出 `out/`。
 
 - [ ] **Step 5: 跑测试**
 
