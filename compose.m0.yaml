@@ -1,0 +1,151 @@
+# Tenon M0 目标拓扑（构建契约，非当前可运行状态）
+#
+# 这份文件的用途是**把接口钉死在拓扑上**：哪个容器开哪个端口、谁调谁、
+# 用什么凭据、按什么顺序起。它现在可以 `docker compose -f compose.m0.yaml config`
+# 校验语法，但 `up` 会在构建阶段失败——因为 M0 的代码还没写。
+#
+# 判定「能不能跑」的方法：
+#   docker compose -f compose.m0.yaml config   # 语法：现在就能过
+#   docker compose -f compose.m0.yaml build    # 现在必失败（cmd/ 与 dist/ 都还不存在）
+#
+# 端口与端点对照见 docs/interfaces.md。
+
+name: tenon-m0
+
+services:
+  # Agent 运行时（dsh）+ 控制平面（registry/grant/policy/audit）+ 共驾 WS。
+  # 持有【宿主侧 4 个端点】；不实现模块侧端点。
+  host:
+    build:
+      context: .
+      dockerfile: docker/node-service.Dockerfile
+      args:
+        PKG: "@tenon/dsh-plugin-module-host"
+    image: tenon/host:m0
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      TENON_VERSION: "0.1"
+      TENON_MODULE_ID: "host"
+      TENON_AUDIT_PATH: "/var/lib/tenon/audit.jsonl"
+      TENON_POLICY_FILE: "/etc/tenon/policies.yaml"
+      TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
+    secrets:
+      - tenon_hmac
+    volumes:
+      - tenon-audit:/var/lib/tenon
+    networks:
+      - edge
+      - core
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # 库存模块：Go HTTP 侧车，实现【模块侧 6 个端点】。
+  inventory:
+    build:
+      context: .
+      dockerfile: docker/go-service.Dockerfile
+      args:
+        ENTRY: "./cmd/inventory"
+    image: tenon/inventory:m0
+    environment:
+      PORT: "8081"
+      TENON_MODULE_ID: "inventory"
+      TENON_HOST_URL: "http://host:8080"
+      TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
+    secrets:
+      - tenon_hmac
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8081/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+
+  # 采购模块：Go HTTP 侧车，D1 差异测试里被「摘掉」的那一个。
+  procurement:
+    build:
+      context: .
+      dockerfile: docker/go-service.Dockerfile
+      args:
+        ENTRY: "./cmd/procurement"
+    image: tenon/procurement:m0
+    environment:
+      PORT: "8082"
+      TENON_MODULE_ID: "procurement"
+      TENON_HOST_URL: "http://host:8080"
+      TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
+    secrets:
+      - tenon_hmac
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8082/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+
+  # 一致性套件：一次性任务，跑完退出；退出码即结论（0 = 全绿）。
+  conformance:
+    build:
+      context: .
+      dockerfile: docker/go-service.Dockerfile
+      args:
+        ENTRY: "./cmd/tenon"
+    image: tenon/tool:m0
+    command: ["conformance", "run", "--target", "http://host:8080", "--report", "/out/report.json"]
+    environment:
+      TENON_TARGET: "http://host:8080"
+    volumes:
+      - ./out:/out
+    depends_on:
+      host:
+        condition: service_healthy
+      inventory:
+        condition: service_healthy
+      procurement:
+        condition: service_healthy
+    networks:
+      - core
+    restart: "no"
+
+  # 反模式扫描：一次性任务，对仓库源码做 C10 检查。
+  lint:
+    build:
+      context: .
+      dockerfile: docker/go-service.Dockerfile
+      args:
+        ENTRY: "./cmd/tenon"
+    image: tenon/tool:m0
+    command: ["lint", "--path", "/work"]
+    volumes:
+      - ./:/work:ro
+    networks:
+      - core
+    restart: "no"
+
+secrets:
+  # 开发期用文件注入；生产应换成编排平台的 secret 机制。
+  #   mkdir -p docker/secrets && openssl rand -hex 32 > docker/secrets/hmac.txt
+  tenon_hmac:
+    file: ./docker/secrets/hmac.txt
+
+volumes:
+  tenon-audit:
+
+networks:
+  # 对外：只有 host 发布端口
+  edge:
+    driver: bridge
+  # 对内：模块与宿主互访，不出容器网络
+  core:
+    driver: bridge
+    internal: true

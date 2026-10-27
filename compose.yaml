@@ -1,0 +1,56 @@
+# Tenon —— 当前仓库状态可直接运行的容器
+#
+#   docker compose up -d docs     # 文档站 → http://localhost:8088
+#   docker compose run --rm spec  # 规范校验（零依赖 Node，与 CI 的 spec job 同源）
+#   docker compose run --rm go    # Go 工具链 gofmt/vet/build（与 CI 的 go job 同源）
+#   docker compose up             # 一次跑全部（spec/go 跑完即退出，属正常）
+#
+# 基础镜像可用环境变量覆盖（受限网络/内网仓库时）：
+#   TENON_NODE_IMAGE=node:22-alpine TENON_NGINX_IMAGE=nginx:1.27-alpine docker compose build
+#
+# M0 的目标拓扑（宿主 + 模块 + 套件）在 compose.m0.yaml，那里标注了哪些服务
+# 在对应代码落地前不可构建。协议接口说明见 docs/interfaces.md。
+
+name: tenon
+
+services:
+  # 只读文档站：规范 schema/语义文档 + 设计期架构图 + 设计文档原文
+  docs:
+    build:
+      context: .
+      dockerfile: docker/docs.Dockerfile
+      args:
+        NGINX_IMAGE: ${TENON_NGINX_IMAGE:-nginx:alpine}
+    image: tenon/docs:dev
+    ports:
+      - "8088:80"
+    restart: unless-stopped
+    # 探针不写在镜像里：换基础镜像时只改这里。默认用例自带 busybox wget。
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # 规范静态校验
+  spec:
+    build:
+      context: .
+      dockerfile: docker/checks.Dockerfile
+      target: spec
+      args:
+        NODE_IMAGE: ${TENON_NODE_IMAGE:-node:24-bookworm-slim}
+    image: tenon/spec-check:dev
+    restart: "no"
+
+  # Go 工具链检查
+  go:
+    build:
+      context: .
+      dockerfile: docker/checks.Dockerfile
+      target: go
+      args:
+        GO_IMAGE: ${TENON_GO_IMAGE:-golang:1.26-alpine}
+    image: tenon/go-check:dev
+    restart: "no"

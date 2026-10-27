@@ -26,3 +26,9 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# 开发期容器机密（见 docker/README.md）
+docker/secrets/
+
+# 容器/套件输出
+out/

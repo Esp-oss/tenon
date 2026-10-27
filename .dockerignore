@@ -1,0 +1,12 @@
+# 构建上下文排除项（不影响 git，只影响 docker build 上下文）
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.git
+.github
+.superpowers
+*.log
+.env
+.env.*
+.vscode
+.idea

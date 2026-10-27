@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tenon · 规范与架构</title>
+<style>
+  :root { color-scheme: dark }
+  body { margin:0; background:#0b1120; color:#e2e8f0;
+         font:15px/1.7 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif }
+  .wrap { max-width:820px; margin:0 auto; padding:48px 24px 72px }
+  h1 { font-size:26px; margin:0 0 4px }
+  .sub { color:#94a3b8; margin:0 0 32px; font-size:13px }
+  h2 { font-size:14px; color:#94a3b8; letter-spacing:.06em; text-transform:uppercase;
+       margin:32px 0 10px; font-weight:600 }
+  a { color:#7dd3fc; text-decoration:none }
+  a:hover { text-decoration:underline }
+  ul { list-style:none; padding:0; margin:0 }
+  li { background:#111827; border:1px solid #1f2937; border-radius:8px;
+       padding:12px 16px; margin-bottom:8px }
+  li b { display:block; font-size:14px; margin-bottom:2px }
+  li span { color:#94a3b8; font-size:12.5px }
+  .note { margin-top:28px; border-left:3px solid #f59e0b; background:#111827;
+          padding:12px 16px; border-radius:6px; color:#cbd5e1; font-size:13px }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Tenon（榫卯）</h1>
+  <p class="sub">让 AI 直接操作业务系统的可插拔协议 · 容器内只读文档站</p>
+
+  <h2>架构图（设计期快照）</h2>
+  <ul>
+    <li><a href="screens/architecture-approaches.html"><b>三条候选架构与选型理由</b><span>网关中心 / 原生插件树 / 协议内核 + 多运行时</span></a></li>
+    <li><a href="screens/design-1-layers.html"><b>分层与九类契约</b><span>协议内 vs 协议外边界</span></a></li>
+    <li><a href="screens/design-2-slice.html"><b>纵切面时序</b><span>报价 → 扣库存，15 步 4 闸门、错误分类、接入面</span></a></li>
+    <li><a href="screens/design-3-robustness.html"><b>健壮性</b><span>8 道闸、fail-closed 降级矩阵、兼容性矩阵、风险</span></a></li>
+  </ul>
+
+  <h2>规范</h2>
+  <ul>
+    <li><a href="spec/0.1/"><b>spec/0.1 索引</b><span>九类契约与语义文档目录</span></a></li>
+    <li><a href="spec/0.1/schemas/"><b>JSON Schema（唯一真源）</b><span>10 份：common + 九类契约</span></a></li>
+  </ul>
+
+  <h2>设计文档</h2>
+  <ul>
+    <li><a href="design/"><b>docs/superpowers/specs</b><span>设计文档 v0.2（Markdown 原文）</span></a></li>
+  </ul>
+
+  <div class="note">
+    这些页面是<b>设计期快照</b>，与设计文档 v0.2 在步数/端点数上存在差异，<b>以设计文档为准</b>。<br>
+    Markdown 以纯文本呈现，本站不做渲染。协议接口说明见仓库内 <code>docs/interfaces.md</code>。
+  </div>
+</div>
+</body>
+</html>
