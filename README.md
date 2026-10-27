@@ -129,20 +129,36 @@ docs/             设计文档与架构图
 
 ## 当前状态
 
-**M0 骨架**：规范与目录结构已就位，**业务代码尚未实现**。各包的实现计划见其 README 的「阶段状态」。
+**M0 内核已跑通**：规范 10 份 schema + Go 工具链（`cmd/tenon`：一致性套件 / lint / schema 校验）+ 两个真实模块（`cmd/inventory`、`cmd/procurement`）。约 5000 行 Go，四个包全绿。
 
-已可运行：
+一条命令跑一致性测试（模块需先起在 8081/8082）：
 
 ```bash
-pnpm install
-pnpm check      # 校验 spec/0.1 全部 schema + 类型检查 @tenon/core
-go vet ./...    # Go 工具链骨架（conformance / tools/lint）
+go run ./cmd/tenon conformance run \
+  --target http://127.0.0.1:8081 --module inventory \
+  --fixtures conformance/fixtures/mini-erp.json --source-dir . --report out/report.json
 ```
 
-- `pnpm validate` —— 只跑规范校验（零依赖）
-- `pnpm typecheck` —— 只跑 `@tenon/core` 的类型检查
+对真实模块实测（`exit=0`，pass 6 / fail 0 / skip 3）：
 
-> CI 工作流已就绪但尚未入库：推送方 token 缺 `workflow` scope。执行 `gh auth refresh -s workflow` 后即可补上 `.github/workflows/ci.yml`。
+| 用例 | 结果 | 断言的是什么 |
+|---|---|---|
+| C1 | pass | manifest 合法、摘要不含 `inputSchema`、每个 write 都有幂等声明 |
+| C2 | pass | 同 `Idempotency-Key` 两次 → 响应一致、副作用一次 |
+| C3 | pass | 注入未知字段 → 200 而非 400（前向兼容） |
+| C8 | pass | 不支持 dry-run 的 action → 404/501 优雅降级 |
+| C9 | pass | 库存不足 → 422 `business_rejection`，`retryable=false` |
+| C10 | pass | 全仓反模式扫描 0 命中 |
+| C4 / C5 / D1 | **skip** | 需要宿主侧端点或 LLM 规划器；**SKIP 不等于 PASS**，报告会明说不能视为整体合规 |
+
+其它检查：
+
+```bash
+pnpm check        # 规范 schema 校验 + TS 类型检查
+go test ./... -count=1
+```
+
+**还没做的**：dsh 宿主（`dsh-plugin-module-host` / governance / intent-ui / skill-biz）、`quote` 进程内模块、D1 需要的 LLM 规划器。没有 LLM 凭据之前，D1 保持 SKIP——用规则式规划器让它「通过」就是把核心命题做成假命题。
 
 里程碑：
 

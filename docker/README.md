@@ -85,7 +85,10 @@ docker compose -f compose.m0.yaml build    # 预期失败：go build ./cmd/... �
 | `docker compose run --rm spec` | `✓ spec 校验通过：11 项检查，0 失败`，exit 0 |
 | `docker compose run --rm go` | gofmt / vet / build 全 ok，exit 0 |
 | `docker compose up -d docs` | `Up (healthy)`；`/healthz` 返回 `ok`；首页 `<title>Tenon · 规范与架构</title>`；`screens/design-1-layers.html`、`spec/0.1/schemas/action.schema.json` 均 200 |
-| `go-service --target build` | 在 `go build ./cmd/inventory` 处失败（契约点），符合预期 |
-| `node-service --target build` | 在 `pnpm --filter … run build` 处失败：`ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT`，符合预期 |
+| `go-service --target build`（`./cmd/tenon`） | ✅ **现已真实构建成功**（M0 代码落地后契约自动兑现） |
+| `node-service --target build` | ❌ 仍在 `pnpm run build` 处失败：`ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT`（`packages/*` 尚无 build 脚本） |
+| `go-service` 完整镜像 | ⚠️ 未验：运行时基础镜像 `alpine:3.20` 在本机拉不到（网络） |
+| `compose.m0.yaml` 端到端启动 | ❌ 未验：缺 `host`（dsh 宿主）实现 |
+| 模块 ↔ 宿主 HMAC 实际握手 | ❌ 未验：同上；模块侧验签已有单测覆盖 |
 
-**未验证的部分（不能声称已通过）**：`host` 完整镜像（需先实现 `packages/dsh-plugin-module-host`）、`compose.m0.yaml` 的端到端启动、模块间 HMAC 实际握手。这些要等 M0 代码。
+**未验证的部分不许当成已实现来宣称。** `host` 与 `quote` 模块是 M0 剩下的主要工作量。

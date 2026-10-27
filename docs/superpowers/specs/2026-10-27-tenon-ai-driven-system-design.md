@@ -796,7 +796,7 @@ tenon/
 3. **配额单位扩展**：`quotaUnit` 目前只有 `calls` / `quantity`，是否需要 `money`。
 4. **策略 DSL 表达力边界**：`all/any/not` + 9 个算子是否够；何时需要引入表达式语言（会牺牲可测试性）。
 5. **skill 正文里允许的动作标识符例外**：例如"禁止调用 X"这类否定描述是否要放行。
-6. **Go 侧 JSON Schema 库选型（M0 阻塞项）**：必须支持 draft 2020-12。候选实现的能力矩阵未经本机核实（连不上 raw.githubusercontent），落地判据是**正反对拍**——同一份 `action.schema.json`，一条合法实例必须过、一条已知应失败的实例必须挂；不合格的库直接出局。
+6. **Go 侧 JSON Schema 库选型** —— **已定（M0）**：`github.com/santhosh-tekuri/jsonschema/v6`（draft 2020-12）。正反对拍当场就抓到真问题：`common.schema.json` 的 `Iso8601Duration` 用了前瞻 `(?=…)`，RE2 编译不了，**整份 common schema 在 Go 侧无法加载**。已改为无前瞻的等价写法，并新增门禁 `internal/spec/pattern_interop_test.go`（所有 `pattern` 必须能被 `regexp.Compile` 接受）。教训：协议里的正则也属于可移植性范畴，必须被机械门禁守住。
 7. **lint 词法扫描的误报率上限**：纯 Go 词法方案不引 cgo，代价是可能误报。M0 需定一个可接受阈值（真阳性 3/3 必中、demo 与 packages 零误报），否则改用 cgo + tree-sitter 并接受分发代价。
 
 ---

@@ -1,15 +1,13 @@
-# Go 服务镜像（构建契约）
+# Go 服务镜像：工具（conformance / lint）与 demo 模块共用同一份构建。
 #
-# 当前仓库状态下**不可构建**，且这是有意的：镜像假定存在 ./cmd/${ENTRY}，
-# 而 M0 尚未实现任何命令，所以构建会在 `go build ./cmd/...` 处失败并明确告诉你「代码还没写」。
-# 它同时是构建契约：M0 落地时应当产出 cmd/tenon（工具）与 demo 模块的 cmd/<模块名>。
+# 现状（M0）：`cmd/tenon`、`cmd/inventory`、`cmd/procurement` 已实现，构建阶段可正常通过。
+# 之前这份文件在 `go build ./cmd/...` 处失败是**刻意的契约信号**；代码落地后它自动变成真实构建。
 #
-# 只想验证「构建契约仍然成立且失败在预期位置」时，只建 build 阶段即可（不需要运行时基础镜像）：
-#   docker build -f docker/go-service.Dockerfile --target build \
-#     --build-arg ENTRY=./cmd/inventory .
-#
-# 完整构建：
 #   docker build -f docker/go-service.Dockerfile --build-arg ENTRY=./cmd/tenon -t tenon/tool .
+#   docker build -f docker/go-service.Dockerfile --build-arg ENTRY=./cmd/inventory -t tenon/inventory .
+#
+# 只验编译（不需要运行时基础镜像、也不拉 alpine）：
+#   docker build -f docker/go-service.Dockerfile --target build --build-arg ENTRY=./cmd/tenon .
 
 ARG GO_IMAGE=golang:1.26-alpine
 ARG RUNTIME_IMAGE=alpine:3.20
@@ -17,10 +15,16 @@ ARG RUNTIME_IMAGE=alpine:3.20
 FROM ${GO_IMAGE} AS build
 ARG ENTRY=./cmd/tenon
 WORKDIR /src
-COPY go.mod ./
+
+# 依赖先行：go.sum 变化才会让这层失效
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY internal ./internal
 COPY conformance ./conformance
 COPY tools ./tools
-# 契约点：M0 落地后这里应能编译出二进制
+COPY cmd ./cmd
+
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app "${ENTRY}"
 
 FROM ${RUNTIME_IMAGE}

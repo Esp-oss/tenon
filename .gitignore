@@ -32,3 +32,7 @@ docker/secrets/
 
 # 容器/套件输出
 out/
+
+# 本地构建产物（go build 默认输出）
+*.exe
+/tenon
