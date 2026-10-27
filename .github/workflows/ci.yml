@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+    # 所有分支都跑：特性分支上的红灯不该等到合进 main 才被发现。
+    # （曾经只写 [main]，结果一个会过期的时间夹具在特性分支上躺了一整天。）
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  spec:
+    name: spec (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 校验 spec/0.1 的 schema 与文档完整性
+        run: node scripts/validate-spec.mjs
+
+      - name: 确认 schema 全部为合法 JSON
+        run: |
+          for f in spec/0.1/schemas/*.json; do
+            node -e "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'))" "$f"
+          done
+          echo "all schemas parse"
+
+  go:
+    name: go (toolchain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: gofmt 无差异
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件需要 gofmt："
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test（全仓）
+        run: go test ./... -count=1
+
+      - name: 无 test 文件的包也要能编译（-run 空模式）
+        run: go test ./... -run '^$' -count=1
+
+  typecheck:
+    name: typecheck (ts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 类型检查（@tenon/core）
+        run: pnpm run typecheck
+
+  compose:
+    name: compose 语法
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验两份 compose 文件
+        run: |
+          docker compose config --quiet
+          docker compose -f compose.m0.yaml config --quiet
+          echo "compose files valid"
