@@ -35,7 +35,23 @@ C10 反模式扫描器：检查接入方仓库里是否把「事件 → action�
 
 ## 阶段状态
 
-M0（当前）：只有包声明与文档（`doc.go`），未实现。M0 计划实现三条规则 + 正反对拍，并作为 M0 出口判据之一（§12：D1 与 C10 全绿）。
+M0（当前）：**已实现**三条规则，纯词法、零第三方依赖、零 cgo。`go test ./tools/...` 覆盖 16 个测试函数：三条规则各命中一次、`console.log` 不误报、全大写码但无 action 不误报、`tenon-allow` 豁免生效、真仓库（`demo/`、`packages/`、`spec/`）零误报、spec 目录被跳过。
+
+### 规则 3 的作用域：只扫 skill 文档
+
+规则 3 只对 **skill 文档**生效（文件名为 `SKILL.md`、路径含 `skills/` 段、或 frontmatter 含 `tenon:`），而不是全部 `.md`。
+
+原因：`demo/mini-erp/README.md` 里必然出现 `inventory.DeductStock` 这类写法——那是在**描述**协议，不是把 action 写进知识。若对全部 Markdown 生效，要么 demo 永远报错，要么被迫加一片 `tenon-allow` 噪音，反而让人不再看告警。这与 §6.4 的原文一致：约束对象是 **skill 正文**。
+
+代价（已知漏报）：把「错误码 → action」映射写进普通 README 或设计文档不会被报。若将来 agent 会读普通文档作为知识，这个作用域必须重议——那是设计变更，不是实现细节。
+
+### 其余已知漏报
+
+1. 非 TS/JS 语言零覆盖（Go 侧车、Python SDK、YAML 映射表），按 README 由 D1 兜底。
+2. 跨函数/跨文件的 action 引用不报（`bus.on("x", handler)` 而 handler 在别处）——规则 1 只在订阅调用自己的参数区间内找回调体，**不猜**。
+3. 动态拼接的 id（`` `${m}.${a}` ``）无法判定。
+4. 规则 2 的窗口是硬编码 5 行，超长 case 块会漏报。
+5. 订阅方法名是白名单（`on/once/subscribe/subscribeTo/addListener/addEventListener/onEvent`），自定义名漏报。
 
 M1 计划把命中项与治理侧审计对齐（命中位置写进审计备注），但不新增扫描规则——三条规则的判据由 §2.2 与 §6.4 冻结。
 
