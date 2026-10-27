@@ -1,0 +1,30 @@
+[
+  {
+    "policyId": "pol-inventory-deduct-approve",
+    "priority": 100,
+    "match": {
+      "module": "inventory",
+      "actions": ["inventory.DeductStock"]
+    },
+    "when": {
+      "all": [
+        {
+          "arg.qty": { ">": 10 }
+        }
+      ]
+    },
+    "outcome": "approve",
+    "approvers": ["role:warehouse_manager"]
+  },
+  {
+    "policyId": "pol-procurement-create-approve",
+    "priority": 100,
+    "match": {
+      "module": "procurement",
+      "actions": ["procurement.CreatePurchaseRequest"]
+    },
+    "when": { "all": [] },
+    "outcome": "approve",
+    "approvers": ["role:procurement_manager"]
+  }
+]
