@@ -2232,6 +2232,46 @@ func (p *poller) Steps() []string {
 
 - [ ] **Step 2: 改 `cmd/agent/main.go`**
 
+### Step 2 前置：Task 2 复核后追加的四条硬要求
+
+1. **空 `requestId` 必须在进账本前拒掉**：`Claim("")` 恒返回 `(true, nil)` 且不写盘，等于**静默关闭去重**。`handleInbound` 的 request 分支开头就要校验 `req.RequestID == ""` → 记日志 + 返回错误（不 ack，让 host 侧报文问题暴露出来）。
+2. **跳过时要区分 `claimed` 与 `done`**：`Ledger` 现在只有 `Claim`（探测即写盘）。Task 10 **允许给 `ledger.go` 加一个只读方法**：
+
+```go
+// Phase 返回某个 requestId 的已知阶段（""=没出现过，claimed=处理中断，done=已处理）。
+// 只读，不写盘：排障路径上不要用 Claim 代替它——Claim 每次都会写一行。
+func (l *Ledger) Phase(requestID string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.seen[requestID]
+}
+```
+
+`handleInbound` 里 `Claim` 返回 false 时按 phase 分开处理：
+
+```go
+		if !ok {
+			switch p.ledger.Phase(req.RequestID) {
+			case "claimed":
+				// 上次处理中断（进程崩了 / 回合失败）：宁可丢这一句，也不重复扣库存。
+				log.Printf("agent: request %s 上次处理中断、未完成，按去重策略跳过（这是一句被舍弃的用户请求）", req.RequestID)
+				_ = p.hostc.PushPending(ctx, map[string]any{
+					"planId": "req-" + req.RequestID, "summary": "该请求处理中断，请重新发起",
+					"items": []map[string]any{{"label": "上次处理中断，请重新发起"}},
+					"requiredRoles": []string{}, "expiresAt": time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339),
+					"state": "aborted",
+				})
+			default:
+				log.Printf("agent: request %s 已处理过，跳过（去重）", req.RequestID)
+			}
+			return nil
+		}
+```
+
+3. **`Done` 必须覆盖所有返回路径**，包括 `res.Outcome == NeedsHuman`（挂起成功，那也是一次完整的处理）。实现时把 `Done` 放在 `Run` 之后立刻执行，不要让它排在可能失败的 `writeRequestResult` 之后。
+4. **装配**：`NewLedger(filepath.Join(cfg.stateDir, "processed.jsonl"))`（**文件**路径，不是目录）；`poller.ledger` 必须注入，否则 `drainInbound` 会 nil 解引用。`Deps.State` 为 nil 表示"没有挂起通道"，**不要把空串传给 `NewStateStore`**。
+
+
 `config` 增字段（沿用现有 env 读取风格）：
 
 ```go
