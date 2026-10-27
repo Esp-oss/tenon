@@ -1,6 +1,6 @@
 ﻿<!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASIP 设计图 · design-2-slice</title><style>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tenon 设计图 · design-2-slice</title><style>
 :root{color-scheme:dark}
 body{margin:0;background:#0b1120;color:#e2e8f0;font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 .wrap{max-width:1000px;margin:0 auto;padding:32px 24px 64px}
@@ -38,7 +38,7 @@ pre{overflow-x:auto}
 
 <div style="border-left:3px solid #38bdf8;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T3 取知识</b>　加载 skill <code>quote-to-fulfillment@1.2</code>：标准件报价完成后须核库存并预留/扣减</div>
 
-<div style="border-left:3px solid #38bdf8;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T4 能力发现</b>　<code>/.well-known/asip</code> 拿到 inventory-module 的 action 清单，<b style="color:#7dd3fc">只为要用的 action 拉完整 schema</b>（省上下文）</div>
+<div style="border-left:3px solid #38bdf8;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T4 能力发现</b>　<code>/.well-known/Tenon</code> 拿到 inventory-module 的 action 清单，<b style="color:#7dd3fc">只为要用的 action 拉完整 schema</b>（省上下文）</div>
 
 <div style="border-left:3px solid #c084fc;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T5 规划</b>　产出 Plan DAG：<code>GetStock</code> → <code>DeductStock(idemKey, compensation=ReleaseStock)</code>，附 <code>expectedDiff: onHand 120→108</code></div>
 
@@ -75,12 +75,12 @@ pre{overflow-x:auto}
 <div style="display:flex;gap:12px;margin-top:8px">
   <div style="flex:1;background:#0f172a;border:1px solid #22c55e;border-radius:8px;padding:12px">
     <div style="color:#86efac;font-weight:600;font-size:12px">HTTP 侧车（任意语言 · 6 个端点）</div>
-    <pre style="font:10.5px/1.6 ui-monospace,monospace;color:#cbd5e1;margin:8px 0 0;white-space:pre-wrap">GET  /.well-known/asip            → manifest
-GET  /asip/actions/{id}           → schema + risk
-POST /asip/actions/{id}           → 执行（Idempotency-Key）
-POST /asip/actions/{id}:dry-run   → 预演（可选但强烈建议）
-POST /asip/events                 → agent 收事件（Webhook 签名）
-GET  /asip/events?since=cursor    → 补课/重放</pre>
+    <pre style="font:10.5px/1.6 ui-monospace,monospace;color:#cbd5e1;margin:8px 0 0;white-space:pre-wrap">GET  /.well-known/Tenon            → manifest
+GET  /Tenon/actions/{id}           → schema + risk
+POST /Tenon/actions/{id}           → 执行（Idempotency-Key）
+POST /Tenon/actions/{id}:dry-run   → 预演（可选但强烈建议）
+POST /Tenon/events                 → agent 收事件（Webhook 签名）
+GET  /Tenon/events?since=cursor    → 补课/重放</pre>
   </div>
   <div style="flex:1;background:#0f172a;border:1px solid #0ea5e9;border-radius:8px;padding:12px">
     <div style="color:#7dd3fc;font-weight:600;font-size:12px">dsh 原生（TS · 参考实现#1）</div>
@@ -89,7 +89,7 @@ GET  /asip/events?since=cursor    → 补课/重放</pre>
   actions: [deductStock, releaseStock],
   events:  ['stock.deducted'],
 })
-ctx.plugin(asipModuleHost, mod)
+ctx.plugin(TenonModuleHost, mod)
 // 自动挂成 dsh tool + 事件订阅 + 审计
 // HMR 热插拔，不重启</pre>
   </div>

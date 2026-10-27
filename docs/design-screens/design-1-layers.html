@@ -1,6 +1,6 @@
 ﻿<!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASIP 设计图 · design-1-layers</title><style>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tenon 设计图 · design-1-layers</title><style>
 :root{color-scheme:dark}
 body{margin:0;background:#0b1120;color:#e2e8f0;font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 .wrap{max-width:1000px;margin:0 auto;padding:32px 24px 64px}
@@ -83,7 +83,7 @@ pre{overflow-x:auto}
   <tr style="color:#94a3b8;text-align:left;border-bottom:1px solid #334155">
     <th style="padding:6px 8px 6px 0">契约</th><th style="padding:6px 8px 6px 0">方向</th><th style="padding:6px 0">不可让步的内容</th>
   </tr>
-  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Module Manifest</td><td style="padding:7px 8px 7px 0;color:#94a3b8">模块→系统</td><td style="padding:7px 0;color:#cbd5e1">发现自己：模块 id/版本、actions[]、events[]、支持的协议版本。<code style="color:#7dd3fc">/.well-known/asip</code></td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Module Manifest</td><td style="padding:7px 8px 7px 0;color:#94a3b8">模块→系统</td><td style="padding:7px 0;color:#cbd5e1">发现自己：模块 id/版本、actions[]、events[]、支持的协议版本。<code style="color:#7dd3fc">/.well-known/Tenon</code></td></tr>
   <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Action</td><td style="padding:7px 8px 7px 0;color:#94a3b8">agent→模块</td><td style="padding:7px 0;color:#cbd5e1">inputSchema / outputSchema / risk{level,reversible,money} / idempotency{keyFields} / preconditions / compensation</td></tr>
   <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Domain Event</td><td style="padding:7px 8px 7px 0;color:#94a3b8">模块→agent</td><td style="padding:7px 0;color:#cbd5e1">信封（id/type/subject/occurredAt/causation/correlation）+ 至少一次投递 + 可重放</td></tr>
   <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Plan</td><td style="padding:7px 8px 7px 0;color:#94a3b8">agent→系统</td><td style="padding:7px 0;color:#cbd5e1">DAG steps + expectedDiff（dry-run 结果）+ 每步幂等键，<strong style="color:#e2e8f0">可被人读懂、可被策略评估、可回放</strong></td></tr>
