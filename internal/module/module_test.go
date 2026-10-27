@@ -1897,3 +1897,37 @@ func TestManifestCarriesSummaryTemplate(t *testing.T) {
 		t.Fatalf("空模板不该出现：%s", raw2)
 	}
 }
+
+// 必填字段是模块声明的一部分：摘要线必须带出，空则不出现。
+func TestManifestCarriesRequiredArgs(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	f.module.Actions[1].RequiredArgs = []string{"name"}
+	srv := serve(t, f.module)
+
+	_, raw := doJSON(t, http.MethodGet, srv.URL+"/.well-known/tenon", nil, nil)
+	if !bytes.Contains(raw, []byte(`"requiredArgs":["name"]`)) {
+		t.Fatalf("摘要线没带 requiredArgs：%s", raw)
+	}
+
+	empty := newFixture()
+	srv2 := serve(t, empty.module)
+	_, raw2 := doJSON(t, http.MethodGet, srv2.URL+"/.well-known/tenon", nil, nil)
+	if bytes.Contains(raw2, []byte("requiredArgs")) {
+		t.Fatalf("空声明不该出现：%s", raw2)
+	}
+}
+
+// 声明与契约不一致是装配错误：requiredArgs 必须在 inputSchema.required 里。
+func TestValidateRejectsRequiredArgsOutsideSchema(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	f.module.Actions[1].RequiredArgs = []string{"nope"}
+	err := f.module.Validate()
+	if err == nil {
+		t.Fatal("requiredArgs 不在 inputSchema.required 里时 Validate 必须失败")
+	}
+	if !strings.Contains(err.Error(), "nope") {
+		t.Fatalf("错误里要点名字段，得到：%v", err)
+	}
+}
