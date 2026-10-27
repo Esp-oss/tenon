@@ -69,7 +69,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 
 	"tenon.dev/internal/controlplane/audit"
 	"tenon.dev/internal/controlplane/grant"
@@ -129,7 +128,7 @@ type Server struct {
 	auditPath    string
 	modules      *registry.Registry
 	testMode     bool
-	intents      *intentQueue
+	intents      Queue
 	policyCount  int
 	grantCount   int
 }
@@ -153,7 +152,7 @@ func New(cfg Config) (*Server, error) {
 		auditPath:   cfg.AuditPath,
 		modules:     registry.NewRegistry(),
 		testMode:    cfg.TestMode,
-		intents:     newIntentQueue(maxIntentFrames),
+		intents:     newMemoryQueue(maxIntentFrames),
 		policyCount: len(cfg.Policies),
 		grantCount:  len(cfg.Grants),
 	}
@@ -819,15 +818,6 @@ func normalizeBaseURL(raw string) (string, error) {
 
 // ---------- 共驾帧（REST 降级通道） ----------
 
-// queuedFrame 是队列里的一帧：序号 + 原始帧 JSON。
-//
-// 序号不能塞进帧里：frames.schema.json 的三帧都是 additionalProperties=false 的封闭
-// 结构，多一个 seq 字段就不是合法帧了，所以包一层。
-type queuedFrame struct {
-	Seq   int64           `json:"seq"`
-	Frame json.RawMessage `json:"frame"`
-}
-
 // pollResponse 是 GET /tenon/intents/poll 的响应体。
 //
 // Dropped 是「因为队列满而丢掉的累计帧数」：前端不接入时帧本就该丢弃，但悄悄丢和
@@ -874,7 +864,7 @@ func (s *Server) serveIntentEnqueue(w http.ResponseWriter, r *http.Request) {
 		writeTenonError(w, *perr)
 		return
 	}
-	writeJSON(w, http.StatusOK, enqueueResponse{OK: true, Seq: s.intents.push(body)})
+	writeJSON(w, http.StatusOK, enqueueResponse{OK: true, Seq: s.intents.Push(body)})
 }
 
 // serveIntentPoll 回放 after 之后未确认的帧；nextCursor 是下一次应当传入的 after。
@@ -888,7 +878,7 @@ func (s *Server) serveIntentPoll(w http.ResponseWriter, r *http.Request) {
 		writeTenonError(w, *perr)
 		return
 	}
-	frames, cursor, dropped := s.intents.since(after)
+	frames, cursor, dropped := s.intents.Since(after)
 	writeJSON(w, http.StatusOK, pollResponse{Frames: frames, NextCursor: cursor, Dropped: dropped})
 }
 
@@ -914,7 +904,7 @@ func (s *Server) serveIntentAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 省略 upto 表示「确认到目前为止已入队的全部帧」：这是无参 ack 唯一说得通的语义。
-	upto := s.intents.highest()
+	upto := s.intents.Highest()
 	if req.Upto != nil {
 		if *req.Upto < 0 {
 			writeTenonError(w, *newError(protocol.ClassContractViolation, "INVALID_CURSOR",
@@ -923,7 +913,7 @@ func (s *Server) serveIntentAck(w http.ResponseWriter, r *http.Request) {
 		}
 		upto = *req.Upto
 	}
-	writeJSON(w, http.StatusOK, ackResponse{OK: true, Acked: s.intents.ack(upto)})
+	writeJSON(w, http.StatusOK, ackResponse{OK: true, Acked: s.intents.Ack(upto)})
 }
 
 // validateFrame 只做宿主必须做的最小判定：它是不是三种帧之一。
@@ -957,78 +947,6 @@ func parseAfter(raw string) (int64, *protocol.Error) {
 			"after 必须是非负整数序号，收到 "+strconv.Quote(raw))
 	}
 	return n, nil
-}
-
-// intentQueue 是有界内存帧队列：序号单调递增，ack 掉已确认的前缀。
-type intentQueue struct {
-	mu       sync.Mutex
-	capacity int
-	seq      int64
-	frames   []queuedFrame
-	dropped  int64
-}
-
-// newIntentQueue 构造队列；capacity 非正时退回 maxIntentFrames。
-func newIntentQueue(capacity int) *intentQueue {
-	if capacity <= 0 {
-		capacity = maxIntentFrames
-	}
-	return &intentQueue{capacity: capacity, frames: make([]queuedFrame, 0, capacity)}
-}
-
-// push 入队一帧并返回分配的序号；队列满时丢最旧的并累加 dropped。
-func (q *intentQueue) push(frame json.RawMessage) int64 {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.seq++
-	q.frames = append(q.frames, queuedFrame{Seq: q.seq, Frame: frame})
-	for len(q.frames) > q.capacity {
-		q.frames = q.frames[1:]
-		q.dropped++
-	}
-	return q.seq
-}
-
-// since 返回序号严格大于 after 的帧，并给出下一次应当传入的游标与累计丢弃数。
-// 没有新帧时游标回显 after（调用方可以继续用同一个游标轮询）。
-func (q *intentQueue) since(after int64) ([]queuedFrame, int64, int64) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	out := make([]queuedFrame, 0, len(q.frames))
-	cursor := after
-	for _, f := range q.frames {
-		if f.Seq <= after {
-			continue
-		}
-		out = append(out, f)
-		cursor = f.Seq
-	}
-	return out, cursor, q.dropped
-}
-
-// ack 丢掉序号不大于 upto 的帧，返回实际确认到的序号（不超过已分配的最大序号）。
-// 重复 ack 同一序号是幂等的。
-func (q *intentQueue) ack(upto int64) int64 {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if upto > q.seq {
-		upto = q.seq
-	}
-	kept := make([]queuedFrame, 0, len(q.frames))
-	for _, f := range q.frames {
-		if f.Seq > upto {
-			kept = append(kept, f)
-		}
-	}
-	q.frames = kept
-	return upto
-}
-
-// highest 返回已分配的最大序号（0 表示还没入过队）。ack 省略 upto 时用它确认全部。
-func (q *intentQueue) highest() int64 {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.seq
 }
 
 // ---------- 配置加载 ----------
