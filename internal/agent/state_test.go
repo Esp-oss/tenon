@@ -22,7 +22,7 @@ func samplePending() Pending {
 		RequiredRoles:     []string{"role:warehouse_manager"},
 		DispatchedAuditID: "aud_1",
 		CreatedAt:         "2026-10-27T09:15:03Z",
-		ExpiresAt:         "2026-10-27T09:30:03Z",
+		ExpiresAt:         "2099-01-01T00:00:00Z",
 	}
 }
 
@@ -93,6 +93,8 @@ func TestStateStoreListSkipsArchived(t *testing.T) {
 
 func TestPendingExpired(t *testing.T) {
 	p := samplePending()
+	// 这条用例自己钉窗口，不依赖 samplePending 的默认值（那个是远期，供别的用例用）。
+	p.ExpiresAt = "2026-10-27T09:30:03Z"
 	now, _ := time.Parse(time.RFC3339, "2026-10-27T09:20:00Z")
 	if p.Expired(now) {
 		t.Fatalf("还没到期")

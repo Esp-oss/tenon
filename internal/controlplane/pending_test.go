@@ -25,7 +25,7 @@ func TestPendingBoardUpsertAndRoleFilter(t *testing.T) {
 	agentTok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", []string{roleAgent}, time.Now().UTC(), time.Hour)
 	body := `{"planId":"pln_1","requestId":"req_1","by":"user:alice",
 	          "summary":"扣 12 件、开 1 张采购单","items":[{"label":"从标准件仓扣掉 12 件"}],
-	          "requiredRoles":["role:warehouse_manager"],"expiresAt":"2026-10-27T09:15:00Z"}`
+	          "requiredRoles":["role:warehouse_manager"],"expiresAt":"2099-01-01T00:00:00Z"}`
 	if status, resp := postJSONAuth(t, ts.URL+"/tenon/pending", agentTok, body); status != http.StatusOK {
 		t.Fatalf("推摘要失败 %d：%s", status, resp)
 	}
