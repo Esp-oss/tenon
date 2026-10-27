@@ -1740,6 +1740,8 @@ git commit -m "feat(agent): approve 走挂起；闸门顺序改为全部过完�
 
 ## Task 8: 恢复执行（校验审批人 → 过期 → G4 → policy → 执行 → 归档）
 
+**状态：✅ 已完成（commit `eaa64d7`，10 条用例）**
+
 **Task 7 复核后追加的要求（比正文更权威）**
 
 **Step 0（先做，关掉一个 fail-open 口子）**：Task 7 补了「策略处置不是 auto/approve 就转人工」的分支，但**没有用例**。先补一条：
@@ -1786,7 +1788,7 @@ func TestUnknownPolicyOutcomeDoesNotExecute(t *testing.T) {
 - Modify: `internal/agent/suspend.go`（`renderLabels` 所在文件；若需补 `Subject` 的填充逻辑在 `run.go`，按实际情况）
 - Test: `internal/agent/resume_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // 合法审批人 → 执行全部步骤 → result 段带 approvedBy → 归档 done。
@@ -1887,12 +1889,12 @@ func TestResumeIdempotentOnReplay(t *testing.T) {
 
 > 这些测试依赖一个测试装配器 `newResumeEnv`（假 host + 假模块 + 状态目录）。**在 `resume_test.go` 里自己写它**，结构参考 `run_test.go` 的既有假 host：`env.Host` 记录审计与策略、`env.Module` 记录执行与库存。不要改 `run_test.go` 的既有设施。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestResume' -count=1`
 Expected: `undefined: resumeConfirm`（或同类）
 
-- [ ] **Step 3: 实现 `resume.go`**
+- [x] **Step 3: 实现 `resume.go`**
 
 ```go
 package agent
@@ -2088,14 +2090,14 @@ func (r *runner) writePlanResult(ctx context.Context, p Pending, approvedBy, err
 }
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go run ./cmd/tenon d1 run --help`（确保工具链仍可用）→ 忽略
 
 Run: `go test ./internal/agent/ -run 'TestResume' -count=1 -v`
 Expected: 6 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/resume.go internal/agent/resume_test.go
@@ -2106,9 +2108,17 @@ git commit -m "feat(agent): 恢复执行（审批人/过期/G4/policy/归档）"
 
 ## Task 9: 公告板重推与终态覆盖
 
+**Task 8 复核后追加的要求（比正文更权威）**
+
+1. **`finishTerminal` 只推公告板，绝不再写 result 段**：`resume.go` 已在归档前写好计划级 result（`auditId = DispatchedAuditID`）。计划正文那句「写计划级 result 段并推终态覆盖」的注释是**错的**——照它再写一次，同一 auditId 会出现两条 result 段（计划级变三条记录）。
+2. **`RepushBoard` 要跳过「archived 里已有同名终态」的 pending**：`Archive` 的两步（写归档件 → 删 pending 件）之间失败会留下同名双份，`List()` 仍会返回它，重推会让板上挂一张**早已完成的卡**直到过期。实现：重推前查 `LoadArchived(planId)`，命中终态就跳过（并顺手删掉残留 pending，附日志）。
+3. **`state=resuming` 不要按 awaiting 重推**：它是崩溃标记（confirm 已被接受过），重推成"待批"会让审批人再点一次。
+4. **reject 分支不写 result 段**（`resume.go` 已如此）。若将来要补：`decision.outcome=deny`、`approvedBy=null`——拒绝就是没有人批准。
+
 **Files:**
-- Modify: `internal/agent/resume.go`（`finishTerminal` 完整实现）
 - Create: `internal/agent/board.go`
+- Modify: `internal/agent/resume.go`（仅在需要收口终态推送时；不得重复写 result 段）
+- Modify: `internal/agent/state.go`（若需按 planId 查 archived，用已有 `LoadArchived`）
 - Test: `internal/agent/board_test.go`
 
 - [ ] **Step 1: 写失败测试**
