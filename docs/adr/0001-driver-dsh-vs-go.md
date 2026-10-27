@@ -121,6 +121,14 @@
 - **Tenon 侧没有「改服务器」这种动作**（Go 侧无 `os/exec`，业务动作只有 HTTP），因此「留后门」的风险**全部来自 DSH 自带的工具面**；生产必须收窄到只剩业务工具（档位 A）。
 - **钩子不能当安全边界**（POC-1 实测 fail-open），安全只能建在「能力不提供」上——这也让 §6 第 2 步 `module-host` 的 `restrict`（收窄工具面）从「优化」升级为**安全前置条件**。
 
+**档位已定（2026-10-27）**：生产用**档位 A**——DSH 只挂 Tenon 业务工具，无 shell / 无文件写 / 无出网 / 无子代理 / 无运行时插件管理。`restrict` 的验收口径就是一条命令：
+
+```bash
+node scripts/check-profile-capabilities.mjs <prod-profile>   # 必须 exit 0
+```
+
+开发环境（`danger-full-access` + 审批关闭）不是生产配置，不得作为生产 profile 的基线。
+
 ## 7. 被否的方案
 
 | 方案 | 否决理由 |

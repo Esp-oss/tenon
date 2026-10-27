@@ -254,7 +254,7 @@ dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、�
 
 > **DSH 还不是业务驱动（0 实现）**：全仓**没有一行 dsh/cordis 代码**；今天操作业务的是 Go 的 `cmd/agent` + `cmd/host` + 模块。最终验收（DSH 对话页驱动业务）与模块动态注册/健康检查这三条需求已记录在 [`docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md`](docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md)（R1–R3 / Q1–Q3），**均未开始**。另有两处与「插件架构」说法不符的硬耦合待修：`TENON_MODULES` 只能启动时静态注册（改模块要重启 host）、`internal/agent/skillselect.go` 的 `knownModuleNames` 硬编码模块词表（新增模块不改这里，请求回合会静默选不中 skill）。
 
-> **生产安全边界尚未落地**：Tenon 侧没有 `os/exec`（业务动作只有 HTTP），「在服务器留后门」的风险**全部来自 DSH 自带工具面**（`pwsh`/`bash`/`fs` 写/`web`）。当前开发环境是 `danger-full-access` + 审批关闭，**不是生产配置**。生产应收窄到「只挂 Tenon 业务工具」，且禁止 `DSH_PERMISSION_MODE=danger-full-access`；威胁模型与三档能力见 [`docs/superpowers/specs/2026-10-27-tenon-security-threat-model.md`](docs/superpowers/specs/2026-10-27-tenon-security-threat-model.md)。
+> **生产安全边界尚未落地**：Tenon 侧没有 `os/exec`（业务动作只有 HTTP），「在服务器留后门」的风险**全部来自 DSH 自带工具面**（`pwsh`/`bash`/`fs` 写/`web`）。当前开发环境是 `danger-full-access` + 审批关闭，**不是生产配置**。生产已定为「只挂 Tenon 业务工具」（威胁模型档位 A），门禁用 `node scripts/check-profile-capabilities.mjs <profile>` 一条命令判定（现有 `web` profile 会报 20 项、`headless` 14 项，证明它真的会红）。细节见 [`docs/superpowers/specs/2026-10-27-tenon-security-threat-model.md`](docs/superpowers/specs/2026-10-27-tenon-security-threat-model.md)。
 
 > 页面已交付（`TENON_UI_DIR=ui`，无构建链静态页）：白话来自身份化模板，技术信息在折叠区。**可回归的验收**：`powershell -NoProfile -File scripts/verify-ui.ps1`——它起 stub 全链路、造一张待批卡，再用 Edge(CDP) 断言「卡面只有人话、技术信息默认收起、非审批人没有批准按钮」，并落两张截图到 `out/ui-verify/`。
 
