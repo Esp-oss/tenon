@@ -136,6 +136,30 @@ docs/             设计文档、接口文档与架构图
 
 **M0.5 已落地三个进程**：宿主 `cmd/host`（控制平面：策略 / 授权 / 审计链 / 注册表 / 共驾帧 REST）、agent 运行时 `cmd/agent`（轮询发件箱 → 读 skill → 能力发现 → LLM 规划 → 闸门 → 两段审计 → 执行）、触发器模块 `cmd/quote`；M0 的 `cmd/inventory` / `cmd/procurement` 继续可用。协议侧的三处扩展（`POST /tenon/audit`、`GET /tenon/modules`、模块发件箱 `direction=out`）见 [spec/0.1/CHANGELOG.md](spec/0.1/CHANGELOG.md) 的 `0.2.0` 提案段与 [docs/interfaces.md](docs/interfaces.md)。
 
+### 对话入口（M1 切片 1）：后端就绪，链路未通
+
+`cmd/host` 已具备「人 → agent」的入站面：
+
+- 入站队列**落盘**（`requests.jsonl` + `.meta` 序号水位），独立于出站内存队列——两者的 `ack` 都是累积游标，共用一个会互相吞帧；
+- `POST /tenon/session` 口令换**无状态 token**（dev 账号表 `config/users.dev.json`：`alice` / `bob` / `agent`）；
+- 入站三端点 + 待批公告板 + `GET /` 同源静态页；**消费侧**（`poll` / `ack` / 公告板写入）要求 `role:agent`，普通用户 token 一律 403；
+- `origin` 进策略：宿主签发合成 `evt_` 并**独立落盘登记**（这张表是治理状态，不是缓存——单删它会把在途请求静默降级成事件驱动），据此判定「对话发起 / 事件驱动」；缺 `triggerEventId` 的行为由 `TENON_REQUIRE_TRIGGER` 过渡控制（默认放行为 `event`，P4 收口时改强制）；
+- 业务级规则从 `skills/<id>/approval.json` 加载，加载期校验 `arg.*` / `risk.*` 路径并试编译，按 skill 粒度 fail-closed；与平台规则同池合并、**取更严**，所以业务规则只能收紧不能放宽。
+
+**还缺两半，所以现在不能当功能用**：agent 不消费入站队列、也不读 `confirm`（P2）；页面没有内容（P3）。即「业务员说话 → 落到队列」这一段是真的，「agent 处理 → 人看到结果」还没有。
+
+现在能验证到的最小链路（先起一个模块，例如 `inventory` 在 8081）：
+
+```bash
+TENON_USERS_FILE=config/users.dev.json TENON_SESSION_SECRET=dev \
+TENON_INBOUND_DIR=out/inbound TENON_MODULES='inventory=http://127.0.0.1:8081' \
+go run ./cmd/host
+# 换 token，再推一句人话；返回 {"ok":true,"seq":1,"durable":true}
+curl -s -X POST localhost:8080/tenon/session -d '{"user":"alice","password":"alice-dev"}'
+curl -s -X POST localhost:8080/tenon/requests -H "Authorization: Bearer <token>" \
+  -d '{"type":"tenon.request","text":"扣 12 件"}'
+```
+
 ### 能判定的用例（宿主模式，真进程实测）
 
 ```bash
@@ -188,15 +212,16 @@ docker compose -f compose.m0.yaml config --quiet
 
 ### 还没做的
 
-dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，本轮只有 REST 三端点）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
+dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、**agent 侧的挂起/恢复**（不消费入站队列、不读 `confirm`，所以审批通过也恢复不了执行）、**前端页面**（`GET /` 只是路由，`TENON_UI_DIR` 不配就回 503）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
 
 里程碑：
 
 | 阶段 | 内容 | 出口判据 |
 |---|---|---|
 | M0 | schema + conformance C1–C3/C8/C9/C10 + lint + `inventory` / `procurement` 两个侧车 | 模块侧用例全绿 |
-| **M0.5（当前）** | `host` + `agent` + `quote` + 协议扩展三处（写审计 / 注册表 / 发件箱） | C4/C5 判 PASS（**已达成**）；D1 需真 LLM 跑一次 A/B（**未跑**，接线已就位） |
-| M1 | grant 校验 + 审批通道 + 审计对账 + 共驾 WS + 进程内接入 | 高风险路径必须人工；对账能发现篡改 |
+| **M0.5（已完成）** | `host` + `agent` + `quote` + 协议扩展三处（写审计 / 注册表 / 发件箱） | C4/C5 判 PASS（**已达成**）；D1 需真 LLM 跑一次 A/B（**未跑**，接线已就位） |
+| **M1 切片 1（已完成）** | host 入站面：落盘入站队列 / dev 身份 / `origin` 进策略 / 业务级规则 / 待批公告板 / 同源静态页 | 入站与策略侧用例全绿；**链路未通**——agent 侧（P2）与页面（P3）未做 |
+| M1（剩余） | agent 挂起/恢复 + `pendingPlanId` + 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 | 高风险路径必须人工；对账能发现篡改 |
 | M2 | HTTP 侧车 SDK + MCP 双向 + 非 TS 示例 | 非 TS 模块跑通全套用例 |
 | M3 | skill 仓库 + 轨迹蒸馏 + 发布审计/回滚 | 新流程只改 skill 即可上线 |
 
@@ -217,8 +242,8 @@ docker compose -f compose.m0.yaml config --quiet   # 现在就能过
 docker compose -f compose.m0.yaml build            # 逐服务构建；运行时阶段仍未验
 ```
 
-对外接口（端口分配、模块侧 6 端点、宿主侧 8 端点、请求头与 HMAC、游标与方向、健康探针、调用矩阵、G1 的 fail-closed 语义、已知缺口）：
-[**docs/interfaces.md**](docs/interfaces.md)。
+对外接口（端口分配、模块侧 6 端点、宿主侧 **13 个协议端点 + 2 个探针 + 静态页**、请求头与 token、游标与方向、健康探针、调用矩阵、G1 的 fail-closed 语义、已知缺口）：
+[**docs/interfaces.md**](docs/interfaces.md)（§4 有逐条清单）。
 
 ## 与相邻协议的关系
 

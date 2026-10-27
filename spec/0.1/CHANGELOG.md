@@ -6,7 +6,7 @@
 
 ## 0.2.0 — 提案，尚未冻结
 
-> **状态：提案。** 本段记录 M0.5 实现过程中对 0.1 的三处扩展与一处语义澄清。它**尚未冻结**：措辞可能随评审改动，实现仍以 `Tenon-Version: 0.1` 报版本（扩展端点不改动 0.1 的任何既有线格式）。冻结之前，不要把本段当成已发布的对外承诺。
+> **状态：提案。** 本段记录 M0.5 实现过程中对 0.1 的三处扩展与一处语义澄清，以及 M1 切片 1（对话入口）落地时补出的入站面扩展。它**尚未冻结**：措辞可能随评审改动，实现仍以 `Tenon-Version: 0.1` 报版本（扩展端点不改动 0.1 的任何既有线格式）。冻结之前，不要把本段当成已发布的对外承诺。
 
 ### Added — `POST /tenon/audit`（写审计）
 
@@ -42,6 +42,40 @@
 
 - 模块未实现 `POST /tenon/actions/{id}:dry-run`（404）→ 等价于 `unsupported`，**调用方必须强制审批（fail-closed）**。
 - 这**不是免检**。把 404 读成「没有预演就放行」，等于给供应商一个自助旁路：删掉端点即可跳过预演。任何允许这种读法的实现，都在事实上取消了预演闸门。
+
+### Added — 入站面：`POST /tenon/session`、`/tenon/requests`（+`poll`/`ack`）、`/tenon/pending`（`GET`/`POST`）
+
+**为什么 0.1 不够**：0.1 的三帧里 `Intent` 是 agent→前端，而 `Context` / `Confirm` 虽然定义了前端→agent 的方向，却**没有任何入站通道**（实现里 agent 也不读）。于是「人说话 → agent 做一回合」这条路径不存在，审批帧也无处投递。而 0.1 把 `/tenon/intents` 写成 WS 端点，其 REST 降级的 `ack` 是**累积游标**——两个消费者共用一个游标会互相吞帧，所以入站不能复用它。
+
+- `POST /tenon/session`：`{user, password}` → `{token, user, roles, exp}`；token 是无状态 HMAC（`base64url(payload).base64url(HMAC-SHA256(…))`），不引存储。**这是开发态身份，不是认证**（无口令强度、无锁定、无吊销、无 SSO）。
+- `POST /tenon/requests` 收 `tenon.request`（新帧）或 `tenon.confirm`；响应 `{ok, seq, durable}`。`durable:false` 表示只进了内存队列没落盘——**此时仍回 200**：500 会诱导客户端重试，而 `requestId` 由宿主签发，重试等于把用户那句话再说一遍。
+- **三个入站端点都要求** `Authorization: Bearer`；**消费侧**（`poll` / `ack` / 公告板写入）还要求 `role:agent`。用户 token 若能 ack 就能吞掉别人的请求；若能写公告板，就能给审批人塞伪造的待批卡片。
+- 入站队列**落盘**（JSONL + 序号水位 meta），与出站内存队列刻意不对称：入站承载「人说过的话」，丢了没人知道；出站只是界面提示，丢了可由公告板重建。
+- `POST /tenon/pending` / `GET /tenon/pending`：待批公告板，**只读 read-model**（权威状态在 agent 盘上的 pending 文件）。`POST` 是幂等 upsert，`GET` 按 token 角色过滤并给 `mine`——仅供显示，不构成授权。
+
+### Added — 新帧 `tenon.request`（人 → agent）
+
+```json
+{"type":"tenon.request","requestId":"req_…","text":"Q-2026-0417 这单货不够，先扣现有的，缺的发起采购",
+ "context":{"view":{"module":"quote","type":"Quote","id":"Q-2026-0417"}},"by":"user:alice","at":"2026-10-27T09:15:00.000Z"}
+```
+
+- `by` 由宿主从 token 解析后**覆写**，客户端自报一律丢弃；`text` 是原话，不做意图分类；`context.view` 可选，给「这单」这类指代一个实体锚点。
+- 宿主为每条 request 签发 `requestId` 与**合成事件 id**（`evt_`），并登记 `eventId → origin:"request"`。`Plan.trigger` 沿用既有规定——`plan.schema.json` 的 `PlanTrigger` 注解本就写了「人工发起时使用宿主生成的合成事件 id」，**不需要改 plan schema**。
+- 登记表是**治理状态而非缓存**：判定规则是「未登记即视为 `event`」，所以删掉它会把在途 request 静默降级成事件驱动，绕开「对话发起必须审批」。清理它必须与清空 pending 一起做。
+
+### Added — `origin` 成为策略输入（`policies:evaluate` 增 `triggerEventId`）
+
+- 条件叶子路径前缀从 `arg` / `risk` 扩为 `arg` / `risk` / `origin`；`origin` 是**单段路径**（不带点），取值 `request` | `event`。`policy.schema.json` 的 `ConditionLeaf` propertyName 相应允许单段。
+- `origin` 由宿主查登记表判定，**不接受调用方自报**；缺 `triggerEventId` 时按 `event` 处理，`TENON_REQUIRE_TRIGGER=1` 时改为 `200 + deny + reasons:["MISSING_TRIGGER"]`（不是 4xx——处置与其它策略结论同形）。
+- 用途：把「对话发起必须人按」与「事件驱动按阈值自动」做成两条正交轴，合并仍取更严（`deny > approve > auto`）。
+
+### Added — 业务级规则文件 `skills/<skillId>/approval.json`、`summaryTemplate`
+
+- `approval.json` 与平台 `config/policies*.json` **同 schema、同加载器、同池合并**（先按 `outcome` 强弱，同 outcome 内按 `priority`），**不设文件级覆盖**。因此业务级规则**只能收紧、不能放宽**：平台若有「该动作一律 approve」，业务级写 auto 是无效的。
+- 加载期校验：`arg.*` 必须存在于该动作 `inputSchema.properties`（只比首段）；`risk.*` 必须存在于动作声明的 `risk`；规则还要**试编译**一次（未知算子/非法路径语法在此暴露，按 skill 粒度整份丢弃，而不是让整个宿主起不来）。业务级文件**必须写明 `match.actions`**——模块级规则的覆盖面无法枚举，其 `arg.*` 无从校验，一律拒收。
+- `module-manifest.schema.json` 的 action 增可选 `summaryTemplate`（人话模板，占位符取自 `args`），供渲染「从标准件仓扣掉 12 件」这类白话；`title` 早已是必填项，本轮未改。
+- **威胁模型变化**：规则放进 `skills/` 等于「改文档即改权限」，需要 CODEOWNERS + review 或只读挂载。
 
 ## 0.1.0 - 2026-10-27
 
