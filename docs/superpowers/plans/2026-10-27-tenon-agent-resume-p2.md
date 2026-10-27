@@ -1538,6 +1538,8 @@ git commit -m "feat(agent): prompt 分流（用户请求指令块与事件事实
 
 ## Task 7: `round()` 闸门重构 + `approve` 走挂起
 
+**状态：✅ 已完成（commit `9abd389`）**
+
 **Task 6 复核后追加的接线要求（比正文更权威）**
 
 1. **`run.go:178` 的 `PlanInput` 构造必须补 `Request: r.request`**：`runner` 需要一个 `request *UserRequest` 字段，`Run()` 从 `in.Request` 赋值。漏了这一处，Task 6 的 prompt 分流永远不生效（`PlanInput.Request` 恒 nil）。
@@ -1551,7 +1553,7 @@ git commit -m "feat(agent): prompt 分流（用户请求指令块与事件事实
 - Modify: `internal/agent/run_test.go`（改既有 approve 用例）
 - Test: `internal/agent/run_test.go`
 
-- [ ] **Step 1: 改既有用例并新增失败测试**
+- [x] **Step 1: 改既有用例并新增失败测试**
 
 把 `TestPolicyApproveGoesNeedsHumanWithoutApprovalChannel` 的语义改成「**没有挂起通道时**才转人工」：给 `Deps` 传 `State` 为 nil，断言仍是 `needs_human` 且 `PendingPlanID == nil`。
 
@@ -1601,12 +1603,12 @@ func TestPolicyDenyDoesNotSuspend(t *testing.T) {
 
 > `newRunEnv` / `env.RunOnce` / `planJSON` / `testStep` 都是 `run_test.go` 里**已有**的测试设施（若名字不同，按实际改名，不要新造一套）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestPolicyApprove|TestPolicyDenyDoesNotSuspend' -count=1`
 Expected: `Deps.State` 不存在 / 用例失败
 
-- [ ] **Step 3: 改 `run.go`**
+- [x] **Step 3: 改 `run.go`**
 
 `Deps` 增：
 
@@ -1722,12 +1724,12 @@ func renderLabels(plan Plan) ([]string, error) {
 
 > 说明：真正的人话模板来自模块 manifest 的 `summaryTemplate`，P1 已加 schema 字段但模块尚未填。本任务先用「动作 id + 参数摘要」兜底，**并在代码注释里写明这条兜底**；P3 渲染前再补模板。这不是占位——它是计划明确接受的降级。
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -count=1`
 Expected: 全绿（含改过的 approve 用例与新增两条）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/run.go internal/agent/run_test.go internal/agent/suspend.go
@@ -1738,8 +1740,50 @@ git commit -m "feat(agent): approve 走挂起；闸门顺序改为全部过完�
 
 ## Task 8: 恢复执行（校验审批人 → 过期 → G4 → policy → 执行 → 归档）
 
+**Task 7 复核后追加的要求（比正文更权威）**
+
+**Step 0（先做，关掉一个 fail-open 口子）**：Task 7 补了「策略处置不是 auto/approve 就转人工」的分支，但**没有用例**。先补一条：
+
+```go
+// 未知的策略处置必须 fail-closed：绝不能因为"不认识这个值"就掉进执行。
+func TestUnknownPolicyOutcomeDoesNotExecute(t *testing.T) {
+	env := newFakeEnv(t)
+	env.Host.PolicyOutcome = "maybe" // 未来的新枚举 / 被篡改的响应
+	env.LLM.replies = []string{planJSON("pln_unknown", testStep{id: "s1", action: "inventory.DeductStock"})}
+	deps := env.Deps()
+	res := Run(context.Background(), deps, RunInput{Event: env.Event()})
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("未知处置应转人工，得到 %q", res.Outcome)
+	}
+	// 只走到策略闸门，不许碰授权/预演/执行。
+	if !equalSeq(env.Host.Trace(), []string{"policies:evaluate"}) {
+		t.Fatalf("闸门次序不对：%v", env.Host.Trace())
+	}
+}
+```
+
+（`newFakeEnv` / `env.Deps()` / `env.Host` / `equalSeq` 都是 `run_test.go` 里**已有**的设施；字段名以实际为准，不要新造。）
+
+**Step 0b（恢复路径必须自己装模块清单）**：`r.modules` 只在 `run()` 的 `discover()` 里填，`moduleBase()` 靠它。`resume` **不能复用 `round()`**（它含规划与二次挂起），但必须自己 `discover(ctx)` 后再走 `executeStep`，否则每步都报"动作所属模块不在可达清单里"。
+
+**Step 0c（补 `Subject`，别让审计丢实体）**：`Pending` 现在只存 `TriggerEventID` + `Plan.Trigger.CorrelationID`，事件的 `subject` 丢了 → 恢复后 `entities()`/`target()` 退化成空数组（审计 `effects.entities=[]`、Intent 帧 `actions=[]`）。**加一个字段**（改 `state.go`，本任务允许）：
+
+```go
+	// Subject 是触发事件的实体寻址（domain-event 的 subject 原样）。审计与 Intent 帧都要它，
+	// 而 TriggerEventID 只够锚定事件、锚不住"哪个实体"。
+	Subject json.RawMessage `json:"subject,omitempty"`
+```
+
+`buildPending`（Task 7 已落地）要补填 `Subject: r.event.Subject`；`resume` 组装 `runner` 时把 `event.Subject` 填回去。补一条用例：恢复执行的审计里 `effects.entities` 非空。
+
+**Step 0d（`approvedBy` 需要通道）**：`gateDecision` 没有 `approvedBy`，`auditBase` 硬写 `decision.ApprovedBy: nil`。恢复执行时**不要复用 `auditBase` 写 result 段**——直接用计划里给的 `writePlanResult`（它自己填 `approvedBy`），并且**不要**把 `decision.outcome` 从 `approve` 改写成 `auto`（`TestAuditRecordsTwoSegments` 锁了"outcome=闸门处置、policyId=策略 id"）。
+
+**Step 0e**：`grantIDs` 不落盘，恢复必须**重跑** `grants:evaluate`（spec §5 也这么要求），别从 pending 里找命中的 grant。
+
 **Files:**
 - Create: `internal/agent/resume.go`
+- Modify: `internal/agent/state.go`（加 `Subject` 字段）
+- Modify: `internal/agent/suspend.go`（`renderLabels` 所在文件；若需补 `Subject` 的填充逻辑在 `run.go`，按实际情况）
 - Test: `internal/agent/resume_test.go`
 
 - [ ] **Step 1: 写失败测试**
@@ -2314,7 +2358,6 @@ func (h hostAuditProbe) Has(ctx context.Context, auditID string) (bool, error) {
 6. **自检的导出包装与日志**：`selfCheck` 是小写、返回未导出类型 `selfCheckReport`。Task 10 加个导出包装 `SelfCheck(...) (selfCheckReport, error)` 即可（调用方用 `rep.Kept` 这类导出字段，不需要命名类型）。日志行**必须包含 `Corrupt`**——坏文件唯一的告警出口。
 
 7. **`SelectSkills` 接进 `Run` 的三条（Task 5 复核后追加）**
-
    (i) **`PlanInput.Request`（Task 6）与 `RunInput.Request`（Task 7）必须同时存在**：`Run` 内按 `runInput.Request != nil` 分流——request 回合用 `SelectSkills` 算候选集，事件回合仍走 `Skills.TextFor(event.Type)`。只改一处会得到一个永远不成立的分支。
 
    (ii) **别用 `SkillStore.TextFor` 渲染候选集**：它只渲染**非空 Body**。只靠 `Subscribes` 命中的 skill（Body 为空）会被选中却渲染成空串 → `userPrompt` 写「（本次没有匹配的 skill 正文）」——**选了 N 份却告诉模型没有**。需要新写 `TextForSelected(selected []Skill) string`，与 `TextFor` 同一格式，但空 Body 渲染成「（无正文，仅按订阅命中）」，绝不渲染空串。
