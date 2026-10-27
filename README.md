@@ -223,16 +223,18 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 | #1 | 修 prompt 前 | `fail` | **判定受阻**：A 轮模型输出连续 2 次没过 `plan.schema.json`，两轮无可比 |
 | #2 | 修 prompt 后 | 当时记 `pass` | **空洞通过**：A 轮只有 `inventory.GetStock`，本就没引用被摘的 `procurement`，两轮差异不是摘除造成的 |
 | #3 | 判据收紧后 | `fail` | B 轮规划出 `inventory.DeductStock` 但**缺 `referenceNo`** → 预演 400 `SCHEMA_MISMATCH` → fail-closed，B 轮 `failed` |
+| #4 | 库存种子改 0 + `requiredArgs` 进 prompt | `fail` | **实质结论**：A 轮 `[inventory.GetStock]`（completed）、B 轮 `[inventory.GetStock]`（completed）——两轮都只做只读探针，序列相同，说明 agent 没在用能力清单完成业务 |
 
-**结论：D1 至今没有被真正判定过一次。** 三种形态各不相同，但都不是「agent 自适应」的证据。
+**结论：D1 第 4 次判出实质结论 `fail`（不再是「判定受阻」）。** 前三次分别卡在「schema 撞墙」「空洞通过」「B 轮非法计划」，这次两轮都跑完了、计划也合法，但**模型只查了库存就收工**——在库 0、需求 12 的场景下它本应规划采购（唯一的写路径），却没有。这暴露的是**计划质量问题（模型不做业务闭环）**，不是契约问题：同一份 prompt 下，对话回合能正确规划「查库存 + 扣 12 件并挂起审批」（见 `scripts/verify-ai.ps1` 的通过记录），事件回合却退化成只读探针。
 
-**根因链（三层，前两层已修，第三层需单独评审）**
+**根因链（四层：前三层已修，第四层是模型行为）**
 
 1. **`expectedDiff` 的形状没写给模型**（已修）：prompt 没说元素必须含 `field`/`from`/`to`，模型自造 `{op, note}`；prompt 说 entity 可写「字符串简写」却没给格式，模型写了裸主键 `"STD-1002"`，而 `EntityRefString` 要求三段 `模块:类型/主键`（`oneOf` 两侧都不匹配时报错文本会误导成「只收对象」）。修法：第 7 条给出两种等价写法的占位示例 + 明说「只写主键是错的」，`TestPromptStatesExpectedDiffShape` 锁住。
 2. **判据会被计划质量架空**（已修）：A 轮若不含被摘模块的动作，「B 轮不碰它」是白送的。现在这种空洞通过记 **`inconclusive`**（新增第三态）而不是 `pass`，用例 `TestD1InconclusiveWhenADidNotUseRemovedModule` 锁住；退出码仍为非 0，不会被 CI 当成合格。
-3. **prompt 不带入参契约**（未修，需评审）：动作清单只列 action id（`internal/agent/planner.go` 的「可调动作」块），模型不知道 `DeductStock` 需要 `referenceNo`，写动作必然靠猜——#3 的 400 就是它。要让 D1 可判定，得把每个动作的**最小入参契约**（`required` 字段名与类型）带进 prompt，或让规划器按需拉 `GET /tenon/actions/{id}`。这是设计变更（上下文成本 vs 计划合法率），不在本轮边界内。
+3. **prompt 不带入参契约**（已修）：`requiredArgs` 已进摘要线并渲染进 prompt（`actionMetaSuffix`），模块侧加载期断言 `⊆ inputSchema.required`。证据：修之前真模型写 `DeductStock` 漏 `referenceNo`（#3 的 400）；修之后对话回合能规划出合法 args 并挂起。
+4. **模型在事件回合不做业务闭环**（未修，属模型/场景层面）：`#4` 里 A/B 都只查库存。可能的下一步：强化 skill 正文的流程约束、或让 D1 场景的「必须采购」更显式（例：事件里直接给出缺口数量）。这已不是契约问题，改它属于「调 prompt/场景」，按本轮边界先记录不实施。
 
-> 本轮边界是「只判不调」：已修的两层都是**让判定成为可能**的缺陷（不是为了让结果变绿），第三层会让判定继续受阻，但它改变的是 prompt 的信息量与上下文成本，必须单独评审。用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
+> 本轮边界是「只判不调」：前三层修的都是**让判定成为可能**的缺陷；第四层是模型的计划质量，改它容易把 D1 做成假命题，必须单独评审。用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
 
 ### 其它检查
 
