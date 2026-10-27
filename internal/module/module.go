@@ -1614,3 +1614,30 @@ func methodNotAllowed(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
+
+// TemplatePlaceholders 按出现顺序返回模板里的占位符名（去重）。
+//
+// 导出是给**测试**用的：模块侧的用例要机械断言「模板里每个占位符都真的在
+// inputSchema.properties 里」。这条约束不放进加载期校验——模板写错只影响可读性，
+// 不该让整条审批路径瘫痪（P3 spec §6）。
+func TemplatePlaceholders(tpl string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for i := 0; i < len(tpl); i++ {
+		if tpl[i] != '{' {
+			continue
+		}
+		rel := strings.IndexByte(tpl[i+1:], '}')
+		if rel < 0 {
+			// 落单的 '{' 不是占位符：渲染侧会因此退 R2，这里不替它报错。
+			break
+		}
+		name := tpl[i+1 : i+1+rel]
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+		i += rel + 1
+	}
+	return out
+}

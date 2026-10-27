@@ -74,10 +74,11 @@ func main() {
 
 func createPurchaseRequestAction() module.Action {
 	return module.Action{
-		ID:      actionCreatePurchaseRequest,
-		Version: "0.1.0",
-		Title:   "创建采购申请",
-		Kind:    "write",
+		ID:              actionCreatePurchaseRequest,
+		Version:         "0.1.0",
+		Title:           "创建采购申请",
+		SummaryTemplate: "缺 {qty} 件 {sku}，发起采购申请（单据 {referenceNo}）",
+		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,

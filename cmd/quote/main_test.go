@@ -562,16 +562,30 @@ func TestManifestSummariesOmitInputSchema(t *testing.T) {
 		t.Fatalf("动作摘要应有 2 条，得到 %d：%s", len(mf.Actions), raw)
 	}
 
-	// 摘要字段集合封闭：多一个字段就是 manifest 与 schema 不一致。
-	wantKeys := []string{"id", "version", "title", "kind", "risk", "dryRun"}
+	// 摘要字段集合：六个必填字段之外，summaryTemplate 可选（0.2.0 加的字段）。
+	// 多出别的字段就是 manifest 与 schema 不一致；少了必填字段同理。
+	requiredKeys := []string{"id", "version", "title", "kind", "risk", "dryRun"}
+	optionalKeys := map[string]bool{"summaryTemplate": true}
 	kinds := make(map[string]string, len(mf.Actions))
 	for _, summary := range mf.Actions {
-		if len(summary) != len(wantKeys) {
-			t.Fatalf("动作摘要字段数 = %d，期望 %d：%v", len(summary), len(wantKeys), summary)
-		}
-		for _, k := range wantKeys {
+		for _, k := range requiredKeys {
 			if _, ok := summary[k]; !ok {
-				t.Fatalf("动作摘要缺字段 %q：%v", k, summary)
+				t.Fatalf("动作摘要缺必填字段 %q：%v", k, summary)
+			}
+		}
+		for k := range summary {
+			if optionalKeys[k] {
+				continue
+			}
+			known := false
+			for _, req := range requiredKeys {
+				if req == k {
+					known = true
+					break
+				}
+			}
+			if !known {
+				t.Fatalf("动作摘要出现契约外字段 %q：%v", k, summary)
 			}
 		}
 		var id, kind string
@@ -654,4 +668,28 @@ func TestConcurrentCreatesAndReads(t *testing.T) {
 	if len(seen) != workers {
 		t.Fatalf("事件载荷只覆盖 %d 张单，期望 %d", len(seen), workers)
 	}
+}
+
+// 模板里的每个占位符都必须真的在 inputSchema.properties 里：否则渲染必然退 R2，
+// 卡片上永远读不到人话（P3 spec §4 的 R1）。
+func assertTemplateArgs(t *testing.T, a module.Action) {
+	t.Helper()
+	if a.SummaryTemplate == "" {
+		t.Fatalf("%s 没声明 summaryTemplate", a.ID)
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(a.InputSchema, &schema); err != nil {
+		t.Fatalf("%s 的 inputSchema 读不出：%v", a.ID, err)
+	}
+	for _, name := range module.TemplatePlaceholders(a.SummaryTemplate) {
+		if _, ok := schema.Properties[name]; !ok {
+			t.Fatalf("%s 的模板占位符 {%s} 不在 inputSchema.properties 里", a.ID, name)
+		}
+	}
+}
+
+func TestActionTemplatesUseDeclaredArgs(t *testing.T) {
+	assertTemplateArgs(t, createStandardPartQuoteAction())
 }
