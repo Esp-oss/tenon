@@ -490,6 +490,30 @@ func TestPolicyDenyDoesNotSuspend(t *testing.T) {
 	}
 }
 
+// 未知的策略处置必须 fail-closed：绝不能因为「不认识这个值」就掉进执行。
+//
+// policy.schema.json 是封闭枚举，但宿主的响应不受本包控制（新枚举、被篡改的响应、
+// 中间层塞进来的调试值都可能出现）。这是 approve 走挂起之后留下的一处 fail-open 口子：
+// 只要判断写成「不是 deny 就往下走」，未知值就会一路走到执行。
+func TestUnknownPolicyOutcomeDoesNotExecute(t *testing.T) {
+	env := newFakeEnv(t)
+	env.Host.PolicyOutcome = "maybe" // 未来的新枚举 / 被篡改的响应
+	env.LLM.replies = []string{planJSON("pln_unknown", testStep{id: "s1", action: "inventory.DeductStock"})}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("未知处置应转人工，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	// 只走到策略闸门，不许碰授权/预演/执行。
+	if want := []string{"policies:evaluate"}; !equalSeq(env.Trace, want) {
+		t.Fatalf("闸门次序不对：实际 %v，期望 %v", env.Trace, want)
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("未知处置绝不许执行：write=%d execute=%d", env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+}
+
 // request 回合命中 approve → 同样挂起，只是 origin=request、requestId 有值
 // （spec §6.3：「等审批」只有一条实现路径，不分来源）。
 //

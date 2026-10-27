@@ -40,6 +40,10 @@ type Pending struct {
 	CreatedAt         string       `json:"createdAt"`
 	ExpiresAt         string       `json:"expiresAt"`
 	ArchivedStatus    *string      `json:"archivedStatus"`
+
+	// Subject 是触发事件的实体寻址（domain-event 的 subject 原样）。审计与 Intent 帧都要它，
+	// 而 TriggerEventID 只够锚定事件、锚不住「哪个实体」。
+	Subject json.RawMessage `json:"subject,omitempty"`
 }
 
 // Expired 判断是否过了审批窗口。解析失败按「已过期」处理（fail-closed）。

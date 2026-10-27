@@ -414,6 +414,9 @@ func (r *runner) buildPending(plan Plan, policy policyEvaluation) (Pending, erro
 		RequiredRoles:  policy.Approvers,
 		CreatedAt:      now.Format(time.RFC3339),
 		ExpiresAt:      now.Add(pendingTTL).Format(time.RFC3339),
+		// subject 必须落盘：恢复时 TriggerEventID 只够锚定事件、锚不住「哪个实体」，
+		// 丢了它，恢复执行的审计 effects.entities 与 Intent 帧 actions 就退化成空数组。
+		Subject: r.event.Subject,
 	}, nil
 }
 
