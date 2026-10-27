@@ -77,15 +77,6 @@ function clockText(date) {
   return pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
 }
 
-function interleave(nodes) {
-  const out = [];
-  nodes.forEach((node, i) => {
-    if (i) out.push(' · ');
-    out.push(node);
-  });
-  return out;
-}
-
 class HttpError extends Error {
   constructor(message, status) {
     super(message);
@@ -485,21 +476,6 @@ function renderCard(item, pending) {
   }
   card.append(head);
 
-  const meta = [];
-  if (item.planId) meta.push(h('span', {}, 'planId ', h('code', { text: item.planId })));
-  if (item.requestId) meta.push(h('span', {}, 'requestId ', h('code', { text: item.requestId })));
-  if (item.by) meta.push(h('span', {}, '发起人 ', h('code', { text: item.by })));
-  if (meta.length) card.append(h('p', { class: 'meta' }, ...interleave(meta)));
-
-  const labels = itemLabels(item);
-  if (labels.length) {
-    const list = h('ul', { class: 'detail' });
-    labels.forEach((label) => list.append(h('li', { text: label })));
-    card.append(list);
-  } else {
-    card.append(h('p', { class: 'meta muted' }, '（没有分项明细）'));
-  }
-
   const need = Array.isArray(item.requiredRoles) ? item.requiredRoles.filter((r) => typeof r === 'string' && r) : [];
   const needLine = h('p', { class: 'meta' }, '需要角色：');
   if (need.length) {
@@ -522,6 +498,29 @@ function renderCard(item, pending) {
   );
   if (item.expiresAt) expiryLine.append(' ', h('code', { text: item.expiresAt }));
   card.append(expiryLine);
+
+  // 技术详情（R5）：planId / requestId / 发起人 / 每步的 action（args）只在这里出现。
+  // 用原生 <details>：零 JS 状态、零构建链，默认收起，卡面只剩一句人话。
+  const labels = itemLabels(item);
+  const tech = h('details', { class: 'tech' });
+  tech.append(h('summary', {}, '详情 ▾'));
+  const techList = h('ul', { class: 'tech-list' });
+  if (item.planId) techList.append(h('li', {}, h('span', { text: 'planId ' }), h('code', { text: item.planId })));
+  if (item.requestId) techList.append(h('li', {}, h('span', { text: 'requestId ' }), h('code', { text: item.requestId })));
+  if (item.by) techList.append(h('li', {}, h('span', { text: '发起人 ' }), h('code', { text: item.by })));
+  labels.forEach((label, i) => {
+    const entry = Array.isArray(item.items) ? item.items[i] : null;
+    // 老 agent 不推 detail：退回这条 item 自身的 JSON，至少让详情区不是空的。
+    const detail = entry && typeof entry.detail === 'string' && entry.detail.trim() !== ''
+      ? entry.detail
+      : JSON.stringify(entry || { label });
+    techList.append(h('li', {}, h('code', { text: detail })));
+  });
+  if (!techList.childNodes.length) {
+    techList.append(h('li', { class: 'muted', text: '（没有技术明细）' }));
+  }
+  tech.append(techList);
+  card.append(tech);
 
   if (pending) {
     const actions = h('div', { class: 'card-actions' });
