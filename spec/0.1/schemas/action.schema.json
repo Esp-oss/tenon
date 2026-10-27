@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/action.schema.json",
+  "title": "Action（动作契约）",
+  "description": "模块暴露一个可调用动作的完整定义：读写分类、入参/出参 schema、风险、幂等、补偿、超时、预演能力与配额计量单位，供 agent 在命中候选后按 id 拉取。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "version", "title", "kind", "inputSchema", "outputSchema", "risk", "timeoutMs", "dryRun"],
+  "properties": {
+    "id": {
+      "description": "动作标识 <module>.<Action>，在模块内唯一且发布后不改名（改名即新动作）。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+    },
+    "version": {
+      "description": "动作契约版本（语义化版本）。入参/出参增量兼容演进用 minor，破坏性变更用 major 并以新 id 并行发布。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/SemVer"
+    },
+    "title": {
+      "description": "面向人和 agent 的动作名称，一句话说明它做什么（例「扣减库存」）。",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "kind": {
+      "description": "读写分类，必填。read 无副作用，不得声明 idempotency；write 有副作用，必须声明 idempotency。C1 用例按此分支断言。",
+      "type": "string",
+      "enum": ["read", "write"]
+    },
+    "inputSchema": {
+      "description": "入参的 JSON Schema 原文。本字段是一份嵌套的 JSON Schema，故不封闭字段集合（合法的 schema 关键字是开放的）；write 动作的 idempotency.keyFields 必须是本 schema 的 required 子集（§4.2，该约束见 semantics.md §3，由 C1 用例机械校验）。",
+      "type": ["object", "boolean"]
+    },
+    "outputSchema": {
+      "description": "出参的 JSON Schema 原文。用于让 agent 读懂返回结构，不参与闸门判定。",
+      "type": ["object", "boolean"]
+    },
+    "risk": {
+      "description": "风险分级与可逆性，决定该动作能否自动执行、能否出现在多步 Plan 的非末位。",
+      "$ref": "#/$defs/Risk"
+    },
+    "idempotency": {
+      "description": "幂等声明。write 必填（重试与崩溃恢复全靠它），read 禁止出现（无副作用则无幂等语义）。",
+      "$ref": "#/$defs/Idempotency"
+    },
+    "compensation": {
+      "description": "saga 补偿声明：动作失败后如何撤销它。reversible=false 且缺失本字段时强制审批（§4.2、§4.7）。",
+      "$ref": "#/$defs/Compensation"
+    },
+    "timeoutMs": {
+      "description": "单步超时毫秒，必须显式声明（协议默认值 30000 仅在接入方未覆盖时给出，声明即生效）。超时按 retryable 处理，且已发出的调用结果视为未定，须按幂等键回查（§5.2、semantics.md §2）。",
+      "type": "integer",
+      "minimum": 1
+    },
+    "dryRun": {
+      "description": "预演能力声明。supported=false 时该动作的 Plan 在 dryRun.status 上降级为 unsupported，并触发强制审批。",
+      "$ref": "#/$defs/DryRunCapability"
+    },
+    "quotaUnit": {
+      "description": "配额计量单位，供 Grant 配额计算：calls 按调用次数，quantity 按 args 中的业务量（字段名由 quotaField 指定）。省略等价于 calls。",
+      "$ref": "#/$defs/QuotaUnit"
+    },
+    "quotaField": {
+      "description": "quotaUnit=quantity 时必须给出：args 里表示业务量的字段名（例 qty），缺失则配额无法计量。该必填关系属语义层（§4.2 的示例本身省略了它，故 schema 不强制，见 README §6）。quotaUnit=calls 时本字段无意义。",
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "preconditions": {
+      "description": "前置条件的说明性文字，供人和 agent 阅读理解。它不是给 agent 执行的条件，agent 不得据此短路调用：前置条件永远由模块在动作内部校验（G4，§3.2、§4.2）。",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "deprecated": {
+      "description": "标记该动作进入弃用期（见 versioning.md 弃用流程）：仍必须可调用，但新实现不应再依赖它，且不得被新 Plan 首选；下一个 major 版本删除。",
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["kind"],
+        "properties": {
+          "kind": {
+            "const": "write"
+          }
+        }
+      },
+      "then": {
+        "required": ["idempotency"]
+      }
+    },
+    {
+      "if": {
+        "required": ["kind"],
+        "properties": {
+          "kind": {
+            "const": "read"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": ["idempotency"]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Risk": {
+      "description": "风险分级。level 是分级判断，reversible 是硬约束来源：false 的动作不得出现在多步 Plan 的非末位，且无 compensation 时强制审批。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "reversible"],
+      "properties": {
+        "level": {
+          "description": "风险等级：low / medium / high。策略可据此分级处置（§4.7）。",
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        },
+        "reversible": {
+          "description": "是否可回滚。false 表示撤销需要人工或业务补偿，宿主与策略必须据此收紧（§5.2 不可逆约束）。",
+          "type": "boolean"
+        },
+        "moneyAffecting": {
+          "description": "是否影响金额。涉及金额的动作在策略层应默认转审批；摘要层可省略本字段。",
+          "type": "boolean"
+        }
+      }
+    },
+    "Idempotency": {
+      "description": "幂等声明。keyFields 的取值必须来自 inputSchema.required（否则幂等键可能缺失，导致重复副作用）；scope 决定去重边界，duplicateBehavior 规定重复提交的处理方式。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyFields", "scope", "duplicateBehavior"],
+      "properties": {
+        "keyFields": {
+          "description": "参与幂等键计算的入参字段名，非空。每一项都必须是 inputSchema.required 的成员（§4.2 硬约束；该子集关系由 C1 用例校验，见 semantics.md §3）。",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          }
+        },
+        "scope": {
+          "description": "去重边界：module 表示在单个模块内去重，system 表示跨模块按全系统去重。",
+          "type": "string",
+          "enum": ["module", "system"]
+        },
+        "duplicateBehavior": {
+          "description": "重复提交的处理方式。0.1 只有 return_first_result：返回首次调用的结果，不产生第二次副作用（未来扩展须保持该值语义不变）。",
+          "type": "string",
+          "enum": ["return_first_result"]
+        }
+      }
+    },
+    "Compensation": {
+      "description": "saga 补偿声明：失败时逆序补偿已成功步骤，失败步骤本身不补偿（§5.2）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "argMap"],
+      "properties": {
+        "action": {
+          "description": "用于撤销本动作的补偿动作 id（通常与本体同模块）。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+        },
+        "argMap": {
+          "description": "补偿动作入参的取值映射：键为补偿动作的入参字段名，值为取值路径字面量，$in.<field> 取自本体入参，$result.<field> 取自本体出参。本对象键随动作语义变化，故不封闭字段集合。",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^\\$(in|result)(\\.[A-Za-z_][A-Za-z0-9_]*)+$"
+          }
+        }
+      }
+    },
+    "DryRunCapability": {
+      "description": "预演能力声明。声明 supported 但端点不可用属于实现不一致，宿主按 unsupported 处理（fail-closed）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported"],
+      "properties": {
+        "supported": {
+          "description": "是否实现 POST /tenon/actions/{id}:dry-run。",
+          "type": "boolean"
+        }
+      }
+    },
+    "QuotaUnit": {
+      "description": "配额计量单位：calls 按调用次数计，quantity 按 args 中业务量计（字段由 quotaField 指定）。",
+      "type": "string",
+      "enum": ["calls", "quantity"]
+    }
+  }
+}

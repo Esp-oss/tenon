@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/frames.schema.json",
+  "title": "Intent / Context / Confirm（人机共驾三帧）",
+  "description": "前端与 agent 之间唯一的三种报文：Intent 告诉界面应进入什么状态，Context 回传用户看到的与改了什么，Confirm 回传用户的批准、拒绝或改写；帧内不含 DOM 选择器、不含坐标，无前端接入时 Intent 直接丢弃而业务结果不变。",
+  "type": "object",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/IntentFrame"
+    },
+    {
+      "$ref": "#/$defs/ContextFrame"
+    },
+    {
+      "$ref": "#/$defs/ConfirmFrame"
+    }
+  ],
+  "$defs": {
+    "IntentFrame": {
+      "description": "帧一（agent → 前端）：把计划的结果翻译成界面状态变化。它只表达「应进入什么状态」，不表达怎么定位元素。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "intentId", "planId", "actions"],
+      "properties": {
+        "type": {
+          "description": "帧类型判别值，固定 tenon.intent。",
+          "const": "tenon.intent"
+        },
+        "intentId": {
+          "description": "帧实例标识，形如 int_<ULID>；回执与排重都以它为准。",
+          "type": "string",
+          "pattern": "^int_[A-Za-z0-9_-]{4,}$"
+        },
+        "planId": {
+          "description": "产生本帧的计划标识，供前端把界面状态与可撤销计划关联起来。",
+          "type": "string",
+          "pattern": "^pln_[A-Za-z0-9_-]{4,}$"
+        },
+        "actions": {
+          "description": "要执行的界面动作序列，按顺序表达。空数组表示无需界面反应（例如纯对话场景）。",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IntentAction"
+          }
+        }
+      }
+    },
+    "IntentAction": {
+      "description": "一条界面动作：打开某实体或高亮某实体。没有选择器、没有坐标，由前端按自己的组件树解释（D6）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "target"],
+      "properties": {
+        "kind": {
+          "description": "界面状态变化种类：open 打开该实体的视图，highlight 在当前视图上标注它。",
+          "type": "string",
+          "enum": ["open", "highlight"]
+        },
+        "target": {
+          "description": "目标实体，对象形式或字符串简写均可（§4.0）。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/EntityRefLike"
+        },
+        "badge": {
+          "description": "高亮时显示的短文案（例「-12 已扣减」）。它是给人看的结论，不是指令。",
+          "type": "string",
+          "maxLength": 120
+        },
+        "undoable": {
+          "description": "该变化是否可一键撤销。true 时必须给出 undoPlanId，否则前端无从构造撤销。",
+          "type": "boolean"
+        },
+        "undoPlanId": {
+          "description": "撤销时执行的计划标识（通常是补偿计划）。",
+          "type": "string",
+          "pattern": "^pln_[A-Za-z0-9_-]{4,}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["undoable"],
+            "properties": {
+              "undoable": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": ["undoPlanId"]
+          }
+        }
+      ]
+    },
+    "ContextFrame": {
+      "description": "帧二（前端 → agent）：告诉 agent 用户此刻在看什么、改了什么。它是「事实回传」，不是「操作指令」。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "view", "edits", "at"],
+      "properties": {
+        "type": {
+          "description": "帧类型判别值，固定 tenon.context。",
+          "const": "tenon.context"
+        },
+        "view": {
+          "description": "用户当前视图对应的实体寻址（§4.0）。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/EntityRef"
+        },
+        "edits": {
+          "description": "用户对表单所做改动的列表；空数组表示只是浏览、未改动。",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ContextEdit"
+          }
+        },
+        "at": {
+          "description": "该视图状态被观测到的时刻，带时区偏移。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Iso8601Timestamp"
+        }
+      }
+    },
+    "ContextEdit": {
+      "description": "一处用户改动：字段名与改动前后值。agent 应据此重新评估计划，而不是假设用户想表达某个动作。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "from", "to"],
+      "properties": {
+        "field": {
+          "description": "被改动的字段名。",
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_.]*$"
+        },
+        "from": {
+          "description": "改动前的值。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonValue"
+        },
+        "to": {
+          "description": "改动后的值。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonValue"
+        }
+      }
+    },
+    "ConfirmFrame": {
+      "description": "帧三（前端 → agent）：用户对某个计划的最终决定。approve 放行执行，reject 终止，amend 以 JSON Patch 改写未执行步骤并产生新计划。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "confirmId", "planId", "decision", "patch", "by", "at"],
+      "properties": {
+        "type": {
+          "description": "帧类型判别值，固定 tenon.confirm。",
+          "const": "tenon.confirm"
+        },
+        "confirmId": {
+          "description": "帧实例标识，形如 cfm_<ULID>；审计用它证明「是谁在哪一刻批的」。",
+          "type": "string",
+          "pattern": "^cfm_[A-Za-z0-9_-]{4,}$"
+        },
+        "planId": {
+          "description": "被决定的计划标识。amend 时本字段指向旧计划，新计划的 supersedes 指回它。",
+          "type": "string",
+          "pattern": "^pln_[A-Za-z0-9_-]{4,}$"
+        },
+        "decision": {
+          "description": "用户决定：approve 批准、reject 拒绝、amend 改写。",
+          "$ref": "#/$defs/ConfirmDecision"
+        },
+        "patch": {
+          "description": "RFC 6902 JSON Patch，只作用于计划的未执行步骤。amend 时必须非空，approve/reject 时必须为 null。",
+          "oneOf": [
+            {
+              "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonPatch"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "by": {
+          "description": "决定者身份，形如 user:alice。必须可解析到具体主体，否则审计无法追责。",
+          "type": "string",
+          "pattern": "^(user|agent|system):[^\\s]+$"
+        },
+        "at": {
+          "description": "做出决定的时刻，带时区偏移。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Iso8601Timestamp"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["decision"],
+            "properties": {
+              "decision": {
+                "const": "amend"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "patch": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["decision"],
+            "properties": {
+              "decision": {
+                "enum": ["approve", "reject"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "patch": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ConfirmDecision": {
+      "description": "确认决定三态：approve / reject / amend（§4.5）。",
+      "type": "string",
+      "enum": ["approve", "reject", "amend"]
+    }
+  }
+}

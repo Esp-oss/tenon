@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/error.schema.json",
+  "title": "Error（协议错误体）",
+  "description": "模块或控制平面拒绝/失败时返回的统一错误信封：class 决定 agent 该怎么反应（重试、重新规划、转人工还是告警），code 是模块内的稳定错误码，retryable 必须与 class 一致。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tenonError"],
+  "properties": {
+    "tenonError": {
+      "description": "错误体本体。所有协议错误都放在这一层，便于与成功响应体区分，也避免与业务返回字段撞名。",
+      "$ref": "#/$defs/TenonError"
+    }
+  },
+  "$defs": {
+    "TenonError": {
+      "description": "错误体：class 是分类（决定 agent 的应对策略），code 是模块内稳定的机器码，message 是给人看的一句话，details 承载结构化补充，retryable 是机器可读的重试许可。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "code", "message", "retryable"],
+      "properties": {
+        "class": {
+          "description": "错误分类，四类封闭（§4.9）：retryable 瞬时故障可退避重试；business_rejection 业务前置条件不满足须重新规划；policy_denied 治理闸门拒绝须终止转人工；contract_violation 契约不符属 bug 须死信告警。",
+          "$ref": "#/$defs/ErrorClass"
+        },
+        "code": {
+          "description": "模块内稳定的机器可读错误码，大写蛇形（例 STOCK_INSUFFICIENT）。同一语义必须永远同一码；错误码不得被用来路由到具体动作（§2.2 反模式判据）。",
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "maxLength": 64
+        },
+        "message": {
+          "description": "给人看的一句话说明，应含关键数值（例「可用 3，需求 12」）以便人快速判断；不保证机器可解析。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "details": {
+          "description": "结构化补充信息（例 {\"available\": 3}），供 agent 与排障使用。不得放置任何凭证、密钥或个人敏感数据。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonObject"
+        },
+        "retryable": {
+          "description": "是否允许重试。必须与 class 一致：只有 retryable 可为 true，其余三类恒为 false（重试 business_rejection 会反复撞同一面墙，重试 policy_denied 等于绕过闸门）。",
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["class"],
+            "properties": {
+              "class": {
+                "const": "retryable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["class"],
+            "properties": {
+              "class": {
+                "enum": ["business_rejection", "policy_denied", "contract_violation"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ErrorClass": {
+      "description": "错误分类四态（§4.9）。判定顺序与应对策略见 errors.md，HTTP 状态码映射亦在该文。",
+      "type": "string",
+      "enum": ["retryable", "business_rejection", "policy_denied", "contract_violation"]
+    }
+  }
+}

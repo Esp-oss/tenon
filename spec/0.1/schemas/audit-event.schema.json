@@ -1,0 +1,392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/audit-event.schema.json",
+  "title": "Audit Event（审计记录）",
+  "description": "一次动作调用留下的不可变记录，分 dispatched 与 result 两段写入并用 prevHash 串成哈希链：先写成功 dispatched 才允许执行，写失败即拒绝执行；同一次调用产生两条记录，auditId 相同而 stage 不同。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "auditId",
+    "stage",
+    "at",
+    "actor",
+    "trigger",
+    "planId",
+    "stepId",
+    "action",
+    "inputHash",
+    "idempotencyKey",
+    "decision",
+    "result",
+    "effects",
+    "tokenUsage",
+    "prevHash"
+  ],
+  "properties": {
+    "auditId": {
+      "description": "审计记录标识，形如 aud_<ULID>。同一次调用的两段记录共用同一个 auditId，靠 stage 区分。",
+      "type": "string",
+      "pattern": "^aud_[A-Za-z0-9_-]{4,}$"
+    },
+    "stage": {
+      "description": "记录阶段：dispatched 表示「即将发出调用」（必须先落盘），result 表示「已得到结果」。",
+      "$ref": "#/$defs/AuditStage"
+    },
+    "at": {
+      "description": "该段记录写入的时刻，带时区偏移。两段的时间差即可看出单步耗时。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Iso8601Timestamp"
+    },
+    "actor": {
+      "description": "行为主体。agent 代行时 onBehalfOf 必填，审计据此既能追责又不放大权限（§4.6 D5）。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Actor"
+    },
+    "trigger": {
+      "description": "触发源：事件实例与业务链关联标识。模块侧独立审计可能没有触发事件，故两个键都允许为 null。",
+      "$ref": "#/$defs/AuditTrigger"
+    },
+    "planId": {
+      "description": "所属计划标识；脱离计划的人机直接调用为 null。",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^pln_[A-Za-z0-9_-]{4,}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "stepId": {
+      "description": "计划中的步骤标识；脱离计划的调用为 null。",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "action": {
+      "description": "被调用的动作 id。审计按动作维度可聚合，不按事件或错误码维度聚合（§2.2 反模式判据）。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+    },
+    "inputHash": {
+      "description": "入参的 SHA-256 摘要。大对象只存摘要，原文入对象存储，既省空间又能验证「执行的是不是当时计划的参数」。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Sha256Hash"
+    },
+    "idempotencyKey": {
+      "description": "本次调用使用的幂等键。write 调用必须给出，崩溃恢复时靠它向模块回查真实结果；read 调用为 null。",
+      "oneOf": [
+        {
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/IdempotencyKey"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "decision": {
+      "description": "闸门结论留痕：outcome 是自动放行、人工批准还是被拒，policyId 与 grantId 指出是哪条策略、哪份授权让它过的，approvedBy 指出是谁按的批准。",
+      "$ref": "#/$defs/AuditDecision"
+    },
+    "result": {
+      "description": "执行结果段。dispatched 阶段必然未定（status=unknown），result 阶段才给出真实结论。",
+      "$ref": "#/$defs/AuditResult"
+    },
+    "effects": {
+      "description": "业务影响：改动了哪些实体、涉及几张单据、多少业务量。它是日切对账与用量看板的唯一数据来源，因此必须与模块终态可比。",
+      "$ref": "#/$defs/AuditEffects"
+    },
+    "tokenUsage": {
+      "description": "本次决策消耗的模型 token 数。协议不规定模型与定价，只留可聚合的计量字段，供 v2 成本看板使用。",
+      "$ref": "#/$defs/TokenUsage"
+    },
+    "prevHash": {
+      "description": "链中上一条审计记录的哈希。链首为 null（协议约定的创世值）；校验时按写入顺序重算，任何一处被改即断链。",
+      "oneOf": [
+        {
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Sha256Hash"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["stage"],
+        "properties": {
+          "stage": {
+            "const": "dispatched"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "status": {
+                "const": "unknown"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["result"],
+        "properties": {
+          "result": {
+            "required": ["status"],
+            "properties": {
+              "status": {
+                "const": "ok"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "outputHash": {
+                "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Sha256Hash"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["result"],
+        "properties": {
+          "result": {
+            "required": ["status"],
+            "properties": {
+              "status": {
+                "const": "error"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "errorClass": {
+                "$ref": "#/$defs/ErrorClass"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["result"],
+        "properties": {
+          "result": {
+            "required": ["status"],
+            "properties": {
+              "status": {
+                "const": "unknown"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "properties": {
+              "outputHash": {
+                "type": "null"
+              },
+              "errorClass": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "AuditStage": {
+      "description": "审计阶段两态：dispatched / result。",
+      "type": "string",
+      "enum": ["dispatched", "result"]
+    },
+    "AuditTrigger": {
+      "description": "审计的触发源。模块侧独立审计可能没有触发事件，因此两个键都可为 null，但键本身必须出现（缺失与 null 在哈希链中是不同字节）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eventId", "correlationId"],
+      "properties": {
+        "eventId": {
+          "description": "触发本次调用的事件实例标识，无则为 null。",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^evt_[A-Za-z0-9_-]{4,}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "correlationId": {
+          "description": "业务链关联标识，无则为 null。",
+          "oneOf": [
+            {
+              "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/CorrelationId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AuditDecision": {
+      "description": "闸门结论：outcome 与 policyId 分离（不撞名），没有策略参与时 policyId 为 null；approve 决定必须有 approvedBy。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "policyId", "grantId", "approvedBy"],
+      "properties": {
+        "outcome": {
+          "description": "处置结论：auto 自动放行 / approve 人工批准 / deny 被拒。",
+          "type": "string",
+          "enum": ["auto", "approve", "deny"]
+        },
+        "policyId": {
+          "description": "作出该决定的策略 id；无策略参与（如默认放行的读操作）时为 null。",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "grantId": {
+          "description": "本次调用依据的授权标识；无授权模型的应用为 null。",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^gr-[A-Za-z0-9_-]{4,}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "approvedBy": {
+          "description": "按下批准的主体（例 user:alice）；outcome=approve 时必须非空，其余情况为 null。",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(user|agent|system):[^\\s]+$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AuditResult": {
+      "description": "结果段：status 是四态结论，outputHash 只在成功时给出，errorClass 只在失败时给出。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "outputHash", "errorClass"],
+      "properties": {
+        "status": {
+          "description": "执行结果四态：ok 成功 / error 失败 / partially_failed 部分成功（多步计划或补偿未完成）/ unknown 结果未定，须按幂等键回查。",
+          "type": "string",
+          "enum": ["ok", "error", "partially_failed", "unknown"]
+        },
+        "outputHash": {
+          "description": "出参的 SHA-256 摘要；ok 时必填，其余为 null。原文入对象存储。",
+          "oneOf": [
+            {
+              "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Sha256Hash"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "errorClass": {
+          "description": "错误分类（§4.9 四类）；error 时必填，其余为 null。具体错误码不入审计，按需要另行查询。",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ErrorClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "AuditEffects": {
+      "description": "业务影响：entities 为受影响的实体寻址（对象或字符串简写，§4.0），documentCount 为涉及的单据数，quantity 为业务量。三者是日切对账与看板聚合的依据。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entities"],
+      "properties": {
+        "entities": {
+          "description": "受影响的实体列表。必须与 Plan.expectedDiff 使用同一寻址，否则两侧无法比对。空数组表示没有实体级影响（例如只产生外部副作用）。",
+          "type": "array",
+          "items": {
+            "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/EntityRefLike"
+          }
+        },
+        "documentCount": {
+          "description": "涉及的业务单据数量，非负整数。",
+          "type": "integer",
+          "minimum": 0
+        },
+        "quantity": {
+          "description": "业务量（与动作 quotaUnit=quantity 的口径一致），非负数。",
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "TokenUsage": {
+      "description": "模型 token 计量：in 为输入、out 为输出。与业务量无关，只用于成本聚合。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["in", "out"],
+      "properties": {
+        "in": {
+          "description": "输入 token 数。",
+          "type": "integer",
+          "minimum": 0
+        },
+        "out": {
+          "description": "输出 token 数。",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "ErrorClass": {
+      "description": "错误分类四态（§4.9）：retryable / business_rejection / policy_denied / contract_violation。分类判定与应对策略见 errors.md。",
+      "type": "string",
+      "enum": ["retryable", "business_rejection", "policy_denied", "contract_violation"]
+    }
+  }
+}

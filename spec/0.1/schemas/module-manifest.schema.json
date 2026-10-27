@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/module-manifest.schema.json",
+  "title": "Module Manifest（模块能力摘要）",
+  "description": "模块通过 GET /.well-known/tenon 自述的能力摘要，是 agent 发现能力、决定下一步动作的唯一入口；摘要级不含 inputSchema，完整 Action 按需拉取以控上下文成本。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tenon", "module", "actions", "events", "transports", "capabilities"],
+  "properties": {
+    "tenon": {
+      "description": "模块实现的 Tenon 协议版本，形如 0.1；与请求头 Tenon-Version 的协商见 versioning.md。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/TenonVersion"
+    },
+    "module": {
+      "description": "模块自身标识与版本。",
+      "$ref": "#/$defs/ModuleInfo"
+    },
+    "actions": {
+      "description": "可调用动作的摘要数组。每项只带 id/version/title/kind/risk/dryRun 六个字段，刻意不含 inputSchema 与 outputSchema：agent 先看摘要，命中候选后再 GET /tenon/actions/{id} 拉取完整定义（D15）。",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ActionSummary"
+      }
+    },
+    "events": {
+      "description": "模块会产出的领域事件摘要。订阅哪些事件由 skill 声明，取决于业务；协议不规定事件与动作的映射关系（§2.2 反模式判据）。",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/EventSummary"
+      }
+    },
+    "transports": {
+      "description": "模块支持的传输方式。0.1 定义的取值：http（同步请求-响应）、mcp（以 MCP server 双向暴露）、webhook（接收事件投递，HMAC 签名）。取值域开放：消费者遇到未知取值必须忽略该项而不是拒绝整个 manifest。",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CapabilityToken"
+      }
+    },
+    "capabilities": {
+      "description": "模块声明的可选能力标签。0.1 定义的取值：dry-run（实现 :dry-run 端点）、event-replay（支持 GET /tenon/events?since=cursor 补课）。取值域开放，未识别即忽略。",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CapabilityToken"
+      }
+    },
+    "unavailableActions": {
+      "description": "当前不可调用的 action id 列表（熔断打开或健康检查失败时由模块或宿主填入，§5.2、§8 降级矩阵）。消费者必须把列出的 action 视为不可调度，且不得据此改变已经合法的 Plan 结构。省略等价于全部可用。",
+      "type": "array",
+      "items": {
+        "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+      }
+    }
+  },
+  "$defs": {
+    "ModuleInfo": {
+      "description": "模块自述：id 全局唯一且发布后不改，version 为该模块实现版本的语义化版本，title 供人和模型阅读。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "title"],
+      "properties": {
+        "id": {
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ModuleId"
+        },
+        "version": {
+          "description": "模块实现版本，语义化版本；契约兼容性判定见 versioning.md。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/SemVer"
+        },
+        "title": {
+          "description": "面向人和 agent 的模块名称（例「库存」），一句话说清这个模块管什么。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        }
+      }
+    },
+    "ActionSummary": {
+      "description": "action 摘要项：只含 id/version/title/kind/risk/dryRun 六个字段。缺 inputSchema 是刻意的（D15 上下文成本），需要时按 id 拉取完整 Action。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "title", "kind", "risk", "dryRun"],
+      "properties": {
+        "id": {
+          "description": "动作标识，与完整 Action 的 id 一致。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+        },
+        "version": {
+          "description": "动作契约版本（语义化版本）。同一 id 的不同版本可并存于发现结果中，调用时按 manifest 声明的版本解释。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/SemVer"
+        },
+        "title": {
+          "description": "面向人和 agent 的动作名称（例「扣减库存」），一句话说明它做什么。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "kind": {
+          "description": "读写分类。read 无副作用；write 必须声明 idempotency（完整 Action 里校验，§4.2）。",
+          "type": "string",
+          "enum": ["read", "write"]
+        },
+        "risk": {
+          "description": "风险摘要。摘要层只需 level 与 reversible 就够做规划判断；moneyAffecting 可省略，需要时从完整 Action 读取。",
+          "$ref": "#/$defs/Risk"
+        },
+        "dryRun": {
+          "description": "是否实现预演端点。supported=false 或端点缺失时，Plan 的 dryRun.status 降级为 unsupported 并触发强制审批（§8 降级矩阵）。",
+          "$ref": "#/$defs/DryRunCapability"
+        }
+      }
+    },
+    "EventSummary": {
+      "description": "领域事件摘要：type 为点分层小写事件名（例 quote.completed），version 为该事件契约版本。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "version"],
+      "properties": {
+        "type": {
+          "description": "事件类型名。",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
+        },
+        "version": {
+          "description": "事件契约版本（语义化版本）。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/SemVer"
+        }
+      }
+    },
+    "Risk": {
+      "description": "风险摘要：level 为分级，reversible 决定该动作能否出现在多步 Plan 的非末位（§4.2、§5.2）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "reversible"],
+      "properties": {
+        "level": {
+          "description": "风险等级：low 低（可自动执行）、medium 中（建议人工可见）、high 高（默认转审批）。",
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        },
+        "reversible": {
+          "description": "是否可回滚。false 且无 compensation 时强制审批；false 又不在 Plan 末位时宿主拒绝该 Plan（contract_violation）。",
+          "type": "boolean"
+        },
+        "moneyAffecting": {
+          "description": "是否影响金额。涉及金额的动作默认更高审批等级；摘要层可省略。",
+          "type": "boolean"
+        }
+      }
+    },
+    "DryRunCapability": {
+      "description": "dry-run 能力声明。声明 supported=true 但端点不可用，属实现不一致，宿主按 unsupported 处理（fail-closed）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported"],
+      "properties": {
+        "supported": {
+          "description": "是否实现 POST /tenon/actions/{id}:dry-run。",
+          "type": "boolean"
+        }
+      }
+    },
+    "CapabilityToken": {
+      "description": "传输方式与能力标签的通用词法：小写字母起始的小写字母/数字/连字符串。取值域开放，未知取值必须被忽略。",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "maxLength": 64
+    }
+  }
+}

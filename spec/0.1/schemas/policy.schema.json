@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/policy.schema.json",
+  "title": "Policy（风险分级策略）",
+  "description": "控制平面的分级规则：按模块与动作匹配、按条件表达式判断、给出 auto/approve/deny 处置与审批人；多策略命中时按 deny > approve > auto 合并，无命中即 deny（fail-closed），策略本身不可被 agent 读取或改写。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["policyId", "priority", "match", "when", "outcome"],
+  "properties": {
+    "policyId": {
+      "description": "策略标识，由控制平面分配；评估结果的 decidedBy 与审计的 decision.policyId 都引用它，因此策略 id 不得复用（改规则即新 id 或升版本）。",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "priority": {
+      "description": "优先级，整数。合并规则：先按 outcome 排序（deny > approve > auto），同一 outcome 内取 priority 最大者，并把它记入 decidedBy。",
+      "type": "integer"
+    },
+    "match": {
+      "description": "适用范围的静态匹配：哪些模块、哪些动作。",
+      "$ref": "#/$defs/PolicyMatch"
+    },
+    "when": {
+      "description": "条件表达式，必填。无需条件时写 {\"all\": []}（恒真），以便「某模块一律转审批」这类兜底策略仍可表达。",
+      "$ref": "#/$defs/PolicyCondition"
+    },
+    "outcome": {
+      "description": "命中后的处置：auto 直接执行、approve 转人工审批、deny 拒绝。",
+      "$ref": "#/$defs/PolicyOutcome"
+    },
+    "approvers": {
+      "description": "审批人标识（例 role:warehouse_manager）。outcome=approve 时必须给出至少一项，否则无人可批；其余 outcome 下可省略。",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(user|role|group|agent):[^\\s]+$"
+      }
+    }
+  },
+  "$defs": {
+    "PolicyMatch": {
+      "description": "静态匹配范围：module 必填，actions 省略表示该模块下全部动作。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module"],
+      "properties": {
+        "module": {
+          "description": "模块标识。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ModuleId"
+        },
+        "actions": {
+          "description": "动作 id 列表；省略表示匹配该模块的全部动作。不得使用通配符字符串，只能逐条列举。",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+          }
+        }
+      }
+    },
+    "PolicyCondition": {
+      "description": "条件表达式：组合子（all/any/not，可嵌套）或算子叶（字段路径 → 算子对象）。递归定义，深度由实现设上限并拒绝过深输入。",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Combinator"
+        },
+        {
+          "$ref": "#/$defs/ConditionLeaf"
+        }
+      ]
+    },
+    "Combinator": {
+      "description": "组合子，恰好一个键：all 全部成立（空数组合法且恒真，用于无条件命中）、any 任一成立（至少一项）、not 取反。",
+      "type": "object",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["all"],
+          "properties": {
+            "all": {
+              "description": "全部子条件成立。空数组表示恒真，是「always」的唯一写法。",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PolicyCondition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["any"],
+          "properties": {
+            "any": {
+              "description": "任一子条件成立，至少一项（空数组恒假，没有表达价值，故禁止）。",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/PolicyCondition"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["not"],
+          "properties": {
+            "not": {
+              "description": "子条件取反。",
+              "$ref": "#/$defs/PolicyCondition"
+            }
+          }
+        }
+      ]
+    },
+    "ConditionLeaf": {
+      "description": "算子叶：恰好一个字段路径映射到一个算子对象（例 {\"arg.qty\": {\">\": 10}}）。多个条件必须用 all 组合，不得塞进同一个对象，以保证求值顺序无歧义。",
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/OperatorExpression"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+$"
+      }
+    },
+    "OperatorExpression": {
+      "description": "算子对象：恰好一个算子。eq/ne 可比较任意 JSON 值；四个大小算子比较数值或 ISO-8601 时间字符串（两侧类型必须一致）；in/notIn 取非空数组，按相等语义判定；matches 取 ECMA-262 正则字符串。",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "eq": {
+          "description": "等于。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonValue"
+        },
+        "ne": {
+          "description": "不等于。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonValue"
+        },
+        ">": {
+          "description": "大于。",
+          "type": ["number", "string"]
+        },
+        ">=": {
+          "description": "大于等于。",
+          "type": ["number", "string"]
+        },
+        "<": {
+          "description": "小于。",
+          "type": ["number", "string"]
+        },
+        "<=": {
+          "description": "小于等于。",
+          "type": ["number", "string"]
+        },
+        "in": {
+          "description": "属于给定集合。",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonValue"
+          }
+        },
+        "notIn": {
+          "description": "不属于给定集合。",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonValue"
+          }
+        },
+        "matches": {
+          "description": "匹配 ECMA-262 正则（不隐含锚定，需要整串匹配时自行写 ^…$）。",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
+    "PolicyOutcome": {
+      "description": "策略处置三态：auto / approve / deny。合并顺序 deny > approve > auto。",
+      "type": "string",
+      "enum": ["auto", "approve", "deny"]
+    },
+    "PolicyEvaluationRequest": {
+      "description": "策略评估请求体（POST /tenon/policies:evaluate）：整份 Plan 一起评估，因此策略能看见多步之间的组合风险。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan"],
+      "properties": {
+        "plan": {
+          "description": "待评估的完整计划，结构见 plan.schema.json（此处直接引用，不重复定义，避免真源分叉）。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/plan.schema.json"
+        }
+      }
+    },
+    "PolicyEvaluationResponse": {
+      "description": "策略评估结果：outcome 为合并后的最终处置，decidedBy 记录命中的 policyId，approvers 在 approve 时给出待办人，reasons 为机器可读的理由码（例 NO_POLICY_MATCH_DEFAULT_DENY）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "decidedBy"],
+      "properties": {
+        "outcome": {
+          "description": "最终处置。无任何策略命中时必须是 deny（fail-closed），不是 auto。",
+          "$ref": "#/$defs/PolicyOutcome"
+        },
+        "decidedBy": {
+          "description": "参与最终决定的策略 id 列表（同一 outcome 内按 priority 降序）。空数组表示没有策略命中。",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          }
+        },
+        "approvers": {
+          "description": "outcome=approve 时待人批准的角色或用户列表。",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^(user|role|group|agent):[^\\s]+$"
+          }
+        },
+        "reasons": {
+          "description": "机器可读的理由码列表（大写蛇形，例 NO_POLICY_MATCH_DEFAULT_DENY、IRREVERSIBLE_STEP、DRY_RUN_UNVERIFIED），供审计与排障使用。",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]*$"
+          }
+        }
+      }
+    }
+  }
+}

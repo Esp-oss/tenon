@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/domain-event.schema.json",
+  "title": "Domain Event（领域事件信封）",
+  "description": "模块向系统宣告「业务事实已发生」的信封：至少一次投递、可重放、消费侧按 eventId 去重；它是 agent 开启回合的触发源，不携带任何「该调哪个动作」的暗示。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["eventId", "type", "version", "subject", "occurredAt", "causationId", "correlationId", "payload"],
+  "properties": {
+    "eventId": {
+      "description": "事件实例的全局唯一标识，形如 evt_<ULID>。消费侧去重、补课对齐、审计 causationId 都靠它。",
+      "type": "string",
+      "pattern": "^evt_[A-Za-z0-9_-]{4,}$"
+    },
+    "type": {
+      "description": "事件类型名，点分层小写（例 quote.completed、stock.insufficient）。skill 可声明订阅某类事件以决定「是否开启一个回合」，但事件类型不得映射到具体动作（§2.2）。",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)+$"
+    },
+    "version": {
+      "description": "事件契约版本（语义化版本）。新增可选字段用 minor，删除或改变既有字段语义用 major。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/SemVer"
+    },
+    "subject": {
+      "description": "事件主角的实体寻址，对象形式或字符串简写均可（§4.0）。同一事件的所有下游文档与审计必须使用同一寻址，否则对账无法比对。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/EntityRefLike"
+    },
+    "occurredAt": {
+      "description": "事实发生时间（不是投递时间），带时区偏移。延迟投递与重放时该值保持不变。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Iso8601Timestamp"
+    },
+    "causationId": {
+      "description": "上一跳的 eventId 或 auditId；无上一跳时为 null。协议不定义 Command 契约，因此本字段不会出现 cmd_ 前缀的取值（§4.0）。",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^(evt|aud)_[A-Za-z0-9_-]{4,}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "correlationId": {
+      "description": "贯穿整条业务链的关联标识 cor:<业务键>（例 cor:quote/Q-2026-0417）。同一笔业务的多个事件、Plan 与审计共用它。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/CorrelationId"
+    },
+    "payload": {
+      "description": "事件载荷，结构由事件契约（type+version）定义。载荷是数据而非指令：消费者不得从中推导出固定动作序列（§2.2 反模式判据）。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonObject"
+    }
+  }
+}

@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/common.schema.json",
+  "title": "Tenon 通用类型（实体寻址、标识、时间、哈希、状态枚举）",
+  "description": "Tenon 协议 0.1 的跨契约类型库：实体寻址、身份、时间戳、哈希、关联标识与 §5.1 的三个状态枚举，供其余 9 份契约 schema 通过绝对 $ref 复用。",
+  "type": "object",
+  "$comment": "本文件只承载 $defs 类型库，不对任何报文做校验（根上的 type 仅为满足 schema 元数据要求）。其余契约 schema 以 https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/<Name> 的形式引用其中的定义。",
+  "$defs": {
+    "ModuleId": {
+      "description": "模块标识：小写字母起始，仅含小写字母、数字、连字符与下划线；全局唯一且稳定，一旦发布不得改名。",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "maxLength": 64
+    },
+    "ActionId": {
+      "description": "动作标识，形如 <module>.<Action>（例 inventory.DeductStock）。模块段与 ModuleId 同规则，动作段以字母起始；映射到 MCP 时 tool 名为 tenon_<module>_<action>（下划线，§4.10）。",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*\\.[A-Za-z][A-Za-z0-9_]*$"
+    },
+    "EntityRef": {
+      "description": "实体寻址的对象形式：module + type + id 三元组（§4.0）。跨契约与对账两侧必须使用同一寻址，否则无法比对。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "type", "id"],
+      "properties": {
+        "module": {
+          "$ref": "#/$defs/ModuleId"
+        },
+        "type": {
+          "description": "实体类型（PascalCase，例 SKU、Quote）。",
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        },
+        "id": {
+          "description": "实体在所属模块内的业务主键（例 STD-1001）；不得含空白、冒号或斜杠，以免与字符串简写形式产生歧义。",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^\\s:/]+$"
+        }
+      }
+    },
+    "EntityRefString": {
+      "description": "实体寻址的字符串简写形式 module:Type/id（例 inventory:SKU/STD-1001），与 EntityRef 语义严格等价（§4.0）。",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*:[A-Za-z][A-Za-z0-9_]*/[^\\s:/]+$"
+    },
+    "EntityRefLike": {
+      "description": "实体寻址：对象形式 EntityRef 或字符串简写 EntityRefString，二者等价（§4.0）。§4.0 逐点列举的四个位置（Event.subject、Plan.expectedDiff[].entity、Intent.target、Audit.effects.entities）都用本类型。",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/EntityRef"
+        },
+        {
+          "$ref": "#/$defs/EntityRefString"
+        }
+      ]
+    },
+    "CorrelationId": {
+      "description": "关联标识 cor:<业务键>（例 cor:quote/Q-2026-0417）。同一业务链条上的事件、Plan、审计共用同一个值，是跨契约串联的唯一手段（§4.0）。",
+      "type": "string",
+      "pattern": "^cor:[^\\s]+$"
+    },
+    "IdempotencyKey": {
+      "description": "幂等键。宿主生成时约定形如 tenon:<planId>/<stepId>；调用方也可自定义，但同一笔业务重试必须复用同一个值，且不得含空白。",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\s]+$"
+    },
+    "Iso8601Timestamp": {
+      "description": "带时区偏移的 RFC 3339 / ISO-8601 时间戳，必须含秒与偏移（Z 或 ±HH:MM）。协议内一律以 UTC 记录，毫秒精度可选。",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "Iso8601Duration": {
+      "description": "ISO-8601 时长（用于 Grant 配额窗口，例 P1D、PT24H、P1W）。不支持「起止时间区间」写法；窗口以滚动窗口语义解释，见 semantics.md。",
+      "type": "string",
+      "pattern": "^P(?=[0-9T])(\\d+Y)?(\\d+M)?(\\d+W)?(\\d+D)?(T(?=[0-9])(\\d+H)?(\\d+M)?(\\d+(\\.\\d+)?S)?)?$"
+    },
+    "Sha256Hash": {
+      "description": "SHA-256 摘要的约定写法：sha256: 前缀加 64 位小写十六进制。大对象只存摘要，原文入对象存储（§4.8）。",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "TenonVersion": {
+      "description": "Tenon 协议版本，形如 0.1（major.minor）。出现在 manifest.tenon 与 Tenon-Version / Tenon-Min-Version 请求头（§4.1、§4.10）。",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+    },
+    "SemVer": {
+      "description": "契约对象（action、event、module、skill）自身的语义化版本，形如 1.4.0，可带预发布与构建后缀。演进规则见 versioning.md。",
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "Actor": {
+      "description": "行为主体：agent 代行、真人用户或系统进程。onBehalfOf 显式承载身份代理关系——权限取「agent 被授予 ∩ onBehalfOf 用户权限」（§4.6 D5），agent 不放大委托人的权限。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "onBehalfOf"],
+      "properties": {
+        "type": {
+          "description": "主体类型。agent 为自动化运行时，user 为真人，system 为无人类在场的系统进程（如对账 job）。",
+          "type": "string",
+          "enum": ["agent", "user", "system"]
+        },
+        "id": {
+          "description": "主体标识：agent 约定 ag_<name>，用户约定 user:<账号>，系统进程用稳定的作业名。",
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_.:@-]*$"
+        },
+        "onBehalfOf": {
+          "description": "代行时的委托人身份（例 user:alice）；直连调用或 system 主体为 null。字段必须出现：缺失与 null 在哈希链里是不同的字节，且授权评估需要区分「没有委托人」与「未声明」。",
+          "type": ["string", "null"],
+          "pattern": "^(user|agent):[^\\s]+$"
+        }
+      }
+    },
+    "JsonValue": {
+      "description": "任意 JSON 值。用于无法预先约束的内容：差异的 before/after、JSON Patch 的 value、错误 details 的值等。",
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JsonValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          }
+        }
+      ]
+    },
+    "JsonObject": {
+      "description": "任意 JSON 对象。键与值由具体契约决定（event.payload、action 入参 args、error.details、compensation.argMap 之外的自由结构）。",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/JsonValue"
+      }
+    },
+    "JsonPatchOperation": {
+      "description": "RFC 6902 JSON Patch 的单条操作。move/copy 必须带 from，add/replace/test 必须带 value；remove 两者都不带。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "path"],
+      "properties": {
+        "op": {
+          "description": "操作类型（RFC 6902 §4）。",
+          "type": "string",
+          "enum": ["add", "remove", "replace", "move", "copy", "test"]
+        },
+        "path": {
+          "description": "目标位置的 RFC 6901 JSON Pointer；空串表示整份文档。",
+          "type": "string",
+          "pattern": "^(/([^/~]|~[01])*)*$"
+        },
+        "from": {
+          "description": "move/copy 的源位置，RFC 6901 JSON Pointer。",
+          "type": "string",
+          "pattern": "^(/([^/~]|~[01])*)*$"
+        },
+        "value": {
+          "description": "add/replace/test 的目标值。",
+          "$ref": "#/$defs/JsonValue"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["op"],
+            "properties": {
+              "op": {
+                "enum": ["move", "copy"]
+              }
+            }
+          },
+          "then": {
+            "required": ["from"]
+          }
+        },
+        {
+          "if": {
+            "required": ["op"],
+            "properties": {
+              "op": {
+                "enum": ["add", "replace", "test"]
+              }
+            }
+          },
+          "then": {
+            "required": ["value"]
+          }
+        }
+      ]
+    },
+    "JsonPatch": {
+      "description": "RFC 6902 JSON Patch 文档：有序操作数组，按序施加；施加失败即整体不生效。",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/JsonPatchOperation"
+      }
+    },
+    "PlanState": {
+      "description": "Plan 状态枚举（§5.1）。amended 不是状态：amend 产生新 Plan 并以 supersedes 指回旧 planId。迁移表见 state-machines.md。",
+      "type": "string",
+      "enum": [
+        "draft",
+        "evaluating",
+        "auto_approved",
+        "approved",
+        "rejected",
+        "executing",
+        "completed",
+        "partially_failed",
+        "failed",
+        "aborted"
+      ]
+    },
+    "ApprovalState": {
+      "description": "Approval 状态枚举（§5.1）。expiresAt 到期自动进入 expired，语义等价 reject；amended 表示人工改写，旧 Plan 不再执行。",
+      "type": "string",
+      "enum": ["pending", "approved", "rejected", "amended", "expired"]
+    },
+    "ExecutionStepState": {
+      "description": "执行步状态枚举（§5.1）。进入 dispatched 的前置条件是该步的 dispatched 审计已写成功；unknown 只能通过 idempotencyKey 向模块回查收敛为 succeeded 或 failed。",
+      "type": "string",
+      "enum": ["pending", "dispatched", "succeeded", "failed", "compensated", "unknown"]
+    }
+  }
+}

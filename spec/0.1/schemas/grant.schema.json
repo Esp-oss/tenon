@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/grant.schema.json",
+  "title": "Grant（授权与配额）",
+  "description": "控制平面发给某个 agent 的能力白名单与配额：允许调用哪些模块的哪些动作、单次与窗口内的业务量上限、何时过期；生效权限取 agent 被授予与 onBehalfOf 用户权限的交集，agent 不放大委托人的权限。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["grantId", "agent", "allow", "expiresAt"],
+  "properties": {
+    "grantId": {
+      "description": "授权标识，形如 gr-<ULID>；调用时由宿主放进 X-Tenon-Grant 头，模块侧据此再校验一次（纵深防御，§4.6）。",
+      "type": "string",
+      "pattern": "^gr-[A-Za-z0-9_-]{4,}$"
+    },
+    "agent": {
+      "description": "被授权的 agent 身份（例 ag_fulfillment）。同一个 agent 可有多个 grant 并存，评估时按最小满足者匹配。",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_.:-]*$"
+    },
+    "allow": {
+      "description": "允许的模块与动作条目。至少一条；未列出的模块或动作一律视为不允许（fail-closed）。",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/GrantEntry"
+      }
+    },
+    "expiresAt": {
+      "description": "授权到期时刻，带时区偏移。到期后评估必须返回 EXPIRED，不得继续放行。",
+      "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Iso8601Timestamp"
+    }
+  },
+  "$defs": {
+    "GrantEntry": {
+      "description": "一条授权：某模块下允许的动作清单，以及可选的配额约束。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "actions"],
+      "properties": {
+        "module": {
+          "description": "模块标识。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ModuleId"
+        },
+        "actions": {
+          "description": "该模块下被允许的动作 id，至少一个；不得使用通配符，逐条列举是「可机械审计」的前提。",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+          }
+        },
+        "constraints": {
+          "description": "配额约束；省略表示不限额（仍受 expiresAt 与动作自身风险约束）。",
+          "$ref": "#/$defs/GrantConstraints"
+        }
+      }
+    },
+    "GrantConstraints": {
+      "description": "配额约束：单次调用上限、计量窗口长度、窗口内累计上限。窗口以滚动窗口解释，计量单位取动作声明的 quotaUnit。",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxQtyPerCall": {
+          "description": "单次调用的业务量上限（measure 单位同动作的 quotaUnit）。超限直接返回 QUOTA_EXCEEDED，不做部分放行。",
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "window": {
+          "description": "配额窗口长度，ISO-8601 duration（例 P1D、PT24H）。滚动窗口，不是自然日切分。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Iso8601Duration"
+        },
+        "maxUnitsPerWindow": {
+          "description": "窗口内累计业务量上限，与 window 成对使用。",
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "GrantEvaluationRequest": {
+      "description": "授权评估请求体（POST /tenon/grants:evaluate）：一次调用前的资格询问。onBehalfOf 必填，因为生效权限是「agent 被授予 ∩ 用户权限」。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent", "onBehalfOf", "action", "args"],
+      "properties": {
+        "agent": {
+          "description": "发起调用的 agent 身份。",
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_.:-]*$"
+        },
+        "onBehalfOf": {
+          "description": "被代行的用户身份（例 user:alice）。",
+          "type": "string",
+          "pattern": "^(user|agent):[^\\s]+$"
+        },
+        "action": {
+          "description": "拟调用的动作 id。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+        },
+        "args": {
+          "description": "拟传入的入参，用于按 quotaUnit/quotaField 计算本次业务量。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonObject"
+        }
+      }
+    },
+    "GrantEvaluation": {
+      "description": "授权评估结果（POST /tenon/grants:evaluate 响应体）：allowed=true 时给出命中的 grant 与剩余额度，allowed=false 时给出拒绝原因。",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/GrantAllowedEvaluation"
+        },
+        {
+          "$ref": "#/$defs/GrantDeniedEvaluation"
+        }
+      ]
+    },
+    "GrantAllowedEvaluation": {
+      "description": "放行：命中的 grantId 与本次调用后的剩余额度。remaining 用于 agent 自我约束，不是承诺——并发下以服务端为准。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "matchedGrantId", "quota"],
+      "properties": {
+        "allowed": {
+          "description": "固定 true。",
+          "const": true
+        },
+        "matchedGrantId": {
+          "description": "命中的授权标识，应原样放进 X-Tenon-Grant 头。",
+          "type": "string",
+          "pattern": "^gr-[A-Za-z0-9_-]{4,}$"
+        },
+        "quota": {
+          "description": "配额余量。",
+          "$ref": "#/$defs/Quota"
+        }
+      }
+    },
+    "GrantDeniedEvaluation": {
+      "description": "拒绝：给出四类原因之一。拒绝是终态，agent 不得换一条路径绕过（policy_denied 语义，§4.9）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "reason"],
+      "properties": {
+        "allowed": {
+          "description": "固定 false。",
+          "const": false
+        },
+        "reason": {
+          "description": "拒绝原因。",
+          "$ref": "#/$defs/GrantDenyReason"
+        }
+      }
+    },
+    "Quota": {
+      "description": "配额余量：remaining 为剩余可计数量，unit 为计量单位（与动作 quotaUnit 一致）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["remaining", "unit"],
+      "properties": {
+        "remaining": {
+          "description": "窗口内剩余可计量额度。",
+          "type": "number",
+          "minimum": 0
+        },
+        "unit": {
+          "description": "计量单位。",
+          "$ref": "#/$defs/QuotaUnit"
+        }
+      }
+    },
+    "QuotaUnit": {
+      "description": "配额计量单位：calls 按调用次数，quantity 按业务量。",
+      "type": "string",
+      "enum": ["calls", "quantity"]
+    },
+    "GrantDenyReason": {
+      "description": "授权拒绝原因四态：NOT_IN_GRANT 动作不在白名单、EXPIRED 授权过期、QUOTA_EXCEEDED 超出配额、SUBJECT_NOT_PERMITTED 委托人权限不足（交集为空）。",
+      "type": "string",
+      "enum": ["NOT_IN_GRANT", "EXPIRED", "QUOTA_EXCEEDED", "SUBJECT_NOT_PERMITTED"]
+    }
+  }
+}
