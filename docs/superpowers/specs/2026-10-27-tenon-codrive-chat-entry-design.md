@@ -1,6 +1,6 @@
 # M1 切片 1 设计：对话入口（共驾对话框 + 审批落地）
 
-- 状态：**待评审**（已过两轮自查：初版自查 → 重审更正 3 处错误 → 架构对照补充 I7 与 4 处性质级修订；见 §11）
+- 状态：**待评审**（已过四轮：初版自查 → 重审更正 3 处错误 → 架构对照补 I7 → 规则来源分层与作用域；变更记录见 §11）
 - 日期：2026-10-27
 - 关系：是 [`2026-10-27-tenon-ai-driven-system-design.md`](2026-10-27-tenon-ai-driven-system-design.md) 的增量；同时是 [`2026-10-27-tenon-m05-host-agent-design.md`](2026-10-27-tenon-m05-host-agent-design.md) §0 非目标里「前端共驾页面」的落地切片，并把该文档 §5「`approve` 一律转人工」这条死路打开。
 - 前置：M0.5 三进程已落地（`cmd/host` 8080 / `cmd/agent` / `cmd/quote` 8083 / `cmd/inventory` 8081 / `cmd/procurement` 8082）。
@@ -16,6 +16,7 @@
 2. **`approve` 能真的执行**：今天 `internal/agent/run.go` 的 `auditBase` 写死 `ApprovedBy: nil`，并有测试锁定「approve 一律转人工」——而 dev 策略里 `DeductStock qty>10` 与 `CreatePurchaseRequest` 本来就命中 approve，**mini-erp 主路径今天执行不完**。
 3. **`confirm.by` 可信**：host 现在是裸连接，任何人都能自称 `user:alice` 去批准。
 4. **界面说人话**：业务员看到的必须是「从标准件仓扣掉 12 件」，不是 `inventory.DeductStock` / `G1 ok`。
+5. **审批不再一刀切**：今天 dev 策略里两个写动作**无条件** approve，等于所有写操作都要人批。改成两条正交轴——**来源轴**（对话发起一律要人按，因为人说的是意图不是授权）× **风险轴**（事件驱动按业务规范里的阈值自动判定，如小额自动通过）。规则所有权下放到业务规范，平台不为每个系统改代码（§3.8–§3.11）。
 
 **非目标（本轮明确不做）**
 
@@ -28,6 +29,7 @@
 | 多 host 实例 / 多 agent 并行 | M2（受审计链与进程内库存限制，见 §8） |
 | 真认证、SSO、多租户、口令策略 | M1 之后 |
 | 逐 step 审批（本轮是「整份 Plan 一次批准」） | 归档，理由见 §3.3 |
+| 规则热加载、规则可视化编辑、按租户/灰度覆盖 | §14.3（都有明确理由） |
 
 ---
 
@@ -144,7 +146,7 @@ flowchart TB
 | 端点 | 语义 |
 |---|---|
 | `POST /tenon/requests` | 收 `tenon.request` 或 `tenon.confirm` 之一；`200 {ok, seq}` |
-| `GET /tenon/requests/poll?after=<seq>` | `{frames:[{seq,frame}], nextCursor, dropped}` |
+| `GET /tenon/requests/poll?after=<seq>` | `{frames:[{seq,frame}], nextCursor, dropped}`；`frame` 里的 `requestId` 与合成 `eventId` 由 host 在入站时签发并覆写（见 §3.11） |
 | `POST /tenon/requests/ack` | `{upto}`（省略 = 确认全部）→ `{ok, acked}` |
 
 **为什么不复用 `/tenon/intents`**：它的 ack 是累积游标（`ack(upto)`），前端与 agent 两个消费者各自 ack 会互相吞帧。入站与出站是两个方向、两个消费者，必须两条队列。
@@ -222,6 +224,144 @@ flowchart TB
 
 另：`GET /tenon/pending` 的 `mine` 只答"我能不能按"，**不答"这步合不合法"**；页面不得据此推断可执行。
 
+### 3.8 规则来源分层：平台级 / 业务级 / 模块声明（选定：`approval.json`）
+
+**为什么要有这一节**：现状所有规则都在平台文件 `config/policies.dev.json` 里。每接一个新系统，就要工程师进去加规则——"每系统适配"的真正来源在这里，不在字段名。策略引擎本身已经 schema 无关（见下），缺的是**规则的所有权**。
+
+三层，合并取更严（`deny > approve > auto`），**不设"谁覆盖谁"**：
+
+| 层 | 文件 | 谁维护 | 放什么 |
+|---|---|---|---|
+| 平台级 | `config/policies.dev.json`（已有） | 平台 / 安全 | 与业务无关的硬规则：`origin=request → approve`、读动作 `auto` |
+| **业务级（新增）** | `skills/<skillId>/approval.json` | **业务方** | 本流程的阈值与审批人 |
+| 模块声明（已有） | manifest 的 `risk` | 模块开发 | `risk.level` / `risk.reversible` 作为条件维度，不需要新文件 |
+
+业务级文件**与现有策略文件同 schema、同加载器、同合并语义**（`PolicyRule[]`），不引入第二套规则语言：
+
+```jsonc
+// skills/quote-to-fulfillment/approval.json
+[
+  {"policyId": "biz-purchase-auto-small",
+   "priority": 100,
+   "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
+   "when": {"all": [{"arg.amount": {"<=": 5000}}]},
+   "outcome": "auto"},
+
+  {"policyId": "biz-purchase-approve",
+   "priority": 100,
+   "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
+   "when": {"all": []},
+   "outcome": "approve",
+   "approvers": ["role:procurement_manager"]}
+]
+```
+
+**为什么引擎不需要任何改动**（"不为每个系统做适配"的依据）：`internal/controlplane/policy` 的条件求值是路径式的、对业务字段零知识——
+
+| 能力 | 证据 |
+|---|---|
+| 任意字段名 | `arg.<任意段>`，段名只要求 `^[A-Za-z_][A-Za-z0-9_]*$`（`policy.go:90`） |
+| 多级路径 | `{"arg.line.qty": {">": 0}}` 有测试（`policy_test.go:137`） |
+| 任意类型比较 | 数字 / ISO-8601 / 字符串字典序 / 布尔 / null；`>` `>=` `<` `<=` `eq` `ne` `in` `notIn` `matches`；`all`/`any`/`not` 可嵌套 |
+| 风险维度 | `risk.level` / `risk.reversible` 可进条件（`policy_test.go:134`） |
+| 缺值语义 | **取不到值即条件不成立**，不是抛错（`policy_test.go:136`），fail-closed |
+
+所以 `{"arg.pressure_kpa": {"<": 101.3}}`（气压系统）与 `{"arg.amount": {"<=": 5000}}`（金额系统）走同一套引擎，**平台零改动**。
+
+**fail-closed 行为（必须定死）**：
+
+| 情形 | 行为 |
+|---|---|
+| `approval.json` 解析失败 | 该 skill 的规则**整份丢弃** + host 启动告警；该 skill 涉及的动作落回「无命中 → `deny`」（**不是** `auto`） |
+| 规则引用的 `arg.*` 路径在 inputSchema 里不存在 | 同上（整份丢弃），见 §3.10 |
+| 文件不存在 | 不是错误：该 skill 只是没有业务级规则 |
+| 两个 skill 都声明了同一动作的规则 | 进同一规则池，按 `priority` 与 `outcome` 合并（现有语义），不做文件级覆盖 |
+
+**改规则的生效方式**：本切片**不做热加载**——改 `approval.json` 需重启 host。理由见 §14（避免为"改一个数字"引入文件监听与部分生效状态）。
+
+### 3.9 作用域：动作 × 流程（同一个数值在不同业务里阈值不同）
+
+先摆一条会决定方案的事实：**宿主看不见事件**。agent 是直接向模块拉发件箱的（`cmd/agent/main.go:535`，`GET /tenon/events?direction=out`），不经过 host。所以 host 手里没有"这次属于哪条业务流程"。
+
+推论：作用域标识只可能来自三处——
+
+| 来源 | 可信度 | 例 |
+|---|---|---|
+| 动作自身声明（manifest / `risk`） | 高（模块签发） | `risk.level` |
+| **动作入参 `args`（业务系统给）** | **中：进审计 + 进幂等键，事后可对账** | `arg.orderType` |
+| agent 自报（skill 名 / 事件类型） | 低：它可选宽松那条 | — |
+
+**选定：流程标识用 `args` 里的业务字段。** 同一动作、两套阈值，就是同一规则池里的两条规则：
+
+```jsonc
+[
+  {"policyId": "biz-purchase-auto-B", "priority": 100,
+   "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
+   "when": {"all": [{"arg.orderType": {"eq": "B"}}, {"arg.amount": {"<=": 3000}}]},
+   "outcome": "auto"},
+  {"policyId": "biz-purchase-auto-C", "priority": 100,
+   "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
+   "when": {"all": [{"arg.orderType": {"eq": "C"}}, {"arg.amount": {"<=": 20000}}]},
+   "outcome": "auto"},
+  {"policyId": "biz-purchase-approve", "priority": 100,
+   "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
+   "when": {"all": []}, "outcome": "approve",
+   "approvers": ["role:procurement_manager"]}
+]
+```
+
+三种情形的处理，按优先级：
+
+| 情形 | 处理 |
+|---|---|
+| 业务系统 args 里已有流程字段（`orderType`/`workflow`/`costCenter`…） | 用 §上 的写法，零协议变更 |
+| 两套阈值其实对应**两个不同动作**（`CreatePurchaseRequest` vs `CreateUrgentPurchase`） | 天然区分，什么都不用做 |
+| 业务系统给不出流程标识 | **取更严的那条**（fail-closed），并在该 skill 正文注明「此处需业务系统补一个流程标识字段」。代价：较宽松的流程会被多批一次 |
+
+**两件容易混的事**：`approval.json` 放在 `skills/<id>/` 只解决**可维护性**（B 流程的规则写在 B 的规范里，改 B 不碰 C）；**执行时用哪份规则仍由 `args` 决定**。若同一动作出现在两个流程里，光靠目录隔离不会自动生效。
+
+**明确不做**：让 `policies:evaluate` 带 `triggerEventType` 来做规则命名空间。收益只是省一个 `arg` 字段，代价是把"改 skill"变成"改闸门作用域"，而且是 agent 自报、事前不可防（只能事后对账）。
+
+### 3.10 加载期校验规则路径（否则一个字母能把闸门反过来）
+
+规则里的 `arg.*` 路径必须在该 action 的 `inputSchema` 里存在。加载 `approval.json` 时按 `action` 拉完整定义（`GET /tenon/actions/{id}`，manifest 摘要不含 inputSchema 是按需拉取的设计，见 D15）并校验；`risk.*` 路径按 `risk` 结构校验。
+
+**为什么这条不能省**：缺值语义是"条件不成立"，在正向条件下它倒向 `deny`（安全），但一旦被 `not` 取反就倒向 `auto`：
+
+```jsonc
+{"not": {"arg.amout": {"<=": 5000}}}   // 少一个 n
+// 取不到值 → 条件不成立 → not 成立 → outcome=auto
+```
+
+一个字母的笔误就能把「大额要批」变成「大额自动过」。所以路径校验是 fail-closed 的一部分，不是锦上添花。校验失败按 §3.8 的表整份丢弃。
+
+### 3.11 来源判定（`origin`）进策略，且不可由 agent 自报
+
+需求：**对话发起的动作一律要人按**（人说的话是*意图*，不是*授权*——他说的"缺的发起采购"，并不等于"开一张 9 件的采购单"）；事件驱动则按金额/风险自动判定。两条轴合并取更严。
+
+实现（`origin` 必须是可信输入，不能是 agent 的一句话）：
+
+1. `POST /tenon/requests` 收到 request 时，host **签发** `requestId` 与合成 `eventId`（`evt_` + ULID），登记 `syntheticEventId → {origin:"request", by, at}`；登记表与入站队列同生命周期、同目录。
+2. `GET /tenon/requests/poll` 把这两个 id 随帧返回；agent **必须**沿用，不得自行生成（初版 spec 让 agent 自己造 id，那等于让它决定自己要不要被审）。
+3. `policies:evaluate` 请求增 `planId` + `triggerEventId`（**必填**）。host 查登记表：命中 → `origin="request"`；未命中 → `origin="event"`。
+4. host 把 `origin` 塞进策略求值输入；`PolicyRequest` 与 `policy.schema.json` 增 `origin`（枚举 `request` / `event`）。**agent 传入的任何 origin 字段一律忽略。**
+5. **缺失 `triggerEventId` → `deny`**（fail-closed；不允许"没带就当事件"）。
+6. 条件路径前缀从 `arg` / `risk` 扩为 `arg` / `risk` / `origin`，其中 `origin` 是**单段路径**（不带 `.`）。这是 `parsePath` 的一处小改动（`policy.go:546` 现在只认两个前缀）+ 表驱动测试。
+
+规则示例（平台级，放 `config/policies.dev.json`）：
+
+```jsonc
+{"policyId": "plat-request-needs-human", "priority": 1000,
+ "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
+ "when": {"all": [{"origin": {"eq": "request"}}]},
+ "outcome": "approve",
+ "approvers": ["role:procurement_manager"]}
+```
+
+**诚实边界**：`origin` 防的是「agent 把自己想做的事说成用户要的」，**不防恶意 agent**——它完全可以伪造一个格式合法的 `evt_` id。Tenon 的威胁模型里 agent 是被信任的运行时，治理针对不确定性而非恶意；要防恶意得靠审计对账（本切片不做）。这条要写进 README，否则会被当成认证机制。
+
+**对 pending 的影响**：`approve` 不分来源——事件驱动的大额单同样进 pending，走同一条人工批准路径；否则大额事件单就没人批了。
+
 ---
 
 ## 4. 数据流：一次完整往返
@@ -256,7 +396,7 @@ flowchart TB
 
 | 字段 | 请求触发时怎么填 |
 |---|---|
-| `trigger.eventId` | 签发合成事件 id `evt_<ULID>`，与 `requestId` 一对一 |
+| `trigger.eventId` | **由 host 签发**（见 §3.11），agent 沿用，不得自行生成 |
 | `trigger.correlationId` | 优先用 `context.view` 映射成业务链：`cor:<module>/<id>`（如 `cor:quote/Q-2026-0417`）；无 view 时为 `cor:request/<requestId>` |
 | 审计 `trigger.eventId` | 同一枚合成 id（`audit-event.schema.json` 的 `eventId` 允许 `null`，但我们给真值，让审计可追到是哪句话） |
 
@@ -414,7 +554,11 @@ type Queue interface {
 | 公告板 | 只读语义；按 roles 过滤；`mine` 标记；不参与任何执行判定 | ✅ |
 | agent 挂起/恢复 | 假 LLM + 假 host + `t.TempDir()`：挂起落 pending → confirm → 执行 → `result.approvedBy` 正确；重复 confirm 幂等；过期不执行；G4 失败触发重规划；`dispatched` 段 approvedBy 恒 null | ✅ 不花 token |
 | 白话渲染 | 模板占位符取值；缺模板退回 title；含数字的 `rationale` 被丢弃；120 字符截断 | ✅ |
-| 请求回合的触发源 | `trigger.eventId` 匹配 `^evt_`；`correlationId` 匹配 `^cor:`（有 view / 无 view 两条路径）；Plan 能通过 `plan.schema.json` 校验 | ✅ |
+| 请求回合的触发源 | `trigger.eventId` 匹配 `^evt_`；`correlationId` 匹配 `^cor:`（有 view / 无 view 两条路径）；Plan 能通过 `plan.schema.json` 校验；**合成 id 必须来自 host 签发**（agent 自造的 id 不被登记） | ✅ |
+| `origin` 判定 | 登记的合成 id → `request`；未登记 → `event`；**缺 `triggerEventId` → deny**；agent 传入的 origin 被忽略 | ✅ |
+| 业务级规则加载 | `approval.json` 与平台规则同池合并取更严；解析失败 → 整份丢弃且该动作落回 deny（**不是 auto**）；文件不存在不报错 | ✅ |
+| 规则路径校验 | `arg.<不存在>` 在加载期被拒；`not` 包一个笔误路径（`arg.amout`）必须被拒，不得被静默放行成 auto | ✅ |
+| 规则集 golden | 表驱动 `(action, args, risk, origin) → 期望处置`；改阈值后 diff 在 review 里可见 | ✅ |
 | prompt 分流 | 用户原话只出现在「用户请求（这是指令）」块；事件块不含用户文本（防把指令当事实） | ✅ |
 | **D1 结果文件隔离** | 事件回合与请求回合混写后，`internal/d1` 仍只读到 `trigger=event` 的行 | ✅ |
 | **I7 崩溃序** | 注入三种崩溃位置（pending 后 / dispatched 后 / 标记前），恢复行为符合 I7 表：缺 dispatched 记录时不执行并记 `contract_violation` | ✅ |
@@ -471,12 +615,14 @@ type Queue interface {
 | §4.1 | 「读 skill」跳过了「请求没有事件类型 → 没有订阅匹配路径」这个问题，P2 必然卡住 | 补确定性粗筛规则（不花 LLM，同输入同结果） |
 | §3.7.1 | 未定义批准人 ≠ 发起人时 grant 按谁算，实现者容易让「主管权限更大」生效 | 写死 **授权仍按发起人评估，批准人不扩大权限**；并区分 `requiredRoles`（能否按按钮）与 grant（这步合不合法） |
 | §4.3 / §4.4 | ① 执行完删 pending 会抹掉完整 plan 的唯一副本；② 初版倾向新增结局态，与 `run.go:74`「三态封闭」冲突；③ 未处理「挂不挂前端会改变 D1 结局」 | ① pending 归档到 `archived/`；② `RunResult` 加 `pendingPlanId` 而非新增态；③ D1 运行时关闭入站通道 |
+| §3.8–§3.11 | 初版把规则全放平台 `config/`，等于每接一个系统就要工程师加规则（"每系统适配"的真正来源）；且未定义「同一数值在不同业务流程阈值不同」怎么表达、`origin` 谁来判定 | 规则分层（平台/业务/模块）+ 流程标识走 `args` 业务字段 + `origin` 由 host 签发登记后判定 + 加载期路径校验 |
 
 **三条被改动但未在初版记明的架构性质**（本切片的代价，写在这里以免被当成免费午餐）：
 
 1. **前端从「可选增强」变成审批路径上的必需环节**：有前端 = 等审批，无前端 = 转人工。用 `pendingPlanId` 区分，且 D1 运行时关闭入站通道来保住主判据的可重复性。
 2. **agent 从无状态变成有状态**（M0.5 §1 原文「不持久化状态」）：多了一份必须与审计链一致的持久状态，见 I7。
 3. **Tenon 从事件驱动单入口变成「事件 + 人」双入口**：`tenon.request` 是指令，而 README 说「订阅事件只决定是否思考，绝不决定做什么」。这条定位变化应在**主设计文档**记一笔，不只留在本切片。
+4. **威胁模型扩了一格：改 skill 即改权限**。规则从 `config/` 下放到 `skills/<id>/approval.json` 之后，能动文档目录的就能改闸门。要么加 CODEOWNERS + review，要么只读挂载（§14.4）。
 
 ---
 
@@ -498,7 +644,45 @@ type Queue interface {
 
 | 阶段 | 内容 | 出口判据 |
 |---|---|---|
-| **P1 host 入站面** | `Queue` 端口 + `jsonlQueue` + 入站 3 端点 + `POST /tenon/session` + 公告板 2 端点 + 静态页路由 | 单测全绿；伪造 token 被拒；两队列 ack 互不干扰 |
+| **P1 host 入站面** | `Queue` 端口 + `jsonlQueue` + 入站 3 端点（含签发合成 id 与登记表）+ `POST /tenon/session` + 公告板 2 端点 + 静态页路由 + **`origin` 进策略 + 业务级规则加载（`approval.json`）与路径校验** | 单测全绿；伪造 token 被拒；两队列 ack 互不干扰；`not` 取反 + 路径笔误用例被加载期拒绝 |
 | **P2 agent 挂起/恢复** | 入站消费循环（先入站再事件）+ **I7 的落盘定序与恢复前置校验** + pending 过期归档 + 恢复执行 + `approvedBy` 落审计 + `pendingPlanId` 出参 + skill 确定性粗筛 | 假 LLM 单测覆盖 I1–I4 与 I7 三种崩溃位置；主路径在无前端时可用 curl 走通 |
 | **P3 白话与界面** | 三个模块补 `summaryTemplate`（`title` 已有，不动）+ 渲染器 + 单页（登录/对话/待批/详情折叠） + 公告板每 tick 幂等重推 | 验收线第 3 步的白话与按钮态检查通过 |
-| **P4 收口** | `interfaces.md` 补 6 端点与「D1 运行时关闭入站」、`CHANGELOG.md` 0.2.0 段、README 已知缺口（含三条性质变化）、compose 更新（可选 redis） | 文档与实现逐条对得上；`go test ./...` + `pnpm check` 全绿 |
+| **P4 收口** | `interfaces.md` 补 6 端点与「D1 运行时关闭入站」、`CHANGELOG.md` 0.2.0 段、README 已知缺口（含三条性质变化与 origin 的诚信边界）、compose 更新（可选 redis）、`skills/` 的 CODEOWNERS | 文档与实现逐条对得上；`go test ./...` + `pnpm check` 全绿 |
+
+---
+
+## 14. 维护性评估：这套设计好不好维护
+
+**结论：比现状好，但不等于"好维护"。** 四条实打实的改进，五处仍然要付的维护成本，加一处威胁模型变化。
+
+### 14.1 变好的四点
+
+| 改进 | 具体 |
+|---|---|
+| 规则与平台代码解耦 | 改阈值 = 改 JSON，不重编译、不发版（但要重启 host，见 14.3） |
+| 所有权清晰 | 业务方改 `skills/<id>/approval.json`，平台改 `config/policies.dev.json`，不再抢同一个文件 |
+| 一套心智模型 | 业务级文件与平台级文件**同 schema、同加载器、同合并语义**，不需要学第二种规则语言 |
+| 接新系统不改平台 | 条件求值器 schema 无关（§3.8 证据表），新系统只写自己的规则；字段名不必统一 |
+
+### 14.2 仍然不好维护的五处（不粉饰）
+
+| # | 负担 | 建议 |
+|---|---|---|
+| 1 | **同一业务语义散在四处**：manifest `title`、`summaryTemplate`、`SKILL.md` 正文、`approval.json`。改规则时容易只改一处 | 以 `approval.json` 为准，正文只解释"为什么"；加 lint：正文里出现的数字阈值必须在 `approval.json` 有对应规则（可机械扫描，与 C10 同套） |
+| 2 | **三份 frontmatter/规则解析器**：agent 的 `splitFrontmatter`/`parseSubscribes`、`tools/lint` 的探测、host 的规则加载 | 抽 `internal/skill` 公共包，三处共用；否则必然漂移 |
+| 3 | **规则缺 id 与变更审计**：谁改了阈值、何时生效？ | 每条规则必带 `policyId`（复用现有字段），审计 `decidedBy` 指回它；`skills/` 纳入 CODEOWNERS 与 review |
+| 4 | **冲突调试成本**：多条命中取最严，"这笔为什么被批"要能回答 | `decidedBy` 已在响应里，把命中规则 id 列表放进 Intent 帧的技术详情（现在只显示"要谁批"） |
+| 5 | **没有规则集回归**：阈值是数据，改一个数字不会有编译错误 | golden test：一张 `(action, args, risk, origin) → 期望处置` 的表，改规则必须同步更新，让 diff 在 review 里可见 |
+
+### 14.3 明确的取舍（本切片不做）
+
+| 不做 | 理由 |
+|---|---|
+| 规则热加载 | 改一个数字要重启 host。引入文件监听会带来"部分生效"的中间态（平台规则新、业务规则旧的组合没人验证过），收益不值 |
+| 规则的可视化编辑 | 页面只读展示，编辑走 git |
+| 规则按租户/灰度覆盖 | 单 host 约束下没有意义（I6） |
+
+### 14.4 威胁模型变化（必须记）
+
+把规则放进 `skills/` 等于**改文档即改权限**。今天改权限要动 `config/`，今后动 skill 目录也能。两条兜法择一：给 `skills/` 加 CODEOWNERS + review 要求，或只读挂载。**不能装作没发生**——否则"业务方可以自己调阈值"会悄悄变成"任何人可以自己关闸门"。
+
