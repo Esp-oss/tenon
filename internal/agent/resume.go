@@ -19,9 +19,11 @@
 // 恢复只补计划级 result 段，并在那里记 approvedBy——人批过的事实哪怕后来被策略拒了
 // 也必须留痕。
 //
-// 本任务**不推公告板**：终态公告板覆盖（spec §3.4）属 Task 9 的 finishTerminal，
-// 归档之后由它在下一个 tick 的自检/公告板阶段统一推。所以这里的每个归档点都没有
-// 推送逻辑，别误以为漏了。
+// 公告板**不在这里推**：终态覆盖是 board.go 的 finishTerminal（spec §3.4），而它需要一个
+// 带登录凭证的 HostClient——Resume 的入参里只有宿主地址（Deps.Host），没有凭证，所以
+// 本文件的每个归档点都只落盘。每 tick 的 RepushBoard 也只重推 pending/ 里的活条目，
+// **不会**替归档件补推终态（见 board.go 的包注释）。终态覆盖的接线要由 cmd/agent 的 tick
+// 补上，否则已处理完的那张卡会一直挂在板上，直到 host 按 expiresAt 把它剔除。
 package agent
 
 import (
@@ -152,7 +154,9 @@ func Resume(ctx context.Context, deps Deps, store *StateStore, c Confirm) error 
 		if err := archivePending(store, p.PlanID, StateRejected); err != nil {
 			return resumeError{Msg: err.Error(), Retryable: true}
 		}
-		return nil // 终态公告板覆盖由 Task 9 补；本任务不推公告板
+		// 归档即可：终态覆盖见 board.go 的 finishTerminal（它需要带凭证的 HostClient，
+		// 接线在 cmd/agent，不在恢复路径里）。
+		return nil
 	case confirmApprove:
 		// 继续走下面的固定顺序
 	default:
@@ -406,8 +410,9 @@ func (r *runner) writePlanResult(ctx context.Context, p Pending, approvedBy, sta
 // archivePending 归档，并容忍「已经被别人归档」：Archive 不幂等，pending 不在盘上时
 // 返回「归档时找不到 <id>」（§0.1.2）。那种情况按已归档处理，只记一行日志。
 //
-// **只归档、不推公告板**：终态公告板覆盖（spec §3.4）由 Task 9 的 finishTerminal 补，
-// 它会在下一个 tick 的公告板阶段把 state=终态推上去。
+// **只归档、不推公告板**：终态覆盖见 board.go 的 finishTerminal。注意 RepushBoard 每 tick
+// 只重推 pending/ 里的活条目、看不见归档件——所以「下一个 tick 会自动补推终态」是假的，
+// 终态必须由归档方自己推（需要一个带凭证的 HostClient，接线在 cmd/agent，尚未落地）。
 func archivePending(store *StateStore, planID string, state PendingState) error {
 	err := store.Archive(planID, state)
 	if err == nil {
