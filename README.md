@@ -136,7 +136,7 @@ docs/             设计文档、接口文档与架构图
 
 **M0.5 已落地三个进程**：宿主 `cmd/host`（控制平面：策略 / 授权 / 审计链 / 注册表 / 共驾帧 REST）、agent 运行时 `cmd/agent`（轮询发件箱 → 读 skill → 能力发现 → LLM 规划 → 闸门 → 两段审计 → 执行）、触发器模块 `cmd/quote`；M0 的 `cmd/inventory` / `cmd/procurement` 继续可用。协议侧的三处扩展（`POST /tenon/audit`、`GET /tenon/modules`、模块发件箱 `direction=out`）见 [spec/0.1/CHANGELOG.md](spec/0.1/CHANGELOG.md) 的 `0.2.0` 提案段与 [docs/interfaces.md](docs/interfaces.md)。
 
-### 对话入口（M1 切片 1）：后端就绪，链路未通
+### 对话入口（M1 切片 1 + 切片 2 + P3 白话）：后端与页面已就绪，链路已通
 
 `cmd/host` 已具备「人 → agent」的入站面：
 
@@ -146,18 +146,32 @@ docs/             设计文档、接口文档与架构图
 - `origin` 进策略：宿主签发合成 `evt_` 并**独立落盘登记**（这张表是治理状态，不是缓存——单删它会把在途请求静默降级成事件驱动），据此判定「对话发起 / 事件驱动」；缺 `triggerEventId` 的行为由 `TENON_REQUIRE_TRIGGER` 过渡控制（默认放行为 `event`，P4 收口时改强制）；
 - 业务级规则从 `skills/<id>/approval.json` 加载，加载期校验 `arg.*` / `risk.*` 路径并试编译，按 skill 粒度 fail-closed；与平台规则同池合并、**取更严**，所以业务规则只能收紧不能放宽。
 
-**还缺两半，所以现在不能当功能用**：agent 不消费入站队列、也不读 `confirm`（P2）；页面没有内容（P3）。即「业务员说话 → 落到队列」这一段是真的，「agent 处理 → 人看到结果」还没有。
+**链路已通（M1 切片 2）**：agent 消费入站队列、命中 `approve` 时挂起落盘（I7 三次写）、审批人批准后按原计划恢复执行，审计 `result` 段带 `approvedBy`。端到端真跑过：投一句话 → 挂起 → bob 批准 → 库存 120→108 → 归档 `done`。
 
-现在能验证到的最小链路（先起一个模块，例如 `inventory` 在 8081）：
+> **启动顺序：模块先起，host 后起**（`inventory` → `procurement` → `host` → `agent`）。
+> host 在**加载期**要拉每个模块的 `GET /tenon/actions/{id}` 来校验并加载 `skills/*/approval.json` 里的业务级规则。模块不在时那两条规则会**静默不加载**——日志里只是少了「业务级规则已加载 2 条（来自 skills）」这一行，不报错。**看到这行才算规则真的生效**。
+
+现在能验证到的最小链路（先起模块，再起 host）：
 
 ```bash
+# 1) 先起模块（各自一个终端）
+TENON_MODULE_ID=inventory PORT=8081 go run ./cmd/inventory
+# 2) 再起 host —— 顺序反了业务规则会静默不加载
 TENON_USERS_FILE=config/users.dev.json TENON_SESSION_SECRET=dev \
 TENON_INBOUND_DIR=out/inbound TENON_MODULES='inventory=http://127.0.0.1:8081' \
-go run ./cmd/host
+TENON_SKILLS_DIR=skills go run ./cmd/host
+# 3) agent（需要 LLM 凭据；无凭据时用 stub，见 .githooks 旁的说明或 compose 的 smoke profile）
+TENON_HOST_URL=http://127.0.0.1:8080 TENON_ON_BEHALF_OF=user:alice \
+TENON_AGENT_ID=ag_fulfillment TENON_AGENT_STATE_DIR=out/agent-state \
+TENON_AGENT_USER=agent TENON_AGENT_PASSWORD=agent-dev go run ./cmd/agent
+```
+
+```bash
 # 换 token，再推一句人话；返回 {"ok":true,"seq":1,"durable":true}
 curl -s -X POST localhost:8080/tenon/session -d '{"user":"alice","password":"alice-dev"}'
 curl -s -X POST localhost:8080/tenon/requests -H "Authorization: Bearer <token>" \
   -d '{"type":"tenon.request","text":"扣 12 件"}'
+# 浏览器打开 http://127.0.0.1:8080/ （需 TENON_UI_DIR=ui）即可用页面走同一条链路
 ```
 
 ### 能判定的用例（宿主模式，真进程实测）
@@ -184,7 +198,7 @@ go run ./cmd/tenon conformance run --target http://127.0.0.1:8081 --host http://
 
 不给 `--host` 时 C4/C5 仍记 SKIP 并写明原因——模块模式没有宿主侧端点可查。
 
-### D1 差异测试：runner 已实现，结论未判定
+### D1 差异测试：runner 已实现，判定见下
 
 ```bash
 go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
@@ -195,12 +209,28 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 
 `internal/d1` 会做两轮：A 轮三个模块全在 → B 轮 `POST /tenon/admin/modules` 把 procurement 置 `enabled=false`，两轮之间 reset 所有模块、换一个报价单号（SKU 与数量不变），然后比对 agent 结果文件里两轮**规划出来的**动作序列（判据：序列不同、B 轮不碰被摘模块、B 轮转人工、两轮都没崩）。
 
-**但它还没跑过真 LLM 的 A/B**，所以 D1 的结论是「未判定」，不是「已通过」：
+**一键复现**（前置条件全部写成启动断言）：`powershell -NoProfile -File scripts/d1-e2e.ps1`（`-Stub` 只验编排，不出判定）。
 
-- 本轮没有用真凭据跑过 agent 回合，自然也没有 A/B 两轮可比（没跑 ≠ 通过）；
-- 前置接线都已就位、并逐条实测过：宿主 `TENON_TEST_MODE=1` 挂 `POST /tenon/admin/modules`；三个模块 `TENON_TEST_MODE=1` 挂 `POST /tenon/admin/reset`（设 `1` → 200 `{"reset":true}`，设 `0` → 404）；agent 的 `TENON_RESULT_FILE` 每回合追加一行，正是 `--agent-result` 读的文件。
+### D1 判定结果（2026-10-27，真模型 A/B，三次尝试）
 
-用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
+模型 `deepseek-flash`，报告 `out/d1/report.json`。
+（`deepseek-v4-pro` 实测不可用：推理模型，同一条规划请求 600 token 全花在 reasoning 上、可见 `content` 为空，真实链路里会把轮次拖过超时——所以脚本缺省用 flash。）
+
+| 次 | 条件 | 机械结论 | 实质 |
+|---|---|---|---|
+| #1 | 修 prompt 前 | `fail` | **判定受阻**：A 轮模型输出连续 2 次没过 `plan.schema.json`，两轮无可比 |
+| #2 | 修 prompt 后 | 当时记 `pass` | **空洞通过**：A 轮只有 `inventory.GetStock`，本就没引用被摘的 `procurement`，两轮差异不是摘除造成的 |
+| #3 | 判据收紧后 | `fail` | B 轮规划出 `inventory.DeductStock` 但**缺 `referenceNo`** → 预演 400 `SCHEMA_MISMATCH` → fail-closed，B 轮 `failed` |
+
+**结论：D1 至今没有被真正判定过一次。** 三种形态各不相同，但都不是「agent 自适应」的证据。
+
+**根因链（三层，前两层已修，第三层需单独评审）**
+
+1. **`expectedDiff` 的形状没写给模型**（已修）：prompt 没说元素必须含 `field`/`from`/`to`，模型自造 `{op, note}`；prompt 说 entity 可写「字符串简写」却没给格式，模型写了裸主键 `"STD-1002"`，而 `EntityRefString` 要求三段 `模块:类型/主键`（`oneOf` 两侧都不匹配时报错文本会误导成「只收对象」）。修法：第 7 条给出两种等价写法的占位示例 + 明说「只写主键是错的」，`TestPromptStatesExpectedDiffShape` 锁住。
+2. **判据会被计划质量架空**（已修）：A 轮若不含被摘模块的动作，「B 轮不碰它」是白送的。现在这种空洞通过记 **`inconclusive`**（新增第三态）而不是 `pass`，用例 `TestD1InconclusiveWhenADidNotUseRemovedModule` 锁住；退出码仍为非 0，不会被 CI 当成合格。
+3. **prompt 不带入参契约**（未修，需评审）：动作清单只列 action id（`internal/agent/planner.go` 的「可调动作」块），模型不知道 `DeductStock` 需要 `referenceNo`，写动作必然靠猜——#3 的 400 就是它。要让 D1 可判定，得把每个动作的**最小入参契约**（`required` 字段名与类型）带进 prompt，或让规划器按需拉 `GET /tenon/actions/{id}`。这是设计变更（上下文成本 vs 计划合法率），不在本轮边界内。
+
+> 本轮边界是「只判不调」：已修的两层都是**让判定成为可能**的缺陷（不是为了让结果变绿），第三层会让判定继续受阻，但它改变的是 prompt 的信息量与上下文成本，必须单独评审。用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
 
 ### 其它检查
 
@@ -212,18 +242,24 @@ docker compose -f compose.m0.yaml config --quiet
 
 ### 还没做的
 
-dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、**agent 侧的挂起/恢复**（不消费入站队列、不读 `confirm`，所以审批通过也恢复不了执行）、**前端页面**（`GET /` 只是路由，`TENON_UI_DIR` 不配就回 503）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
+dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`tenon.request` 帧**至今没有 schema**（只在 prose 与 CHANGELOG 里）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、撤销与补偿（`ReleaseStock` 未接）、`amend`（JSON Patch 改 step 后再批）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
 
-> **审计形状的一处已知偏离（加严校验时会撞上）**：挂起与恢复的审计是**计划级**——`stepId=null`、没有 `action` / `inputHash`（人工批准的对象是整份 plan，不是某一步）。宿主当前的 `POST /tenon/audit` 只校验 `auditId` 非空与 `stage ∈ {dispatched, result}`，所以这些记录能落盘；但它们**不满足** `audit-event.schema.json` 的完整 required 集。也就是说：**审计链里存在非标准记录**。哪天宿主把校验加严到 schema 完整，挂起路径会全线失败——这是刻意接受的取舍（P2 设计 §4），不是疏漏。
+> 页面已交付（`TENON_UI_DIR=ui`，无构建链静态页）：白话来自身份化模板，技术信息在折叠区。**可回归的验收**：`powershell -NoProfile -File scripts/verify-ui.ps1`——它起 stub 全链路、造一张待批卡，再用 Edge(CDP) 断言「卡面只有人话、技术信息默认收起、非审批人没有批准按钮」，并落两张截图到 `out/ui-verify/`。
+
+> **审批人角色只有一条来路**：`tenon.confirm` 帧里的 `roles` **由宿主写入**（取提交者 token 的 `claims.roles`，先删客户端自报再写）。agent 侧不读登录身份、不做兜底——它若读自己的登录角色，等于用服务账号的身份给人授权。也因此：**策略必须真的给出 `approvers`**，否则 `requiredRoles` 为空、`rolesIntersect` 对空集 fail-closed，会出现"板上有卡、谁点都 403"。这是 fail-closed 的必然结果，不是 bug。
+
+> **审计形状的一处已知偏离（加严校验时会撞上）**：**挂起那一刻**写的计划级 `dispatched`（`stepId=null`、无 `action` / `inputHash`）与恢复收尾的计划级 `result`，**不满足** `audit-event.schema.json` 的完整 required 集——人工批准的对象是整份 plan，不是某一步。宿主当前的 `POST /tenon/audit` 只校验 `auditId` 非空与 `stage ∈ {dispatched, result}`，所以这些记录能落盘。恢复执行的 **step 级**两段（`stepId` 非空）是 schema 完整的，且带 `decision.approvedBy`；`effects.entities` 已统一写 `[]`（不是 `null`）。哪天宿主把校验加严到 schema 完整，**计划级那两条会全线失败**——这是刻意接受的取舍（P2 设计 §4），不是疏漏。
 
 里程碑：
 
 | 阶段 | 内容 | 出口判据 |
 |---|---|---|
 | M0 | schema + conformance C1–C3/C8/C9/C10 + lint + `inventory` / `procurement` 两个侧车 | 模块侧用例全绿 |
-| **M0.5（已完成）** | `host` + `agent` + `quote` + 协议扩展三处（写审计 / 注册表 / 发件箱） | C4/C5 判 PASS（**已达成**）；D1 需真 LLM 跑一次 A/B（**未跑**，接线已就位） |
-| **M1 切片 1（已完成）** | host 入站面：落盘入站队列 / dev 身份 / `origin` 进策略 / 业务级规则 / 待批公告板 / 同源静态页 | 入站与策略侧用例全绿；**链路未通**——agent 侧（P2）与页面（P3）未做 |
-| M1（剩余） | agent 挂起/恢复 + `pendingPlanId` + 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 | 高风险路径必须人工；对账能发现篡改 |
+| **M0.5（已完成）** | `host` + `agent` + `quote` + 协议扩展三处（写审计 / 注册表 / 发件箱） | C4/C5 判 PASS（**已达成**）；D1 已用真模型跑过 3 次**仍未判定**（见上文「D1 判定结果」） |
+| **M1 切片 1（已完成）** | host 入站面：落盘入站队列 / dev 身份 / `origin` 进策略 / 业务级规则 / 待批公告板 / 同源静态页 | 入站与策略侧用例全绿 |
+| **M1 切片 2（已完成）** | agent 侧：消费入站队列 / 挂起落盘（I7 三次写）/ 审批人角色通道 / 恢复执行 / 去重账本 / 公告板终态 | 端到端真跑通：投一句话 → 挂起 → bob 批准 → 真扣库存 → 归档 done |
+| **M1 切片 3 / P3（已完成）** | 白话：模块声明 `summaryTemplate` → 能力发现带回 → agent 渲染（失败退「标题+参数」）→ 公告板带 `detail` → 页面折叠 | `scripts/verify-ui.ps1` 在 Edge 里 7 条断言 × 2 身份全过：卡面只有人话、技术信息默认收起、非审批人无批准按钮 |
+| M1（剩余） | 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 + D1 判定阻塞项（prompt 不带入参契约） | 高风险路径必须人工；对账能发现篡改 |
 | M2 | HTTP 侧车 SDK + MCP 双向 + 非 TS 示例 | 非 TS 模块跑通全套用例 |
 | M3 | skill 仓库 + 轨迹蒸馏 + 发布审计/回滚 | 新流程只改 skill 即可上线 |
 

@@ -25,21 +25,28 @@ const (
 // Pending 是一份挂起的计划。Plan 存全文：审计只有 planId/stepId/action/inputHash，
 // 它是「当时规划了什么」的唯一完整副本，所以归档不删（30 天后清理）。
 type Pending struct {
-	PlanID            string       `json:"planId"`
-	State             PendingState `json:"state"`
-	RequestID         *string      `json:"requestId"`
-	TriggerEventID    string       `json:"triggerEventId"`
-	Origin            string       `json:"origin"`
-	By                string       `json:"by"`
-	Plan              Plan         `json:"plan"`
-	Labels            []string     `json:"labels"`
-	Summary           string       `json:"summary"`
-	RequiredRoles     []string     `json:"requiredRoles"`
-	DispatchedAuditID string       `json:"dispatchedAuditId"`
-	AuditSettled      bool         `json:"auditSettled"`
-	CreatedAt         string       `json:"createdAt"`
-	ExpiresAt         string       `json:"expiresAt"`
-	ArchivedStatus    *string      `json:"archivedStatus"`
+	PlanID         string       `json:"planId"`
+	State          PendingState `json:"state"`
+	RequestID      *string      `json:"requestId"`
+	TriggerEventID string       `json:"triggerEventId"`
+	Origin         string       `json:"origin"`
+	By             string       `json:"by"`
+	Plan           Plan         `json:"plan"`
+	Labels         []string     `json:"labels"`
+	// Details 与 Labels 一一对应，是折叠区用的技术原文（action id + args）。
+	// 它是**展示数据**，不参与任何判定：审批、恢复、审计都不读它。
+	Details           []string `json:"details,omitempty"`
+	Summary           string   `json:"summary"`
+	RequiredRoles     []string `json:"requiredRoles"`
+	DispatchedAuditID string   `json:"dispatchedAuditId"`
+	AuditSettled      bool     `json:"auditSettled"`
+	CreatedAt         string   `json:"createdAt"`
+	ExpiresAt         string   `json:"expiresAt"`
+	ArchivedStatus    *string  `json:"archivedStatus"`
+
+	// Subject 是触发事件的实体寻址（domain-event 的 subject 原样）。审计与 Intent 帧都要它，
+	// 而 TriggerEventID 只够锚定事件、锚不住「哪个实体」。
+	Subject json.RawMessage `json:"subject,omitempty"`
 }
 
 // Expired 判断是否过了审批窗口。解析失败按「已过期」处理（fail-closed）。

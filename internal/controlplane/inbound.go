@@ -130,7 +130,7 @@ func (s *Server) serveInboundEnqueue(w http.ResponseWriter, r *http.Request) {
 		writeTenonError(w, *perr)
 		return
 	}
-	frame, perr := normalizeInboundFrame(body, claims.Subject, s.origin)
+	frame, perr := normalizeInboundFrame(body, claims.Subject, claims.Roles, s.origin)
 	if perr != nil {
 		writeTenonError(w, *perr)
 		return
@@ -164,7 +164,11 @@ type inboundEnqueueResponse struct {
 
 // inboundFrame 不再单独定义类型：规范化后的帧就是 map[string]any（保留原字段 + 宿主签发字段）。
 
-func normalizeInboundFrame(body []byte, subject string, origin *originStore) (map[string]any, *protocol.Error) {
+// normalizeInboundFrame 把客户端提交的帧规范化成**只有宿主能认证的那些事实**才算数的形状。
+//
+// subject 与 roles 都是**已验签 token** 里的 claims：两者都必须覆写客户端自报的字段，
+// 因为「谁说的」与「他有什么权限」恰恰是客户端最有动机伪造的两件事。
+func normalizeInboundFrame(body []byte, subject string, roles []string, origin *originStore) (map[string]any, *protocol.Error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, newError(protocol.ClassContractViolation, "SCHEMA_MISMATCH", "帧不是 JSON 对象："+err.Error())
@@ -188,11 +192,29 @@ func normalizeInboundFrame(body []byte, subject string, origin *originStore) (ma
 		return raw, nil
 	case inboundTypeConfirm:
 		raw["by"] = subject
+		// 审批人角色只能来自宿主验证过的 token：客户端自报的 roles 先删掉（**无论有没有**），
+		// 再写入 claims.Roles。**先删后写**而不是「有就保留」——保留等于让客户端夹带一个
+		// 高权限角色进来，把「谁批的」降级成「谁点了」。
+		//
+		// 没有角色时写入空集合而不是删掉字段：消费方要能区分「通道没接上（缺键）」与
+		// 「这个人没有角色（空集）」，而后者在 agent 侧由 rolesIntersect 兑现成
+		// fail-closed 的 403——绝不补一个默认角色（补了就是人人都能批）。
+		delete(raw, "roles")
+		raw["roles"] = emptyIfNilRoles(roles)
 		return raw, nil
 	default:
 		return nil, newError(protocol.ClassContractViolation, "UNKNOWN_FRAME_TYPE",
 			"入站只接受 tenon.request 或 tenon.confirm，收到 "+typ)
 	}
+}
+
+// emptyIfNilRoles 把 nil 角色集规范成空数组：帧里出现 "roles":null 时，消费方分不清
+// 「查不到」与「一个都没有」，而这两者在这里必须是同一个结论。
+func emptyIfNilRoles(roles []string) []string {
+	if roles == nil {
+		return []string{}
+	}
+	return roles
 }
 
 // serveInboundPoll 处理 GET /tenon/requests/poll?after=。

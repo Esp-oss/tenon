@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,5 +112,130 @@ func TestPendingBoardPrunesExpiredItems(t *testing.T) {
 	s.pending.mu.RUnlock()
 	if stillThere || left != 1 {
 		t.Fatalf("过期条目应被删除：stillThere=%v 剩余=%d", stillThere, left)
+	}
+}
+
+// 公告板条目必须带回 state：它是「待批」与「刚刚处理完」的唯一区分。
+//
+// 没有这个字段时 json.Unmarshal 会静默丢掉 agent 推的 state，host 原样重写同一条目，
+// 页面永远显示「待批」——agent 侧推的终态覆盖在线上等于零。
+func TestPendingBoardKeepsState(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, Config{
+		AuditPath:     dir + "/audit.jsonl",
+		SessionSecret: []byte("secret"),
+		InboundDir:    dir + "/inbound",
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	tok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", []string{roleAgent}, time.Now().UTC(), time.Hour)
+
+	// 同一 planId 先待批后 done：第二次就是线上的终态覆盖，顺序不能反。
+	// expiresAt 用远期常量：会到期的夹具过几个小时就自己变红。
+	for _, body := range []string{
+		`{"planId":"pln_state","summary":"扣 12 件","requiredRoles":["role:warehouse_manager"],
+		  "expiresAt":"2099-01-01T00:00:00Z","state":"awaiting_approval"}`,
+		`{"planId":"pln_state","summary":"扣 12 件","requiredRoles":["role:warehouse_manager"],
+		  "expiresAt":"2099-01-01T00:00:00Z","state":"done"}`,
+	} {
+		if status, resp := postJSONAuth(t, ts.URL+"/tenon/pending", tok, body); status != http.StatusOK {
+			t.Fatalf("推摘要失败 %d：%s", status, resp)
+		}
+	}
+
+	_, raw := getJSONAuth(t, ts.URL+"/tenon/pending", tok)
+	var got struct {
+		Items []struct {
+			PlanID string `json:"planId"`
+			State  string `json:"state"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("响应坏：%v", err)
+	}
+	// 终态条目**仍然出现在列表里**：协议层不替页面过滤（过滤是页面的事），
+	// 但 state 必须原样带回 "done"，否则页面无从判断该怎么显示。
+	if len(got.Items) != 1 || got.Items[0].PlanID != "pln_state" {
+		t.Fatalf("终态条目不该被协议层过滤掉，得到 %+v", got.Items)
+	}
+	if got.Items[0].State != "done" {
+		t.Fatalf("state 必须被保留为 done，得到 %q（完整响应：%s）", got.Items[0].State, raw)
+	}
+	// 板上存的那一份也必须已经是 done：state 若只是 GET 时临时算出来的，
+	// 下一次 upsert 又会退回待批。
+	s.pending.mu.RLock()
+	stored := s.pending.items["pln_state"].State
+	s.pending.mu.RUnlock()
+	if stored != "done" {
+		t.Fatalf("公告板上存的 state 应是 done，得到 %q", stored)
+	}
+}
+
+// 缺省值不是「空串」：老客户端（不推 state）的条目仍要显示成待批，不能被当成终态。
+func TestPendingBoardDefaultsStateToAwaiting(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, Config{
+		AuditPath:     dir + "/audit.jsonl",
+		SessionSecret: []byte("secret"),
+		InboundDir:    dir + "/inbound",
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+	tok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", []string{roleAgent}, time.Now().UTC(), time.Hour)
+
+	// 请求体里**没有** state 字段：这是 Task 9 之前的客户端。
+	body := `{"planId":"pln_legacy","summary":"老客户端推的","requiredRoles":[],
+	          "expiresAt":"2099-01-01T00:00:00Z"}`
+	if status, resp := postJSONAuth(t, ts.URL+"/tenon/pending", tok, body); status != http.StatusOK {
+		t.Fatalf("推摘要失败 %d：%s", status, resp)
+	}
+
+	_, raw := getJSONAuth(t, ts.URL+"/tenon/pending", tok)
+	var got struct {
+		Items []struct {
+			PlanID string `json:"planId"`
+			State  string `json:"state"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("响应坏：%v", err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("应看到 1 条，得到 %+v", got.Items)
+	}
+	if got.Items[0].State != "awaiting_approval" {
+		t.Fatalf("缺省 state 必须是 awaiting_approval（不是空串），得到 %q（完整响应：%s）",
+			got.Items[0].State, raw)
+	}
+	// 缺省值要落在板上，而不是只在响应时现算：Upsert 是唯一的写入口。
+	s.pending.mu.RLock()
+	stored := s.pending.items["pln_legacy"].State
+	s.pending.mu.RUnlock()
+	if stored != "awaiting_approval" {
+		t.Fatalf("公告板上存的缺省 state 应是 awaiting_approval，得到 %q", stored)
+	}
+}
+
+// host 不解释 items 的内容：带 detail 进来就要原样带回去（页面靠它渲染折叠区）。
+func TestPendingBoardKeepsItemDetail(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, Config{
+		AuditPath:     dir + "/audit.jsonl",
+		SessionSecret: []byte("secret"),
+		InboundDir:    dir + "/inbound",
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	agentTok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", []string{roleAgent}, time.Now().UTC(), time.Hour)
+	body := `{"planId":"pln_1","summary":"扣减 STD-1002 库存 3 件","state":"awaiting_approval",
+	          "requiredRoles":["role:warehouse_manager"],"expiresAt":"2099-01-01T00:00:00Z",
+	          "items":[{"label":"扣减 STD-1002 库存 3 件","detail":"inventory.DeductStock（{\"qty\":3}）"}]}`
+	if status, resp := postJSONAuth(t, ts.URL+"/tenon/pending", agentTok, body); status != http.StatusOK {
+		t.Fatalf("推公告板失败 %d：%s", status, resp)
+	}
+	code, raw := getJSONAuth(t, ts.URL+"/tenon/pending", agentTok)
+	if code != http.StatusOK || !strings.Contains(raw, `"detail":"inventory.DeductStock`) {
+		t.Fatalf("detail 没有被透传：%d %s", code, raw)
 	}
 }

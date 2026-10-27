@@ -1,0 +1,44 @@
+#!/bin/sh
+# pre-push：push 之前跑一遍与 CI 相同的检查。
+#
+# 为什么存在：.github/workflows/ci.yml 需要一个带 workflow scope 的凭据才能推上去；
+# 在拿到之前，这条钩子是**等效的本地防线**——它拦的正是 CI 会拦的东西
+# （gofmt 漂移、vet 失败、测试红）。曾经有过一个会过期的时间夹具在特性分支上
+# 躺了一整天，就是因为没有这道闸。
+#
+# 跳过：SKIP_PRE_PUSH=1 git push ...（只在明确知道为什么时才用）
+
+set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+log="$repo_root/.git/pre-push-test.log"
+
+if [ -n "$SKIP_PRE_PUSH" ]; then
+	echo "[pre-push] 已按 SKIP_PRE_PUSH 跳过检查（这次没人替你兜底）"
+	exit 0
+fi
+
+echo "[pre-push] gofmt"
+drift=$(gofmt -l . 2>/dev/null || true)
+if [ -n "$drift" ]; then
+	echo "[pre-push] 以下文件需要 gofmt："
+	echo "$drift"
+	exit 1
+fi
+
+echo "[pre-push] go vet"
+if ! go vet ./... >/dev/null 2>&1; then
+	go vet ./... || true
+	exit 1
+fi
+
+echo "[pre-push] go test ./... -count=1"
+if ! go test ./... -count=1 >"$log" 2>&1; then
+	echo "[pre-push] 测试失败（完整输出：$log）："
+	tail -n 40 "$log"
+	exit 1
+fi
+
+echo "[pre-push] ok"

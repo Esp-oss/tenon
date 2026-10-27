@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -36,9 +37,15 @@ type fakeHost struct {
 
 	PolicyOutcome string
 	PolicyReasons []string
-	GrantAllowed  bool
-	GrantReason   string
-	FailAuditPost bool
+	// PolicyApprovers 是 policies:evaluate 响应里的 approvers。
+	//
+	// nil 表示用缺省的一个角色：approve 的用例要验的是挂起机制本身，不该被审批人校验
+	// 拦住。显式赋一个非 nil 的切片（空切片也在内）才是在测「没给审批人角色」那条
+	// 独立守卫（见 TestNoApproversDoesNotSuspend）。
+	PolicyApprovers []string
+	GrantAllowed    bool
+	GrantReason     string
+	FailAuditPost   bool
 
 	AuditRecords []map[string]any
 	IntentFrames []map[string]any
@@ -69,10 +76,16 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 		if len(reasons) == 0 {
 			reasons = []string{"TEST_RULE"}
 		}
+		approvers := h.PolicyApprovers
+		if approvers == nil {
+			// 缺省给一个角色：approve 的用例验的是挂起机制，不是审批人校验。
+			// 「策略要求审批却没给审批人角色」由 TestNoApproversDoesNotSuspend 显式覆盖。
+			approvers = []string{"role:approver"}
+		}
 		writeTestJSON(w, http.StatusOK, map[string]any{
 			"outcome":   h.PolicyOutcome,
 			"decidedBy": []string{"pol-test"},
-			"approvers": []string{},
+			"approvers": approvers,
 			"reasons":   reasons,
 		})
 
@@ -129,6 +142,8 @@ type fakeModule struct {
 
 	ModuleID string
 	Actions  []string
+	// Templates 是 action id → 人话模板；空表示该动作没声明（渲染侧走 R2）。
+	Templates map[string]string
 
 	DryRunStatus  string // 默认 verified
 	DryRunMissing bool   // 声明「不支持预演」：回 404 空体
@@ -162,7 +177,11 @@ func (m *fakeModule) serve(w http.ResponseWriter, r *http.Request) {
 		m.mu.Unlock()
 		actions := make([]map[string]any, 0, len(m.Actions))
 		for _, id := range m.Actions {
-			actions = append(actions, map[string]any{"id": id, "version": "0.1.0", "title": id, "kind": "write"})
+			item := map[string]any{"id": id, "version": "0.1.0", "title": id, "kind": "write"}
+			if tpl, ok := m.Templates[id]; ok {
+				item["summaryTemplate"] = tpl
+			}
+			actions = append(actions, item)
 		}
 		writeTestJSON(w, http.StatusOK, map[string]any{
 			"tenon":   "0.1",
@@ -374,19 +393,328 @@ func TestPolicyDeniedGoesNeedsHumanWithoutWorkaround(t *testing.T) {
 	}
 }
 
+// approve 命中、但**没有挂起通道**（Deps.State 为 nil）→ 仍转人工，且不带 pendingPlanId。
+//
+// 这是 M0.5 行为的保留路径：没有状态目录时 approve 只能是「人来按」，不能假装能挂起。
+// 「没有挂起通道」的唯一表达就是 State 为 nil——空串会被 NewStateStore 拒绝（§0.1.6）。
 func TestPolicyApproveGoesNeedsHumanWithoutApprovalChannel(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{planJSON("pln_approve01", testStep{id: "s1", action: "inventory.DeductStock"})}
 	env.Host.PolicyOutcome = "approve"
 
-	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+	deps := env.Deps()
+	deps.State = nil
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
 
-	// 只有 auto 允许自动执行：approve 要人来按，而 M0.5 没有确认通道。
+	// 三态封闭：转人工就是 needs_human，不新增第四态。
 	if res.Outcome != OutcomeNeedsHuman {
 		t.Fatalf("approve 必须转人工，得到 %q（%s）", res.Outcome, res.Detail)
 	}
+	if res.PendingPlanID != nil {
+		t.Fatalf("没有挂起通道时不该报 pendingPlanId，得到 %q", *res.PendingPlanID)
+	}
 	if env.Module.WriteCalls != 0 {
 		t.Fatalf("没有人批准就不能执行写动作，实际 write=%d", env.Module.WriteCalls)
+	}
+	// 授权与预演必须在「挂起还是转人工」之前跑完（fail-closed 要早）：一份注定过不了
+	// 授权或预演的计划，不该挂上公告板等人白批一次。
+	want := []string{"policies:evaluate", "grants:evaluate", "dry-run"}
+	if !equalSeq(env.Trace, want) {
+		t.Fatalf("approve 未放行时仍要先跑完授权与预演：实际 %v，期望 %v", env.Trace, want)
+	}
+	// 事件回合的 Request 必须保持 nil：多一个空请求块，prompt 就把「事实」读成「指令」。
+	if strings.Contains(env.LLM.LastUser, "用户请求") {
+		t.Fatalf("事件回合不该出现用户请求块：\n%s", env.LLM.LastUser)
+	}
+}
+
+// approve 且配置了状态目录 → 挂起：结局仍是 needs_human，但带 pendingPlanId。
+func TestPolicyApproveSuspendsWhenChannelConfigured(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	env.LLM.replies = []string{planJSON("pln_appr01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "approve"
+
+	deps := env.Deps()
+	deps.State = store
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("挂起后结局仍是 needs_human（三态封闭），得到 %q", res.Outcome)
+	}
+	if res.PendingPlanID == nil || *res.PendingPlanID != "pln_appr01" {
+		t.Fatalf("必须带 pendingPlanId，得到 %+v", res.PendingPlanID)
+	}
+	p, ok, _ := store.Load("pln_appr01")
+	if !ok {
+		t.Fatalf("pending 未落盘")
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("挂起不是执行：write=%d execute=%d", env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+	// pending 必须填全：漏 ExpiresAt 会被 Expired() 的 fail-closed 立刻判过期（§0.1.7），
+	// 漏 labels 则审批人看到的是一张没有白活的卡。
+	if p.ExpiresAt == "" || p.Expired(time.Now()) {
+		t.Fatalf("expiresAt 必须是未来时刻，得到 %q", p.ExpiresAt)
+	}
+	if p.CreatedAt == "" || p.By != "user:alice" || p.TriggerEventID != "evt_test0001" {
+		t.Fatalf("pending 的身份锚点没填全：%+v", p)
+	}
+	if p.Origin != "event" || p.RequestID != nil {
+		t.Fatalf("事件回合的 pending 必须是 origin=event 且 requestId=null：%+v", p)
+	}
+	if len(p.Labels) != 1 || !strings.Contains(p.Labels[0], "inventory.DeductStock") {
+		t.Fatalf("labels 要逐 step 渲染：%+v", p.Labels)
+	}
+	if p.Summary == "" {
+		t.Fatalf("summary 不能为空：%+v", p)
+	}
+	if p.Plan.PlanID != "pln_appr01" || len(p.Plan.Steps) != 1 {
+		t.Fatalf("plan 要存全文（恢复时按原计划执行）：%+v", p.Plan)
+	}
+	if p.AuditSettled != true || p.DispatchedAuditID == "" {
+		t.Fatalf("I7 三次落盘没走完：%+v", p)
+	}
+}
+
+// 策略要求审批、却没给审批人角色 → **不许挂起**，当场转人工。
+//
+// requiredRoles 为空时 rolesIntersect 一律 false（fail-closed），这样的计划谁点都是 403：
+// 挂上去只是一张永远批不掉的卡，占着公告板和审批窗口，还让人白点一次。
+func TestNoApproversDoesNotSuspend(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	env.LLM.replies = []string{planJSON("pln_noappr01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "approve"
+	env.Host.PolicyApprovers = []string{} // 策略要求审批，却没给审批人角色
+
+	deps := env.Deps()
+	deps.State = store
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("没有审批人角色必须转人工，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if res.PendingPlanID != nil {
+		t.Fatalf("没有审批人角色就不许挂起，得到 pendingPlanId=%q", *res.PendingPlanID)
+	}
+	if items, _ := store.List(); len(items) != 0 {
+		t.Fatalf("不该落任何 pending：%+v", items)
+	}
+	if archived, _ := store.ListArchived(); len(archived) != 0 {
+		t.Fatalf("也不该留下归档件（压根没挂起过）：%+v", archived)
+	}
+	if !strings.Contains(res.Detail, "requiredRoles 为空") || !strings.Contains(res.Detail, "403") {
+		t.Fatalf("Detail 必须写明「没给审批人角色，谁批都会 403」，得到 %q", res.Detail)
+	}
+	// 守卫必须在 I7 的三次落盘之前：走到 suspend 会先写一条 dispatched 审计，
+	// 于是盘上留一条谁也不认识的审计幽灵。
+	want := []string{"policies:evaluate", "grants:evaluate", "dry-run"}
+	if !equalSeq(env.Trace, want) {
+		t.Fatalf("闸门次序不对（守卫应当紧接在预演之后、写审计之前）：实际 %v，期望 %v", env.Trace, want)
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("没挂起就不许执行：write=%d execute=%d", env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+}
+
+// deny 仍然直接转人工，不产生 pending。
+func TestPolicyDenyDoesNotSuspend(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	env.LLM.replies = []string{planJSON("pln_deny01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "deny"
+
+	deps := env.Deps()
+	deps.State = store
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman || res.PendingPlanID != nil {
+		t.Fatalf("deny 不该挂起：%+v", res)
+	}
+	if items, _ := store.List(); len(items) != 0 {
+		t.Fatalf("deny 不该写 pending：%+v", items)
+	}
+	// deny 之后不许再跑授权与预演：拒绝就该立刻停，别给「换个计划再试」留余地。
+	if want := []string{"policies:evaluate"}; !equalSeq(env.Trace, want) {
+		t.Fatalf("deny 之后不该再碰闸门：实际 %v，期望 %v", env.Trace, want)
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("deny 不得执行，实际 write=%d", env.Module.WriteCalls)
+	}
+}
+
+// 未知的策略处置必须 fail-closed：绝不能因为「不认识这个值」就掉进执行。
+//
+// policy.schema.json 是封闭枚举，但宿主的响应不受本包控制（新枚举、被篡改的响应、
+// 中间层塞进来的调试值都可能出现）。这是 approve 走挂起之后留下的一处 fail-open 口子：
+// 只要判断写成「不是 deny 就往下走」，未知值就会一路走到执行。
+func TestUnknownPolicyOutcomeDoesNotExecute(t *testing.T) {
+	env := newFakeEnv(t)
+	env.Host.PolicyOutcome = "maybe" // 未来的新枚举 / 被篡改的响应
+	env.LLM.replies = []string{planJSON("pln_unknown", testStep{id: "s1", action: "inventory.DeductStock"})}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("未知处置应转人工，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	// 只走到策略闸门，不许碰授权/预演/执行。
+	if want := []string{"policies:evaluate"}; !equalSeq(env.Trace, want) {
+		t.Fatalf("闸门次序不对：实际 %v，期望 %v", env.Trace, want)
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("未知处置绝不许执行：write=%d execute=%d", env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+}
+
+// request 回合命中 approve → 同样挂起，只是 origin=request、requestId 有值
+// （spec §6.3：「等审批」只有一条实现路径，不分来源）。
+//
+// 同时锁住 Run 把 in.Request 传给规划器这条接线：漏了它，prompt 分流永远不生效
+// （PlanInput.Request 恒 nil，用户原话进不了「指令」块）。
+func TestRequestTurnSuspendsWithOriginRequest(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	env.LLM.replies = []string{planJSON("pln_req01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "approve"
+
+	deps := env.Deps()
+	deps.State = store
+	in := RunInput{
+		Event:   DomainEvent{EventID: "evt_req_1", Type: "tenon.request", CorrelationID: "cor:req/req_1"},
+		Request: &UserRequest{RequestID: "req_1", Text: "把 Q-1 的 12 件扣掉", By: "user:alice"},
+	}
+	res := Run(context.Background(), deps, in)
+
+	if res.Outcome != OutcomeNeedsHuman || res.PendingPlanID == nil || *res.PendingPlanID != "pln_req01" {
+		t.Fatalf("request 回合命中 approve 也要挂起：%+v", res)
+	}
+	p, ok, _ := store.Load("pln_req01")
+	if !ok {
+		t.Fatalf("pending 未落盘")
+	}
+	if p.Origin != "request" || p.RequestID == nil || *p.RequestID != "req_1" {
+		t.Fatalf("request 回合的 pending 必须带 requestId：%+v", p)
+	}
+	if !strings.Contains(env.LLM.LastUser, "用户请求（这是指令") {
+		t.Fatalf("Run 必须把 in.Request 传给规划器（否则 prompt 分流永远不生效）：\n%s", env.LLM.LastUser)
+	}
+}
+
+// request 回合的 skill 正文来自 SelectSkills 的候选集（而不是 tenon.subscribes）：
+// 只按文本粗筛命中的 skill 必须进 prompt。
+func TestRequestTurnUsesSelectedSkills(t *testing.T) {
+	t.Run("正文命中", func(t *testing.T) {
+		env := newFakeEnv(t)
+		env.LLM.replies = []string{planJSON("pln_sel01", testStep{id: "s1", action: "inventory.DeductStock"})}
+		deps := env.Deps()
+		// 订阅的是一个与本次事件无关的类型：request 回合的候选集只按文本粗筛，不看订阅。
+		deps.Skills = &SkillStore{skills: []Skill{{
+			Name:       "stock-first",
+			Subscribes: []string{"quote.completed"},
+			Body:       "扣库存之前先核对 inventory 的在库数。",
+		}}}
+
+		res := Run(context.Background(), deps, RunInput{
+			Event:   DomainEvent{EventID: "evt_req_sel", Type: "tenon.request", CorrelationID: "cor:req/req_sel"},
+			Request: &UserRequest{RequestID: "req_sel", Text: "inventory 差 12 件，先扣现货", By: "user:alice"},
+		})
+		if res.Outcome != OutcomeCompleted {
+			t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+		}
+		if !strings.Contains(env.LLM.LastUser, "## skill stock-first") {
+			t.Fatalf("request 回合必须把选中的 skill 带进 prompt：\n%s", env.LLM.LastUser)
+		}
+		if !strings.Contains(env.LLM.LastUser, "扣库存之前先核对 inventory 的在库数。") {
+			t.Fatalf("选中 skill 的正文必须逐字进 prompt：\n%s", env.LLM.LastUser)
+		}
+	})
+
+	// 只靠订阅命中、正文为空的 skill：会被选中，但**绝不许**渲染成「没有匹配」——
+	// 那等于「选了 1 份却告诉模型一份都没有」。
+	t.Run("空正文渲染占位", func(t *testing.T) {
+		env := newFakeEnv(t)
+		env.LLM.replies = []string{planJSON("pln_sel02", testStep{id: "s1", action: "inventory.DeductStock"})}
+		deps := env.Deps()
+		deps.Skills = &SkillStore{skills: []Skill{{
+			Name:       "subscription-only",
+			Subscribes: []string{"inventory"}, // 命中靠这里，正文为空
+			Body:       "",
+		}}}
+
+		res := Run(context.Background(), deps, RunInput{
+			Event:   DomainEvent{EventID: "evt_req_sel2", Type: "tenon.request", CorrelationID: "cor:req/req_sel2"},
+			Request: &UserRequest{RequestID: "req_sel2", Text: "inventory 差 12 件，先扣现货", By: "user:alice"},
+		})
+		if res.Outcome != OutcomeCompleted {
+			t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+		}
+		if !strings.Contains(env.LLM.LastUser, "（无正文，仅按订阅命中）") {
+			t.Fatalf("空正文必须渲染成显式占位：\n%s", env.LLM.LastUser)
+		}
+		if strings.Contains(env.LLM.LastUser, "本次没有匹配的 skill 正文") {
+			t.Fatalf("选中的 skill 不许渲染成「没有匹配」——选了却告诉模型没有，候选集就被吞了：\n%s",
+				env.LLM.LastUser)
+		}
+	})
+}
+
+// 事件回合一个字都不许变：skill 正文仍只按 tenon.subscribes 取（TextFor），不经过粗筛。
+func TestEventTurnTextStillSubscription(t *testing.T) {
+	env := newFakeEnv(t)
+	plan := planJSON("pln_evt01", testStep{id: "s1", action: "inventory.DeductStock"})
+	env.LLM.replies = []string{plan, plan, plan}
+
+	run := func(skills *SkillStore) string {
+		deps := env.Deps()
+		deps.Skills = skills
+		res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+		if res.Outcome != OutcomeCompleted {
+			t.Fatalf("回合失败：%q（%s）", res.Outcome, res.Detail)
+		}
+		return env.LLM.LastUser
+	}
+
+	baseline := run(EmptySkills())
+	// ① 一份「按文本一定被 SelectSkills 命中」的 skill，但它没订阅这个事件：
+	//    prompt 必须与基线**逐字相同**（多一个字都说明事件回合被粗筛污染了）。
+	leak := run(&SkillStore{skills: []Skill{{
+		Name:       "text-only",
+		Subscribes: []string{"tenon.request"},
+		Body:       "inventory 的业务语义参考（只该在 request 回合出现）。",
+	}}})
+	if leak != baseline {
+		t.Fatalf("事件回合的 prompt 必须逐字不变（粗筛不许漏进事件回合）：\n 基线 %q\n 实际 %q",
+			baseline, leak)
+	}
+	if strings.Contains(leak, "text-only") {
+		t.Fatalf("没订阅该事件的 skill 不许进事件回合的 prompt：\n%s", leak)
+	}
+	// ② 订阅了事件的 skill 仍然按 TextFor 进 prompt——哪怕正文里没有任何模块名
+	//    （SelectSkills 永远不会选它，事件回合也不该由粗筛决定）。
+	subscribed := run(&SkillStore{skills: []Skill{{
+		Name:       "quote-skill",
+		Subscribes: []string{"quote.completed"},
+		Body:       "报价完成后的业务语义参考，正文里没有任何模块名。",
+	}}})
+	if !strings.Contains(subscribed, "## skill quote-skill") {
+		t.Fatalf("订阅了事件的 skill 必须按 TextFor 进 prompt：\n%s", subscribed)
+	}
+	if subscribed == baseline {
+		t.Fatalf("订阅了事件的 skill 必须改变 prompt（TextFor 仍在用）")
 	}
 }
 
@@ -608,6 +936,93 @@ func TestAuditRecordsTwoSegments(t *testing.T) {
 	}
 }
 
+// F1 的反面：auto 路径没有人批准过，step 级两段的 decision.approvedBy 必须是 null。
+// 恢复路径给 step 级审计填审批人时，若把 gate（以及 auditBase）的取值搞混，这条会先红。
+func TestAuditAutoPathKeepsApprovedByNull(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_auto0003", testStep{id: "s1", action: "inventory.DeductStock"})}
+	_ = Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if len(env.Host.AuditRecords) != 2 {
+		t.Fatalf("期望 dispatched + result 两段，实际 %d 条", len(env.Host.AuditRecords))
+	}
+	for _, rec := range env.Host.AuditRecords {
+		decision, _ := rec["decision"].(map[string]any)
+		if decision["outcome"] != outcomeAuto {
+			t.Fatalf("auto 路径的 decision.outcome 应为 %q，实际 %v", outcomeAuto, decision["outcome"])
+		}
+		if got := decision["approvedBy"]; got != nil {
+			t.Fatalf("auto 路径的 decision.approvedBy 必须是 null（那条路径确实没人批），实际 %#v", got)
+		}
+	}
+}
+
+// F2：人工请求回合的业务链锚点必须是**合法**的 cor: 值。
+// 判据在 schema（common.schema.json#/$defs/CorrelationId 的 ^cor:\S+$），不在实现里；
+// 原先直接把 by（user:alice）当锚点，落进审计 trigger.correlationId 就是一条不合规记录。
+func TestAuditRequestCorrelationIDIsSchemaValid(t *testing.T) {
+	// 与 common.schema.json 的 CorrelationId 模式逐字相同。
+	correlationIDPattern := regexp.MustCompile(`^cor:\S+$`)
+
+	for _, requestID := range []string{"req_01JB0TEST", "req_FAKE"} {
+		got := RequestCorrelationID(requestID)
+		if got != "cor:request/"+requestID {
+			t.Fatalf("锚点形状应为 cor:request/<requestId>，实际 %q", got)
+		}
+		if !correlationIDPattern.MatchString(got) {
+			t.Fatalf("锚点 %q 不满足 CorrelationId 模式 ^cor:\\S+$", got)
+		}
+		// 业务键必须来自 requestId：「谁问的」不在这里重复表达。
+		if strings.Contains(got, "user:") {
+			t.Fatalf("锚点不许拿身份当业务键，实际 %q", got)
+		}
+	}
+}
+
+// request 回合把锚点一路带进审计：run.go 用 RunInput.CorrelationID 覆盖 plan.Trigger，
+// 审计 trigger 也取自它。这里断言审计里是 cor:request/<requestId>，而「谁问的」仍在
+// actor.onBehalfOf——两者不互相冒充。
+func TestAuditRequestTurnCorrelationIsCorAnchor(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	const requestID = "req_cor01"
+	anchor := RequestCorrelationID(requestID)
+	env.LLM.replies = []string{planJSON("pln_cor01", testStep{id: "s1", action: "inventory.GetStock", kind: "read"})}
+
+	deps := env.Deps()
+	deps.State = store
+	res := Run(context.Background(), deps, RunInput{
+		Event:         DomainEvent{EventID: "evt_req_cor01", Type: "tenon.request", CorrelationID: anchor},
+		CorrelationID: anchor,
+		Request:       &UserRequest{RequestID: requestID, Text: "查一下 STD-1002 的库存", By: "user:alice"},
+	})
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+
+	correlationIDPattern := regexp.MustCompile(`^cor:\S+$`)
+	if len(env.Host.AuditRecords) != 2 {
+		t.Fatalf("一步计划应写 dispatched + result 两段，实际 %d 条", len(env.Host.AuditRecords))
+	}
+	for _, rec := range env.Host.AuditRecords {
+		trigger, _ := rec["trigger"].(map[string]any)
+		got, _ := trigger["correlationId"].(string)
+		if got != anchor {
+			t.Fatalf("审计 trigger.correlationId 应为 %q，实际 %q", anchor, got)
+		}
+		if !correlationIDPattern.MatchString(got) {
+			t.Fatalf("审计 trigger.correlationId %q 不满足 ^cor:\\S+$", got)
+		}
+		actor, _ := rec["actor"].(map[string]any)
+		if actor["onBehalfOf"] != "user:alice" {
+			t.Fatalf("「谁问的」必须仍由 actor.onBehalfOf 承载，实际 %v", actor["onBehalfOf"])
+		}
+	}
+}
+
 func TestIntentFrameSentOnCompleted(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{planJSON("pln_intent001", testStep{id: "s1", action: "inventory.DeductStock"})}
@@ -629,7 +1044,6 @@ func TestIntentFrameSentOnCompleted(t *testing.T) {
 		t.Fatalf("第一帧动作不对：%v", first)
 	}
 }
-
 func TestPlanSchemaFailureIsFailedNotNeedsHuman(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{`{"planId":"pln_broken1","steps":"oops"}`}
@@ -678,4 +1092,80 @@ func writeTestError(w http.ResponseWriter, status int, class, code, message stri
 			"retryable": class == "retryable",
 		},
 	})
+}
+
+// newRunnerForDiscover 造一个只够跑 discover 的 runner：宿主注册表指向假模块。
+func newRunnerForDiscover(t *testing.T, moduleBase string) *runner {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tenon/modules" {
+			http.NotFound(w, r)
+			return
+		}
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"modules": []map[string]any{{"id": "inventory", "baseURL": moduleBase, "enabled": true}},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return &runner{host: srv.URL, client: srv.Client()}
+}
+
+// 模板必须随能力发现一起到 agent 手里：它是渲染白话的唯一来源，
+// 少了它就只能退回 R2（标题 + 参数），卡上读不到「扣减 … 库存 3 件」这种话。
+func TestDiscoverCarriesActionMeta(t *testing.T) {
+	mod := newFakeModule(t, "inventory", []string{"inventory.DeductStock"}, new([]string))
+	mod.Templates = map[string]string{
+		"inventory.DeductStock": "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）",
+	}
+	r := newRunnerForDiscover(t, mod.Server.URL)
+
+	got, err := r.discover(context.Background())
+	if err != nil {
+		t.Fatalf("能力发现失败：%v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("期望 1 个模块，得到 %d", len(got))
+	}
+	meta, ok := got[0].ActionMeta["inventory.DeductStock"]
+	if !ok {
+		t.Fatalf("ActionMeta 缺 inventory.DeductStock：%+v", got[0])
+	}
+	if meta.SummaryTemplate != "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）" {
+		t.Fatalf("模板不符：%q", meta.SummaryTemplate)
+	}
+	if meta.Title == "" {
+		t.Fatalf("Title 也要带走（R2 兜底要用）")
+	}
+}
+
+// 挂起时渲染一次并落盘：labels 是白话、details 是技术原文、summary 是白话拼接。
+//
+// 注意 runner.modules 是 map[string]string（模块 → 基地址），**不携带**模板；
+// 发现结果（[]ModuleDigest）只在 run() 里以局部变量 digest 存在，所以元信息
+// 是以参数传进 buildPending 的，不挂在 runner 上。
+func TestBuildPendingRendersPlainLanguage(t *testing.T) {
+	meta := map[string]ActionMeta{
+		"inventory.DeductStock": {Title: "扣减库存", SummaryTemplate: "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）"},
+	}
+	r := &runner{
+		deps:  Deps{OnBehalfOf: "user:alice"},
+		event: DomainEvent{Subject: json.RawMessage(`"inventory:SKU/STD-1002"`)},
+	}
+	plan := Plan{PlanID: "pln_1", Trigger: PlanTrigger{EventID: "evt_1"}, Steps: []PlanStep{{
+		StepID: "s1", Action: "inventory.DeductStock", Kind: "write",
+		Args: json.RawMessage(`{"sku":"STD-1002","qty":3,"referenceNo":"Q-2026-0417"}`),
+	}}}
+	got, err := r.buildPending(plan, policyEvaluation{Approvers: []string{"role:warehouse_manager"}}, meta)
+	if err != nil {
+		t.Fatalf("buildPending 失败：%v", err)
+	}
+	if want := "扣减 STD-1002 库存 3 件（单据 Q-2026-0417）"; got.Labels[0] != want {
+		t.Fatalf("label = %q，期望 %q", got.Labels[0], want)
+	}
+	if len(got.Details) != 1 || !strings.Contains(got.Details[0], "inventory.DeductStock") {
+		t.Fatalf("details 必须带 action id：%v", got.Details)
+	}
+	if got.Summary != got.Labels[0] {
+		t.Fatalf("单步计划的 summary 应等于该步白话：%q", got.Summary)
+	}
 }

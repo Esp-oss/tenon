@@ -25,9 +25,16 @@ func newInboundServer(t *testing.T) (*Server, *httptest.Server) {
 
 func login(t *testing.T, base string) string {
 	t.Helper()
-	status, body := postJSON(t, base+"/tenon/session", `{"user":"alice","password":"pw"}`)
+	return loginAs(t, base, "alice", "pw")
+}
+
+// loginAs 用指定账号换 token：审批人角色的用例必须换人（不同人握有不同角色）。
+func loginAs(t *testing.T, base, user, password string) string {
+	t.Helper()
+	status, body := postJSON(t, base+"/tenon/session",
+		`{"user":"`+user+`","password":"`+password+`"}`)
 	if status != http.StatusOK {
-		t.Fatalf("登录失败 %d：%s", status, body)
+		t.Fatalf("登录 %s 失败 %d：%s", user, status, body)
 	}
 	var got struct {
 		Token string `json:"token"`
@@ -317,4 +324,168 @@ func TestPoliciesEvaluateMissingTriggerDenies(t *testing.T) {
 	if len(got.DecidedBy) != 0 {
 		t.Fatalf("decidedBy 应为空数组，得到 %v", got.DecidedBy)
 	}
+}
+
+// ---------- tenon.confirm 的审批人角色通道 ----------
+
+// newRolesServer 起一台带两个审批人的控制平面：alice=role:warehouse_clerk、
+// bob=role:warehouse_manager。角色通道的用例都要求「握有不同角色的人各提一次」。
+func newRolesServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	dir := t.TempDir()
+	s := newTestServer(t, Config{
+		AuditPath: dir + "/audit.jsonl",
+		Users: []User{
+			{User: "alice", Password: "pw", Roles: []string{"role:warehouse_clerk"}},
+			{User: "bob", Password: "pw", Roles: []string{"role:warehouse_manager"}},
+		},
+		SessionSecret: []byte("secret"),
+		InboundDir:    dir + "/inbound",
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// lastInboundFrame 用 agent token 轮询入站队列，返回**最后一帧**的字段表。
+//
+// 断言写在「agent 从队列里真会读到什么」上，而不是写在 normalizeInboundFrame 的
+// 返回值上：这一层要保证的是入队结果，函数返回什么只是手段。
+func lastInboundFrame(t *testing.T, ts *httptest.Server) map[string]any {
+	t.Helper()
+	status, body := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", agentToken(t))
+	if status != http.StatusOK {
+		t.Fatalf("poll 失败 %d：%s", status, body)
+	}
+	var got struct {
+		Frames []struct {
+			Frame json.RawMessage `json:"frame"`
+		} `json:"frames"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("poll 响应坏：%v", err)
+	}
+	if len(got.Frames) == 0 {
+		t.Fatalf("入站队列里没有帧：%s", body)
+	}
+	var frame map[string]any
+	if err := json.Unmarshal(got.Frames[len(got.Frames)-1].Frame, &frame); err != nil {
+		t.Fatalf("帧不是 JSON 对象：%v", err)
+	}
+	return frame
+}
+
+// frameRoles 从帧字段表里取 roles。第二个返回值区分「没有这个键」与「空集合」：
+// 两者是不同的事实——前者是通道没接上，后者才是 fail-closed 的空角色集。
+func frameRoles(t *testing.T, frame map[string]any) ([]string, bool) {
+	t.Helper()
+	raw, ok := frame["roles"]
+	if !ok {
+		return nil, false
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("roles 必须是数组，得到 %T（%v）", raw, raw)
+	}
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("roles 里出现了非字符串：%v", v)
+		}
+		out = append(out, s)
+	}
+	return out, true
+}
+
+// 审批人角色只能来自宿主验证过的 token：tenon.confirm 帧里的 roles 由 claims.Roles
+// 覆写，客户端自报的一律丢弃（自报等于让人自己给自己发审批权限）。
+func TestConfirmFrameRoles(t *testing.T) {
+	t.Run("客户端自报的角色被丢弃", func(t *testing.T) {
+		ts := newRolesServer(t)
+		// alice 只有 role:warehouse_clerk，却在帧里自报 role:warehouse_manager 与 user:bob。
+		tok := loginAs(t, ts.URL, "alice", "pw")
+		status, body := postJSONAuth(t, ts.URL+"/tenon/requests", tok,
+			`{"type":"tenon.confirm","confirmId":"cfm_roles1","planId":"pln_roles1",
+			  "decision":"approve","patch":null,"roles":["role:warehouse_manager"],
+			  "by":"user:bob","at":"2026-10-27T09:00:00Z"}`)
+		if status != http.StatusOK {
+			t.Fatalf("入队失败 %d：%s", status, body)
+		}
+		frame := lastInboundFrame(t, ts)
+		roles, ok := frameRoles(t, frame)
+		if !ok {
+			t.Fatal("confirm 帧必须带 roles 字段（通道没接上）：客户端自报的角色被删掉后要写入 token 的角色")
+		}
+		if len(roles) != 1 || roles[0] != "role:warehouse_clerk" {
+			t.Fatalf("roles 必须被 token 的 claims.Roles 覆写，得到 %v", roles)
+		}
+		if frame["by"] != "user:alice" {
+			t.Fatalf("by 也必须被 token 覆写（客户端自称 user:bob 无效），得到 %v", frame["by"])
+		}
+	})
+
+	t.Run("token 角色写进帧", func(t *testing.T) {
+		ts := newRolesServer(t)
+		// bob 是 role:warehouse_manager，帧里一个 roles 字段都没带：token 角色仍须写进去。
+		tok := loginAs(t, ts.URL, "bob", "pw")
+		status, body := postJSONAuth(t, ts.URL+"/tenon/requests", tok,
+			`{"type":"tenon.confirm","confirmId":"cfm_roles2","planId":"pln_roles2",
+			  "decision":"approve","patch":null,"by":"user:alice","at":"2026-10-27T09:00:00Z"}`)
+		if status != http.StatusOK {
+			t.Fatalf("入队失败 %d：%s", status, body)
+		}
+		roles, ok := frameRoles(t, lastInboundFrame(t, ts))
+		if !ok {
+			t.Fatal("confirm 帧必须带 roles 字段（通道没接上）")
+		}
+		if len(roles) != 1 || roles[0] != "role:warehouse_manager" {
+			t.Fatalf("帧里 roles 必须是 token 的 claims.Roles，得到 %v", roles)
+		}
+	})
+
+	t.Run("无角色 token 得到空角色集", func(t *testing.T) {
+		ts := newRolesServer(t)
+		// 没有角色的 token：帧里必须是**空集**，不能凭空补一个角色（fail-closed 由 agent 侧
+		// 的 rolesIntersect 兑现：空集 ∩ requiredRoles = ∅ ⇒ approve 403）。
+		tok, err := SignToken([]byte("secret"), "user:carol", nil, time.Now().UTC(), time.Hour)
+		if err != nil {
+			t.Fatalf("签发无角色 token 失败：%v", err)
+		}
+		status, body := postJSONAuth(t, ts.URL+"/tenon/requests", tok,
+			`{"type":"tenon.confirm","confirmId":"cfm_roles3","planId":"pln_roles3",
+			  "decision":"approve","patch":null,"roles":["role:warehouse_manager"],
+			  "by":"user:carol","at":"2026-10-27T09:00:00Z"}`)
+		if status != http.StatusOK {
+			t.Fatalf("入队失败 %d：%s", status, body)
+		}
+		roles, ok := frameRoles(t, lastInboundFrame(t, ts))
+		if !ok {
+			t.Fatal("即便 token 没有角色，帧里的 roles 字段也必须存在（空集而不是缺键）")
+		}
+		if len(roles) != 0 {
+			t.Fatalf("token 没有任何角色时帧里不能出现角色（不给默认角色），得到 %v", roles)
+		}
+	})
+
+	t.Run("无 token 仍 401 且不入队", func(t *testing.T) {
+		ts := newRolesServer(t)
+		status, _ := postJSON(t, ts.URL+"/tenon/requests",
+			`{"type":"tenon.confirm","confirmId":"cfm_roles4","planId":"pln_roles4",
+			  "decision":"approve","patch":null,"roles":["role:warehouse_manager"],
+			  "by":"user:bob","at":"2026-10-27T09:00:00Z"}`)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("未鉴权的 confirm 应 401，得到 %d", status)
+		}
+		_, pollBody := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", agentToken(t))
+		var poll struct {
+			Frames []json.RawMessage `json:"frames"`
+		}
+		if err := json.Unmarshal([]byte(pollBody), &poll); err != nil {
+			t.Fatalf("poll 响应坏：%v", err)
+		}
+		if len(poll.Frames) != 0 {
+			t.Fatalf("401 之后不能留下任何帧（客户端自报的角色更不该活着进队列），得到 %d 帧", len(poll.Frames))
+		}
+	})
 }

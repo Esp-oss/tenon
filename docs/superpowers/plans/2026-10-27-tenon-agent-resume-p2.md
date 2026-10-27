@@ -65,11 +65,13 @@
 
 ## Task 1: 状态目录与 `Pending` 读写
 
+**状态：✅ 已完成（commit `3421ff0`）**
+
 **Files:**
 - Create: `internal/agent/state.go`
 - Test: `internal/agent/state_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -178,12 +180,12 @@ func TestPendingExpired(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestStateStore|TestPendingExpired' -count=1`
 Expected: `undefined: Pending`
 
-- [ ] **Step 3: 实现 `state.go`**
+- [x] **Step 3: 实现 `state.go`**
 
 ```go
 package agent
@@ -412,12 +414,12 @@ func listPendingDir(dir string) ([]Pending, error) {
 }
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestStateStore|TestPendingExpired' -count=1 -v`
 Expected: 4 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/state.go internal/agent/state_test.go
@@ -428,11 +430,13 @@ git commit -m "feat(agent): 状态目录与 Pending 读写（tmp+rename 原子�
 
 ## Task 2: 去重账本（write-ahead）
 
+**状态：✅ 已完成（commit `92815e3`）**
+
 **Files:**
 - Create: `internal/agent/ledger.go`
 - Test: `internal/agent/ledger_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -486,12 +490,12 @@ func TestLedgerDoneRecorded(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestLedger' -count=1`
 Expected: `undefined: NewLedger`
 
-- [ ] **Step 3: 实现 `ledger.go`**
+- [x] **Step 3: 实现 `ledger.go`**
 
 ```go
 package agent
@@ -607,12 +611,12 @@ func (l *Ledger) append(e ledgerEntry) error {
 }
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestLedger' -count=1 -v`
 Expected: 3 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/ledger.go internal/agent/ledger_test.go
@@ -623,12 +627,14 @@ git commit -m "feat(agent): requestId 去重账本（write-ahead，claimed 落�
 
 ## Task 3: 挂起的三次落盘（I7）与崩溃分流
 
+**状态：✅ 已完成（commit `3302ac5` + 审计补丁 `c97277e`）**
+
 **Files:**
 - Create: `internal/agent/suspend.go`
 - Modify: `internal/agent/state.go`（只加 `CountCorrupt` 与改准一句注释）
 - Test: `internal/agent/suspend_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -766,12 +772,12 @@ func TestSelfCheckCountsCorruptFiles(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestSuspend|TestSelfCheck' -count=1`
 Expected: `undefined: suspend`
 
-- [ ] **Step 3: 实现 `suspend.go`**
+- [x] **Step 3: 实现 `suspend.go`**
 
 ```go
 package agent
@@ -983,12 +989,12 @@ func postJSONWith(ctx context.Context, client *http.Client, url string, body any
 
 （`import` 需补 `bytes`、`encoding/json`、`io`。）
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestSuspend|TestSelfCheck' -count=1 -v`
 Expected: 4 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/suspend.go internal/agent/suspend_test.go
@@ -999,11 +1005,13 @@ git commit -m "feat(agent): 挂起的 I7 三次落盘与自检分流"
 
 ## Task 4: host 客户端（登录 / 重登 / 入站 poll+ack / 公告板）
 
+**状态：✅ 已完成（commit `f192b94`）**
+
 **Files:**
 - Create: `internal/agent/hostapi.go`
 - Test: `internal/agent/hostapi_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -1097,12 +1105,12 @@ func TestHostClientReLoginsOnUnauthorized(t *testing.T) {
 func itoa(n int) string { return string(rune('0' + n)) }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestHostClient' -count=1`
 Expected: `undefined: NewHostClient`
 
-- [ ] **Step 3: 实现 `hostapi.go`**
+- [x] **Step 3: 实现 `hostapi.go`**
 
 ```go
 package agent
@@ -1299,12 +1307,12 @@ func getJSONWith(ctx context.Context, client *http.Client, url string, headers m
 }
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestHostClient' -count=1 -v`
 Expected: 2 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/hostapi.go internal/agent/hostapi_test.go
@@ -1315,11 +1323,13 @@ git commit -m "feat(agent): host 入站客户端（登录/单飞重登/poll/ack/
 
 ## Task 5: skill 确定性粗筛
 
+**状态：✅ 已完成（commit `c439cf5`；确定性补丁在 `sort.SliceStable`）**
+
 **Files:**
 - Create: `internal/agent/skillselect.go`
 - Test: `internal/agent/skillselect_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -1361,12 +1371,12 @@ func TestSelectSkillsEmptyWhenNoMatch(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestSelectSkills' -count=1`
 Expected: `undefined: SelectSkills`
 
-- [ ] **Step 3: 实现 `skillselect.go`**
+- [x] **Step 3: 实现 `skillselect.go`**
 
 ```go
 package agent
@@ -1429,12 +1439,12 @@ func SelectSkills(skills []Skill, text, viewModule string, limit int) []Skill {
 
 > `Skill` 现在只有 `Name` / `Subscribes` / `Body` 三个字段（`planner.go:375`）。若字段名不同，按实际改名——**不要新增字段**。
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestSelectSkills' -count=1 -v`
 Expected: 3 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/skillselect.go internal/agent/skillselect_test.go
@@ -1445,11 +1455,13 @@ git commit -m "feat(agent): skill 确定性粗筛（request 回合无事件类�
 
 ## Task 6: prompt 分流（用户请求是「指令」，事件是「事实」）
 
+**状态：✅ 已完成（commit `5947b23`）**
+
 **Files:**
 - Modify: `internal/agent/planner.go`（`PlanInput` 加字段、`userPrompt` 增块）
 - Test: `internal/agent/planner_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 func TestUserPromptSeparatesRequestFromEvent(t *testing.T) {
@@ -1474,12 +1486,12 @@ func TestUserPromptSeparatesRequestFromEvent(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestUserPromptSeparatesRequest' -count=1`
 Expected: `unknown field Request in struct literal of type PlanInput`
 
-- [ ] **Step 3: 改 `planner.go`**
+- [x] **Step 3: 改 `planner.go`**
 
 `PlanInput` 增字段：
 
@@ -1510,12 +1522,12 @@ type UserRequest struct {
 	}
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestUserPrompt' -count=1 -v && go test ./internal/agent/ -count=1`
 Expected: 新增用例 PASS，且既有 planner 用例全绿
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/planner.go internal/agent/planner_test.go
@@ -1526,12 +1538,22 @@ git commit -m "feat(agent): prompt 分流（用户请求指令块与事件事实
 
 ## Task 7: `round()` 闸门重构 + `approve` 走挂起
 
+**状态：✅ 已完成（commit `9abd389`）**
+
+**Task 6 复核后追加的接线要求（比正文更权威）**
+
+1. **`run.go:178` 的 `PlanInput` 构造必须补 `Request: r.request`**：`runner` 需要一个 `request *UserRequest` 字段，`Run()` 从 `in.Request` 赋值。漏了这一处，Task 6 的 prompt 分流永远不生效（`PlanInput.Request` 恒 nil）。
+2. **事件回合的 `Request` 必须保持 nil**：塞一个非 nil（哪怕 `Text` 为空）的 `UserRequest`，所有事件回合 prompt 都会多出一个空指令块，`TestUserPromptOmitsRequestBlockWhenNil` 立刻红。
+3. **`suspend` 不填 `CreatedAt`/`ExpiresAt`**：`buildPending` 必须自己填 `ExpiresAt = now.Add(pendingTTL)`；`pendingTTL` 已在 `suspend.go` 声明，**不要重复声明**。漏填会让 `Expired()` 对空串 fail-closed 返回 true，下一轮自检立刻把这份 pending 归档成 `expired`。
+4. **`suspend` 失败会把 pending 归档成 `stale` 再返回 error**：调用方映射成 `needs_human`（不是 `failed`），且**不要用同一份 pending 重试**——重复调用会复用同一个 `auditId`，审计链出现重复记录。
+5. **别把整帧 `json.Unmarshal` 进 `UserRequest`**：它没有 json tag，Go 字段匹配大小写不敏感，"碰巧能 work" 靠的是意外行为。帧→`UserRequest` 的显式映射（`text→Text`、`by→By`）属于 Task 10 的 `handleInbound`；本任务只消费构造好的 `*UserRequest`。
+
 **Files:**
 - Modify: `internal/agent/run.go`（`RunInput`/`RunResult`、`round()`、`Run()`）
 - Modify: `internal/agent/run_test.go`（改既有 approve 用例）
 - Test: `internal/agent/run_test.go`
 
-- [ ] **Step 1: 改既有用例并新增失败测试**
+- [x] **Step 1: 改既有用例并新增失败测试**
 
 把 `TestPolicyApproveGoesNeedsHumanWithoutApprovalChannel` 的语义改成「**没有挂起通道时**才转人工」：给 `Deps` 传 `State` 为 nil，断言仍是 `needs_human` 且 `PendingPlanID == nil`。
 
@@ -1581,12 +1603,12 @@ func TestPolicyDenyDoesNotSuspend(t *testing.T) {
 
 > `newRunEnv` / `env.RunOnce` / `planJSON` / `testStep` 都是 `run_test.go` 里**已有**的测试设施（若名字不同，按实际改名，不要新造一套）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestPolicyApprove|TestPolicyDenyDoesNotSuspend' -count=1`
 Expected: `Deps.State` 不存在 / 用例失败
 
-- [ ] **Step 3: 改 `run.go`**
+- [x] **Step 3: 改 `run.go`**
 
 `Deps` 增：
 
@@ -1702,12 +1724,12 @@ func renderLabels(plan Plan) ([]string, error) {
 
 > 说明：真正的人话模板来自模块 manifest 的 `summaryTemplate`，P1 已加 schema 字段但模块尚未填。本任务先用「动作 id + 参数摘要」兜底，**并在代码注释里写明这条兜底**；P3 渲染前再补模板。这不是占位——它是计划明确接受的降级。
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -count=1`
 Expected: 全绿（含改过的 approve 用例与新增两条）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/run.go internal/agent/run_test.go internal/agent/suspend.go
@@ -1718,11 +1740,55 @@ git commit -m "feat(agent): approve 走挂起；闸门顺序改为全部过完�
 
 ## Task 8: 恢复执行（校验审批人 → 过期 → G4 → policy → 执行 → 归档）
 
+**状态：✅ 已完成（commit `eaa64d7`，10 条用例）**
+
+**Task 7 复核后追加的要求（比正文更权威）**
+
+**Step 0（先做，关掉一个 fail-open 口子）**：Task 7 补了「策略处置不是 auto/approve 就转人工」的分支，但**没有用例**。先补一条：
+
+```go
+// 未知的策略处置必须 fail-closed：绝不能因为"不认识这个值"就掉进执行。
+func TestUnknownPolicyOutcomeDoesNotExecute(t *testing.T) {
+	env := newFakeEnv(t)
+	env.Host.PolicyOutcome = "maybe" // 未来的新枚举 / 被篡改的响应
+	env.LLM.replies = []string{planJSON("pln_unknown", testStep{id: "s1", action: "inventory.DeductStock"})}
+	deps := env.Deps()
+	res := Run(context.Background(), deps, RunInput{Event: env.Event()})
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("未知处置应转人工，得到 %q", res.Outcome)
+	}
+	// 只走到策略闸门，不许碰授权/预演/执行。
+	if !equalSeq(env.Host.Trace(), []string{"policies:evaluate"}) {
+		t.Fatalf("闸门次序不对：%v", env.Host.Trace())
+	}
+}
+```
+
+（`newFakeEnv` / `env.Deps()` / `env.Host` / `equalSeq` 都是 `run_test.go` 里**已有**的设施；字段名以实际为准，不要新造。）
+
+**Step 0b（恢复路径必须自己装模块清单）**：`r.modules` 只在 `run()` 的 `discover()` 里填，`moduleBase()` 靠它。`resume` **不能复用 `round()`**（它含规划与二次挂起），但必须自己 `discover(ctx)` 后再走 `executeStep`，否则每步都报"动作所属模块不在可达清单里"。
+
+**Step 0c（补 `Subject`，别让审计丢实体）**：`Pending` 现在只存 `TriggerEventID` + `Plan.Trigger.CorrelationID`，事件的 `subject` 丢了 → 恢复后 `entities()`/`target()` 退化成空数组（审计 `effects.entities=[]`、Intent 帧 `actions=[]`）。**加一个字段**（改 `state.go`，本任务允许）：
+
+```go
+	// Subject 是触发事件的实体寻址（domain-event 的 subject 原样）。审计与 Intent 帧都要它，
+	// 而 TriggerEventID 只够锚定事件、锚不住"哪个实体"。
+	Subject json.RawMessage `json:"subject,omitempty"`
+```
+
+`buildPending`（Task 7 已落地）要补填 `Subject: r.event.Subject`；`resume` 组装 `runner` 时把 `event.Subject` 填回去。补一条用例：恢复执行的审计里 `effects.entities` 非空。
+
+**Step 0d（`approvedBy` 需要通道）**：`gateDecision` 没有 `approvedBy`，`auditBase` 硬写 `decision.ApprovedBy: nil`。恢复执行时**不要复用 `auditBase` 写 result 段**——直接用计划里给的 `writePlanResult`（它自己填 `approvedBy`），并且**不要**把 `decision.outcome` 从 `approve` 改写成 `auto`（`TestAuditRecordsTwoSegments` 锁了"outcome=闸门处置、policyId=策略 id"）。
+
+**Step 0e**：`grantIDs` 不落盘，恢复必须**重跑** `grants:evaluate`（spec §5 也这么要求），别从 pending 里找命中的 grant。
+
 **Files:**
 - Create: `internal/agent/resume.go`
+- Modify: `internal/agent/state.go`（加 `Subject` 字段）
+- Modify: `internal/agent/suspend.go`（`renderLabels` 所在文件；若需补 `Subject` 的填充逻辑在 `run.go`，按实际情况）
 - Test: `internal/agent/resume_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // 合法审批人 → 执行全部步骤 → result 段带 approvedBy → 归档 done。
@@ -1823,12 +1889,12 @@ func TestResumeIdempotentOnReplay(t *testing.T) {
 
 > 这些测试依赖一个测试装配器 `newResumeEnv`（假 host + 假模块 + 状态目录）。**在 `resume_test.go` 里自己写它**，结构参考 `run_test.go` 的既有假 host：`env.Host` 记录审计与策略、`env.Module` 记录执行与库存。不要改 `run_test.go` 的既有设施。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestResume' -count=1`
 Expected: `undefined: resumeConfirm`（或同类）
 
-- [ ] **Step 3: 实现 `resume.go`**
+- [x] **Step 3: 实现 `resume.go`**
 
 ```go
 package agent
@@ -2024,14 +2090,14 @@ func (r *runner) writePlanResult(ctx context.Context, p Pending, approvedBy, err
 }
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go run ./cmd/tenon d1 run --help`（确保工具链仍可用）→ 忽略
 
 Run: `go test ./internal/agent/ -run 'TestResume' -count=1 -v`
 Expected: 6 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/resume.go internal/agent/resume_test.go
@@ -2042,12 +2108,22 @@ git commit -m "feat(agent): 恢复执行（审批人/过期/G4/policy/归档）"
 
 ## Task 9: 公告板重推与终态覆盖
 
+**状态：✅ 已完成（commit `15f3438`，5 条用例）；但终态覆盖无生产调用点 + host 侧缺 `state` 字段 → Task 9b 补**
+
+**Task 8 复核后追加的要求（比正文更权威）**
+
+1. **`finishTerminal` 只推公告板，绝不再写 result 段**：`resume.go` 已在归档前写好计划级 result（`auditId = DispatchedAuditID`）。计划正文那句「写计划级 result 段并推终态覆盖」的注释是**错的**——照它再写一次，同一 auditId 会出现两条 result 段（计划级变三条记录）。
+2. **`RepushBoard` 要跳过「archived 里已有同名终态」的 pending**：`Archive` 的两步（写归档件 → 删 pending 件）之间失败会留下同名双份，`List()` 仍会返回它，重推会让板上挂一张**早已完成的卡**直到过期。实现：重推前查 `LoadArchived(planId)`，命中终态就跳过（并顺手删掉残留 pending，附日志）。
+3. **`state=resuming` 不要按 awaiting 重推**：它是崩溃标记（confirm 已被接受过），重推成"待批"会让审批人再点一次。
+4. **reject 分支不写 result 段**（`resume.go` 已如此）。若将来要补：`decision.outcome=deny`、`approvedBy=null`——拒绝就是没有人批准。
+
 **Files:**
-- Modify: `internal/agent/resume.go`（`finishTerminal` 完整实现）
 - Create: `internal/agent/board.go`
+- Modify: `internal/agent/resume.go`（仅在需要收口终态推送时；不得重复写 result 段）
+- Modify: `internal/agent/state.go`（若需按 planId 查 archived，用已有 `LoadArchived`）
 - Test: `internal/agent/board_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // 归档终态时推一条 state=终态 的公告板覆盖：否则已执行的单会在板上挂到过期。
@@ -2098,7 +2174,7 @@ func TestRepushPendingBoard(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 实现 `board.go`**
+- [x] **Step 2: 实现 `board.go`**
 
 ```go
 package agent
@@ -2150,12 +2226,12 @@ func finishTerminal(ctx context.Context, client *HostClient, p Pending, state Pe
 }
 ```
 
-- [ ] **Step 3: 跑测试至全绿**
+- [x] **Step 3: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestFinishTerminal|TestRepushPendingBoard' -count=1 -v`
 Expected: 2 个用例全 PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add internal/agent/board.go internal/agent/board_test.go internal/agent/resume.go
@@ -2164,13 +2240,79 @@ git commit -m "feat(agent): 公告板重推与终态覆盖"
 
 ---
 
+## Task 9b: host 侧补 `pendingItem.state`（Task 9 复核发现的缺口）
+
+**为什么必须单独一步**：Task 9 让 agent 推 `state`，但 `internal/controlplane/pending.go` 的 `pendingItem` **没有 `State` 字段**——`json.Unmarshal` 会静默丢弃它。今天的实际行为是：agent 推了终态覆盖，host 把同一条目原样重写、页面仍然显示"待批"。也就是说 **Task 9 的成果在线上等于零**。
+
+**Files:**
+- Modify: `internal/controlplane/pending.go`（`pendingItem` 加字段 + 缺省值）
+- Test: `internal/controlplane/pending_test.go`
+
+- [x] **Step 1: 写失败测试**
+
+```go
+// 公告板条目必须带回 state：它是"待批"与"刚刚处理完"的唯一区分。
+func TestPendingBoardKeepsState(t *testing.T) {
+	// POST 一条 state=done 的覆盖，GET 必须原样带回 "done"。
+	// 再 POST 一条**不带 state** 的，GET 必须给缺省 "awaiting_approval"。
+}
+
+// 缺省值不是"空串"：旧客户端（不推 state）的条目仍要能显示成待批。
+func TestPendingBoardDefaultsStateToAwaiting(t *testing.T) {}
+```
+
+（用例骨架实现者补全，沿用 `pending_test.go` 现有的 `newTestServer` / token 夹具；`expiresAt` 用远期常量。）
+
+- [x] **Step 2: 实现**
+
+```go
+type pendingItem struct {
+	// 原有字段不动…
+	// State 区分「待批」与「刚刚处理完」：页面按它决定怎么显示，协议层不替页面过滤。
+	// 缺省 awaiting_approval —— 老客户端不推这个字段时不能被当成终态。
+	State string `json:"state"`
+}
+```
+
+在 upsert 里补缺省：`if item.State == "" { item.State = "awaiting_approval" }`；`List` 仍按 `expiresAt` 剔除过期条目（不变）。
+
+- [x] **Step 3: 跑测试**
+
+```bash
+go test ./internal/controlplane/ -run 'TestPendingBoard' -count=1 -v
+go test ./... -count=1
+```
+
+- [x] **Step 4: Commit**
+
+```bash
+git add internal/controlplane/pending.go internal/controlplane/pending_test.go
+git commit -m "feat(controlplane): 公告板条目带回 state（终态覆盖否则被静默丢弃）"
+```
+
+**注意**：本任务**不接线**终态覆盖的调用点——那是 Task 10 的事（`Resume` 缺登录凭证，需要由 poller 推）。
+
+---
+
 ## Task 10: `cmd/agent` 的 tick 四段顺序与装配
+
+**Task 9 复核后追加的四条（比正文更权威）**
+
+1. **终态覆盖必须有生产调用点**：`finishTerminal` 未导出、`Resume` 无凭证。**最终选法（比初版的方案 (b) 更省）**：`board.go` 加导出包装 `PushTerminal(ctx, client *HostClient, p Pending, state PendingState) error`；poller 在 `Resume` 成功返回后用 `store.LoadArchived(planId)` 取归档件再推。**`Resume` 签名一个字不用改**——调用方本来就知道 `planId`；重放时归档件已在，再推一次是幂等 upsert。**推失败绝不能回滚归档**（回滚会让同一 confirm 被重放执行第二次），错误只记日志。
+2. **挂起前校验 `approvers` 非空**：`rolesIntersect` 对空集 fail-closed，`requiredRoles` 为空的 approve 计划**谁点都是 403**。在 `buildPending`/挂起处判空 → 不挂起、走 `needs_human` 且 Detail 写明"策略要求审批但没给审批人角色"。
+3. **`resumeError.Retryable` 要能被调用方判断**：加 `agent.IsRetryable(err) bool`；确定性拒绝（角色不匹配/过期/未知 planId/已归档非 done/未知处置）立即 ack，可重试才留到下一 tick。
+4. **合成事件 id 必须确定性**：`evt_req_<requestId>`，**不要用 `newID()`**（时间基会让同一 request 在重启/重放后 triggerEventId 漂移，审计对账对不上）。
+
+- **Task 10b 复核后的更正（比本节正文更权威）**：
+  1. **合成事件 id 用宿主签发的 `syntheticEventId`，不要自己拼 `evt_req_<requestId>`**（原第 4 条是错的）：`docs/interfaces.md:382` 明文要求沿用；且宿主 origin 登记表以宿主签发的 id 为键，自造 id 会把 `origin=request` 判成 `event` → `plat-request-needs-human` 失效 → **对话发起的采购单被自动放行**。
+  2. **入站游标只跟"已 ack 的 seq"**，不要用 `PollInbound` 的 `nextCursor`：宿主按 `Since(after)` 回放，用 nextCursor 会让未 ack 的帧永远回不来。
+  3. **审批人角色通道（Task 10c）**：宿主在 confirm 帧注入 token claims 的 roles（并删除客户端自报），agent 读帧里的 roles。缺这条 approve 永远 403。
 
 **Files:**
 - Modify: `cmd/agent/main.go`
 - Test: `cmd/agent/main_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // tick 的四段顺序是唯一的调度契约（入站 → 自检 → 公告板 → 事件），必须有用例锁住。
@@ -2230,7 +2372,7 @@ func (p *poller) Steps() []string {
 > （`/tenon/events`、`/tenon/modules` 契约同 `internal/agent/run_test.go` 的既有假 host），
 > 返回装好 `hostc` / `store` / `ledger` / `steps` 的 `poller`。**照 `run_test.go` 的写法抄，不要新造一套风格。**
 
-- [ ] **Step 2: 改 `cmd/agent/main.go`**
+- [x] **Step 2: 改 `cmd/agent/main.go`**
 
 ### Step 2 前置：Task 2 复核后追加的四条硬要求
 
@@ -2270,6 +2412,36 @@ func (l *Ledger) Phase(requestID string) string {
 
 3. **`Done` 必须覆盖所有返回路径**，包括 `res.Outcome == NeedsHuman`（挂起成功，那也是一次完整的处理）。实现时把 `Done` 放在 `Run` 之后立刻执行，不要让它排在可能失败的 `writeRequestResult` 之后。
 4. **装配**：`NewLedger(filepath.Join(cfg.stateDir, "processed.jsonl"))`（**文件**路径，不是目录）；`poller.ledger` 必须注入，否则 `drainInbound` 会 nil 解引用。`Deps.State` 为 nil 表示"没有挂起通道"，**不要把空串传给 `NewStateStore`**。
+
+5. **`auditProbe` 的 host 归属已定（`c97277e` 之后）**：签名已改成 `Has(ctx, auditID)`——**没有 host 参数**，空串在类型上不存在了。真实现放在 Task 10：
+
+```go
+// hostAuditProbe 用 HostClient 查审计链；host 绑在 client 里，不进签名。
+type hostAuditProbe struct{ client *HostClient }
+
+func (h hostAuditProbe) Has(ctx context.Context, auditID string) (bool, error) {
+	status, raw, err := h.client.do(ctx, http.MethodGet, h.client.base+"/tenon/audit", nil)
+	if err != nil {
+		return false, err
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("查审计返回 %d：%s", status, snippet(raw))
+	}
+	return bytes.Contains(raw, []byte(`"auditId":"`+auditID+`"`)), nil
+}
+```
+
+`HostClient.base` 是小写字段，同包可直接读；若确实需要外部访问，加 `BaseURL() string`，**不要**把字段导出。
+
+6. **自检的导出包装与日志**：`selfCheck` 是小写、返回未导出类型 `selfCheckReport`。Task 10 加个导出包装 `SelfCheck(...) (selfCheckReport, error)` 即可（调用方用 `rep.Kept` 这类导出字段，不需要命名类型）。日志行**必须包含 `Corrupt`**——坏文件唯一的告警出口。
+
+7. **`SelectSkills` 接进 `Run` 的三条（Task 5 复核后追加）**
+   (i) **`PlanInput.Request`（Task 6）与 `RunInput.Request`（Task 7）必须同时存在**：`Run` 内按 `runInput.Request != nil` 分流——request 回合用 `SelectSkills` 算候选集，事件回合仍走 `Skills.TextFor(event.Type)`。只改一处会得到一个永远不成立的分支。
+
+   (ii) **别用 `SkillStore.TextFor` 渲染候选集**：它只渲染**非空 Body**。只靠 `Subscribes` 命中的 skill（Body 为空）会被选中却渲染成空串 → `userPrompt` 写「（本次没有匹配的 skill 正文）」——**选了 N 份却告诉模型没有**。需要新写 `TextForSelected(selected []Skill) string`，与 `TextFor` 同一格式，但空 Body 渲染成「（无正文，仅按订阅命中）」，绝不渲染空串。
+
+   (iii) **`deps.Skills.Len() == 0` 要单独打日志**：`SelectSkills` 不返回 error，区分不出「压根没加载 skill」与「加载了但没命中」；`LoadSkills` 的注释本就要求把 0 份打出来。另两条写进 `skillselect.go` 注释：`limit <= 0` 会被静默改成 2（传 0 当"不限"只会拿 2 份）；`knownModuleNames` 必须全小写、新模块要记得加行，否则表现为"没有匹配"的静默降级。
+
 
 
 `config` 增字段（沿用现有 env 读取风格）：
@@ -2407,12 +2579,12 @@ func (p *poller) handleInbound(ctx context.Context, typ string, raw []byte) erro
 
 > `rolesOf` 从 token claims 拿：`HostClient` 登录响应里有 `roles`，在 `Login` 时缓存到 `poller`；本任务要求把 `HostClient` 的 claims 暴露为 `Claims() (subject string, roles []string)`。**不要**另造一次登录。
 
-- [ ] **Step 3: 跑测试**
+- [x] **Step 3: 跑测试**
 
 Run: `go build ./... && go test ./cmd/agent/ -count=1`
 Expected: 编译通过；tick 顺序用例按实现者的骨架断言通过
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add cmd/agent/main.go cmd/agent/main_test.go
@@ -2427,7 +2599,7 @@ git commit -m "feat(agent): tick 四段顺序（入站/自检/公告板/事件�
 - Modify: `internal/controlplane/http.go`
 - Test: `internal/controlplane/http_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // D1 的「同一输入同一行为」要求入站通道在测试模式下不存在：
@@ -2452,12 +2624,12 @@ func TestInboundEndpointsAbsentInTestMode(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/controlplane/ -run 'TestInboundEndpointsAbsentInTestMode' -count=1`
 Expected: 得到 401/405 而不是 404
 
-- [ ] **Step 3: 改 `ServeHTTP`**
+- [x] **Step 3: 改 `ServeHTTP`**
 
 ```go
 	case "/tenon/requests":
@@ -2488,12 +2660,12 @@ Expected: 得到 401/405 而不是 404
 
 并在包注释的端点清单里注明「测试模式下入站四路由不挂（D1 可重复性）」。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `go test ./internal/controlplane/ -run 'TestInboundEndpointsAbsentInTestMode' -count=1 -v && go test ./... -count=1`
 Expected: 新用例 PASS；全仓无 FAIL（既有的入站用例**不设** TestMode，不受影响）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/controlplane/http.go internal/controlplane/http_test.go
@@ -2509,14 +2681,14 @@ git commit -m "fix(controlplane): 测试模式下不挂入站通道（D1 可重�
 - Modify: `README.md`（「还没做的」删掉已交付项）
 - Modify: `docs/interfaces.md`（公告板条目加 `state` 字段）
 
-- [ ] **Step 1: 改三处文档（按 spec §12 的映射逐条改）**
+- [x] **Step 1: 改三处文档（按 spec §12 的映射逐条改）**
 
 1. M0.5 spec §1 的 agent 行：把「不开端口、不持久化状态」改为「不开端口；持久状态只有 `TENON_AGENT_STATE_DIR` 下的 `pending/`、`archived/` 与 `processed.jsonl`」。
 2. README「还没做的」：删掉「agent 侧的挂起/恢复」「前端页面（P3 未做）」中的**前者**（后者保留，P3 未做）。
 3. `docs/interfaces.md` §4.7：公告板条目字段补 `state`（`awaiting_approval` / `done` / `rejected` / `expired` / `stale`），并注明「过滤是页面的事，协议层返回全部未过期条目」。
 4. **README 的已知缺口必须写明审计形状偏离**：挂起/恢复的计划级审计 `stepId=null`、无 `action`/`inputHash`，**不满足 `audit-event.schema.json` 的完整 required 集**；宿主当前只校验 `auditId` 与 `stage`，加严校验会让挂起路径全线失败。这是评审选定的 A 案（语义最诚实），不是疏漏。
 
-- [ ] **Step 2: 全量回归**
+- [x] **Step 2: 全量回归**
 
 ```bash
 go test ./... -count=1
@@ -2528,7 +2700,7 @@ go build ./...
 
 Expected: 五项全绿。
 
-- [ ] **Step 3: 冒烟（手工，记入验收清单）**
+- [x] **Step 3: 冒烟（手工，记入验收清单）**
 
 ```bash
 # 起 host（TEST_MODE 关掉）+ inventory + procurement + agent
@@ -2541,7 +2713,9 @@ TENON_RESULT_FILE=out/agent-result.jsonl go run ./cmd/agent
 
 期望：`out/agent-state/pending/` 出现一份 json；`GET /tenon/pending` 能查到；投一条 confirm 后 `archived/` 出现 `done`，inventory 数量真的变了，`GET /tenon/audit?planId=…` 的 result 段 `approvedBy=user:bob`。
 
-- [ ] **Step 4: Commit**
+**证据**：`out/agent-state/pending/archived/pln_smoke1.json`（`state=done`，inventory 侧审计 1 条；宿主审计 4 条、`prevHash` 链连续、step 级 `approvedBy=user:bob`）。
+
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs README.md

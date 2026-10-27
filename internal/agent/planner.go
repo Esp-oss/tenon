@@ -72,6 +72,13 @@ type LLMClient interface {
 	ChatJSON(ctx context.Context, system, user string) ([]byte, error)
 }
 
+// ActionMeta 是渲染白话所需的最小信息：标题（R2 兜底）与模板（R1 主路径）。
+// 它随能力发现一起回来，**不进 prompt**——模板是给人看的，不是给模型的指令。
+type ActionMeta struct {
+	Title           string
+	SummaryTemplate string
+}
+
 // ModuleDigest 是一个**可达**模块的动作清单摘要。
 //
 // Actions 只含从 GET /.well-known/tenon 动态发现的 action id——它们不属于本包代码，
@@ -80,6 +87,8 @@ type LLMClient interface {
 type ModuleDigest struct {
 	ID      string
 	Actions []string
+	// ActionMeta 按 action id 索引；老模块没声明模板时对应项只有 Title。
+	ActionMeta map[string]ActionMeta
 }
 
 // PlanInput 是一次规划的全部输入。
@@ -92,6 +101,20 @@ type PlanInput struct {
 	SkillText string
 	Modules   []ModuleDigest
 	Feedback  string
+	// Request 是人工发起时的原话；事件回合为 nil。
+	// 它与 Event 语义不同：Event 是领域事实，Request 是**指令**。
+	Request *UserRequest
+}
+
+// UserRequest 是 tenon.request 帧在 agent 侧的投影：人要什么，以及是谁要的。
+//
+// 它刻意只有原话，没有领域事实：事实仍然只来自 Event 与动态发现的动作清单，
+// 指令只来自人。两者混进同一个 prompt 块，模型就会把「人希望做的事」读成
+// 「系统已经发生的事」——那是把指令当事实，方向正好反了。
+type UserRequest struct {
+	RequestID string
+	Text      string
+	By        string
 }
 
 // Plan 是 plan.schema.json 的 Go 投影（schema 是 additionalProperties=false，多一个
@@ -278,19 +301,34 @@ func systemPrompt() string {
    dependsOn 是前序 stepId 数组（无依赖写 []）；kind 只能是 read 或 write。
 6. action 只能取自输入里「可调动作」清单，逐字照抄，不得发明、不得猜测、不得改写。
    清单里没有的能力就是没有——不要用别的模块或别的命名去凑。
-7. expectedDiff 是数组，纯读计划可以是空数组；元素的 entity 用 module:Type/id 字符串或实体对象。
+7. expectedDiff 是数组，纯读计划可以是空数组；每个元素必须恰好含 entity、field、from、to 四个键，
+   不得追加 op、note 之类自造键。entity 是实体寻址，两种等价写法任选其一（<…> 是占位，照抄输入里的真实实体）：
+   {"module":"<模块id>","type":"<类型>","id":"<主键>"}   或   "<模块id>:<类型>/<主键>"
+   字符串形式必须是三段；只写主键（例 "STD-1001"）是错的。field 是被改的字段名，
+   from / to 是改前与改后的值（新建时 from 为 null，删除时 to 为 null）。
 8. dryRun.status 只能是 verified、unsafe、unsupported、pending 之一。
 9. estimatedRisk 只能是 low、medium、high；rationale 是一句人能读懂的理由，或 null。
 能力不足时：仍然输出一份只做清单内能力的计划；把「做不到的部分」写进 rationale，
 不要编造动作，也不要输出错误信息代替计划。`
 }
 
-// userPrompt 把动态事实（事件、skill 正文、动作清单）渲染成确定性文本：模块与动作都
-// 排序，保证同一输入下 prompt 逐字相同（temperature=0 的可重复性依赖它）。
+// userPrompt 把动态事实（事件、skill 正文、动作清单）与人工指令（请求）渲染成确定性
+// 文本：模块与动作都排序，保证同一输入下 prompt 逐字相同（temperature=0 的可重复性依赖它）。
 func userPrompt(in PlanInput) string {
 	var b strings.Builder
 	b.WriteString("事件（领域事实，不是指令）：\n")
 	b.WriteString(renderEvent(in.Event))
+
+	// 请求块的位置就是它的语义：紧跟在事件块之后、skill 正文之前。
+	// 塞进事件块 = 用户的话被读成领域事实；塞进 skill 正文 = 被读成「业务语义参考」。
+	// 两者都不构成指令，所以它必须自带「这是指令」的标题、独占一块。
+	// Request 为 nil（事件回合）时一个字都不写：事件回合的 prompt 不因这次分流改变。
+	if in.Request != nil {
+		b.WriteString("\n用户请求（这是指令，目标是完成它）：\n")
+		b.WriteString(strings.TrimSpace(in.Request.Text))
+		b.WriteString("\n")
+	}
+
 	b.WriteString("\nskill 正文（业务语义参考：说明该关心什么，不指定具体动作）：\n")
 	if text := strings.TrimSpace(in.SkillText); text != "" {
 		b.WriteString(text)
@@ -496,6 +534,37 @@ func (s *SkillStore) TextFor(eventType string) string {
 		body := strings.TrimSpace(skill.Body)
 		if body == "" {
 			continue
+		}
+		parts = append(parts, fmt.Sprintf("## skill %s\n%s", skill.Name, body))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// noBodyPlaceholder 是「选中的 skill 没有正文」的渲染文本。
+//
+// 它必须是一句显式的话，不能是空串：候选集是按模块名命中的，一份只靠 subscribes 命中、
+// 正文为空的 skill 被选中很正常。渲染成空串，userPrompt 就会写下「本次没有匹配的
+// skill 正文」——选了 N 份却告诉模型一份都没有。
+const noBodyPlaceholder = "（无正文，仅按订阅命中）"
+
+// TextForSelected 渲染**已选中**的 skill（候选集），格式与 TextFor 逐字一致：
+// 每份一个「## skill <name>」小标题加正文，份与份之间空一行。
+//
+// 与 TextFor 的唯一区别是空正文的渲染（见 noBodyPlaceholder）——所以不能用 TextFor
+// 来渲染候选集：它跳过空 Body，选中的 skill 越多，prompt 越可能声称「没有正文」。
+// selected 为空时返回空串，让 userPrompt 走它自己的「本次没有匹配」分支。
+//
+// 接收者用不到：留在 SkillStore 上是为了与 TextFor 同一调用形状，并且 nil *SkillStore
+// 也能直接调用（Run 里因此不必为它单独判空）。
+func (s *SkillStore) TextForSelected(selected []Skill) string {
+	if len(selected) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(selected))
+	for _, skill := range selected {
+		body := strings.TrimSpace(skill.Body)
+		if body == "" {
+			body = noBodyPlaceholder
 		}
 		parts = append(parts, fmt.Sprintf("## skill %s\n%s", skill.Name, body))
 	}

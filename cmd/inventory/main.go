@@ -90,10 +90,11 @@ func main() {
 
 func getStockAction() module.Action {
 	return module.Action{
-		ID:      actionGetStock,
-		Version: "0.1.0",
-		Title:   "查询在库量",
-		Kind:    "read",
+		ID:              actionGetStock,
+		Version:         "0.1.0",
+		Title:           "查询在库量",
+		SummaryTemplate: "查询 {sku} 在库量",
+		Kind:            "read",
 		InputSchema: json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,
@@ -118,10 +119,11 @@ func getStockAction() module.Action {
 
 func deductStockAction() module.Action {
 	return module.Action{
-		ID:      actionDeductStock,
-		Version: "0.1.0",
-		Title:   "扣减库存",
-		Kind:    "write",
+		ID:              actionDeductStock,
+		Version:         "0.1.0",
+		Title:           "扣减库存",
+		SummaryTemplate: "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）",
+		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,
@@ -163,10 +165,11 @@ func deductStockAction() module.Action {
 
 func releaseStockAction() module.Action {
 	return module.Action{
-		ID:      actionReleaseStock,
-		Version: "0.1.0",
-		Title:   "回补库存（扣减的补偿动作）",
-		Kind:    "write",
+		ID:              actionReleaseStock,
+		Version:         "0.1.0",
+		Title:           "回补库存（扣减的补偿动作）",
+		SummaryTemplate: "回补 {sku} 库存 {qty} 件（单据 {referenceNo}）",
+		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,

@@ -177,3 +177,38 @@ func TestErrorSchemaAllClasses(t *testing.T) {
 		}
 	}
 }
+
+// TestSummaryTemplateInBothShapes 锁住契约：白话模板在「摘要线」与「完整 Action」
+// 两处都要能被接受——agent 只读摘要线，模块只序列化完整 Action，少一处就等于没有。
+// 这条用例同时是一个「CHANGELOG 是否被兑现」的检查：0.2.0 提案段早就写了这个字段。
+func TestSummaryTemplateInBothShapes(t *testing.T) {
+	s := mustLoad(t)
+
+	manifest := `{
+	  "tenon":"0.1",
+	  "module":{"id":"inventory","version":"1.4.0","title":"库存"},
+	  "actions":[{"id":"inventory.DeductStock","version":"1.0.0","title":"扣减",
+	              "kind":"write","risk":{"level":"medium","reversible":true},
+	              "dryRun":{"supported":true},
+	              "summaryTemplate":"扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）"}],
+	  "events":[],
+	  "transports":["http"],
+	  "capabilities":["dry-run"]
+	}`
+	if err := s.Validate("module-manifest.schema.json", []byte(manifest)); err != nil {
+		t.Fatalf("摘要线应接受 summaryTemplate：%v", err)
+	}
+
+	nonString := strings.Replace(manifest,
+		`"summaryTemplate":"扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）"`,
+		`"summaryTemplate":42`, 1)
+	if err := s.Validate("module-manifest.schema.json", []byte(nonString)); err == nil {
+		t.Fatal("summaryTemplate 必须是字符串")
+	}
+
+	action := strings.Replace(validWriteAction, `"kind": "write",`,
+		`"kind": "write", "summaryTemplate": "扣减 {sku} 库存 {qty} 件",`, 1)
+	if err := s.Validate("action.schema.json", []byte(action)); err != nil {
+		t.Fatalf("完整 Action 应接受 summaryTemplate：%v", err)
+	}
+}

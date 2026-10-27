@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tenon 对话入口</title>
+<!--
+  同源静态资源必须走 /ui/ 前缀：宿主只把「/」与「/ui/…」交给静态处理器
+  （internal/controlplane/static.go 的 uiPrefix），写成 ./style.css 会落到
+  /style.css 而被当成未知端点（404 JSON）。
+-->
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <h1>Tenon 对话入口</h1>
+    <p class="sub">人对 agent 说话 · 待批看板 · 批准/驳回</p>
+  </div>
+
+  <div class="session">
+    <form id="login-form" class="login">
+      <label for="login-user">用户</label>
+      <input id="login-user" name="user" type="text" value="alice" autocomplete="username" spellcheck="false">
+      <label for="login-password">口令</label>
+      <input id="login-password" name="password" type="password" placeholder="见 config/users.dev.json" autocomplete="current-password">
+      <button id="login-submit" type="submit" class="primary">登录</button>
+    </form>
+
+    <div id="session-info" class="session-info" hidden>
+      <span>当前用户 <b id="session-user">—</b></span>
+      <span id="session-roles" class="role-line"></span>
+      <button id="logout" type="button" class="link">退出</button>
+    </div>
+  </div>
+</header>
+
+<div id="error-bar" class="error-bar" role="alert" hidden>
+  <span class="error-label">错误</span>
+  <span id="error-text" class="error-text"></span>
+  <button id="error-close" type="button" class="link" aria-label="关闭错误提示">关闭</button>
+</div>
+
+<main>
+  <section class="panel">
+    <h2>说话</h2>
+    <p class="hint">原话直接进 agent 的对话上下文，不做意图分类。发送后宿主签发 requestId；命中审批的计划会出现在下面的待批区。</p>
+    <label class="sr-only" for="request-text">要对 agent 说的话</label>
+    <textarea id="request-text" maxlength="2000" rows="3" placeholder="例：STD-1001 这单货不够，先扣现有的，缺的发起采购"></textarea>
+    <div class="row">
+      <label class="check"><input id="ctx-toggle" type="checkbox"> 附带视图上下文（可选）</label>
+      <span class="hint">告诉 agent「这单」指哪一单：module / type / id 三项一起填，或都留空。</span>
+    </div>
+    <div id="ctx-fields" class="ctx" hidden>
+      <label>module <input id="ctx-module" type="text" placeholder="inventory" spellcheck="false"></label>
+      <label>type <input id="ctx-type" type="text" placeholder="Stock" spellcheck="false"></label>
+      <label>id <input id="ctx-id" type="text" placeholder="STD-1001" spellcheck="false"></label>
+    </div>
+    <div class="row">
+      <button id="send" type="button" class="primary">发送</button>
+      <span id="status-line" class="status" role="status"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>待批 <span id="pending-count" class="count"></span></h2>
+    <div id="pending-list" class="cards"><p class="empty">登录后显示待批条目</p></div>
+  </section>
+
+  <section class="panel">
+    <h2>已处理 <span id="processed-count" class="count"></span></h2>
+    <div id="processed-list" class="cards"><p class="empty">登录后显示已处理条目</p></div>
+  </section>
+
+  <p class="hint foot">登录后每 2 秒自动刷新看板；批准/驳回提交后立即刷新。最后刷新 <span id="board-updated">—</span></p>
+</main>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

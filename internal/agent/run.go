@@ -4,11 +4,16 @@
 // 顺序**不可调换**（TestGateOrder 锁定）：
 //
 //	1 规划（Plan 过 plan.schema.json）
-//	2 policies:evaluate   → 不是 auto 就转人工（deny 不得换路绕过，approve 也要人来按）
+//	2 policies:evaluate   → deny 直接转人工（不得换路绕过）；approve 只记下「需要审批」，
+//	  继续跑 3、4，最后才挂起。授权与预演必须早于「决定挂起」：一份注定过不了授权/
+//	  预演的计划，不该挂上公告板等人白批一次（fail-closed 要早）。没有挂起通道
+//	  （Deps.State 为 nil）时 approve 仍转人工——这是 M0.5 行为的保留路径
 //	3 grants:evaluate     → 逐 action 全部先过（不允许即转人工）
 //	4 每个 write 的 :dry-run（**404 也转人工**：模块不实现预演不等于免检；
 //	  结论不是 verified 同样转人工——fail-closed，见设计文档 §8 降级矩阵）
-//	5 每步执行前写 stage=dispatched 审计（非 200 立即终止，本次调用数必须为 0）
+//	5 需要审批 → 挂起（I7 三次落盘；结局仍是 needs_human + PendingPlanID，
+//	  三态封闭不新增第四态）。否则每步执行前写 stage=dispatched 审计
+//	  （非 200 立即终止，本次调用数必须为 0）
 //	6 执行（write 带 Idempotency-Key = protocol.IdempotencyKey(planId, stepId)）
 //	7 写 stage=result 审计
 //	8 按错误分类处理：retryable 退避重试（幂等键不变）；business_rejection 重新规划；
@@ -30,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -62,6 +68,8 @@ const (
 	// 以下取值来自 spec/0.1 的 schema（policy / plan / frames），本文件只引用字符串，
 	// 不复制它们的语义定义。
 	outcomeAuto     = "auto"     // policy.schema.json 的 outcome：可自动执行
+	outcomeApprove  = "approve"  // policy.schema.json 的 outcome：等人工批准，agent 只能挂起
+	outcomeDeny     = "deny"     // policy.schema.json 的 outcome：转人工，不得换路
 	kindRead        = "read"     // plan.schema.json 的 kind
 	kindWrite       = "write"    // plan.schema.json 的 kind
 	dryRunVerified  = "verified" // plan.schema.json 的 DryRunStatus：唯一允许自动执行的值
@@ -89,9 +97,28 @@ const (
 //
 // CorrelationID 可省略（空串时用事件自带的）：它只影响审计与 Intent 帧的业务链锚点，
 // 不影响闸门判定。
+//
+// Request 是**人工发起**时的原话（tenon.request 帧），事件回合为 nil。它与 Event 的
+// 语义不同：Event 是领域事实，Request 是**指令**，所以两者必须分块进 prompt
+// （planner.userPrompt 负责分流）。塞一个非 nil 的空 UserRequest，事件回合的 prompt
+// 就会凭空多出一个空指令块——判空要看 nil，不要看 Text 是否为空。
 type RunInput struct {
 	Event         DomainEvent
 	CorrelationID string
+	Request       *UserRequest
+}
+
+// RequestCorrelationID 给人工请求回合一个**确定性且合规**的业务链锚点。
+//
+// common.schema.json#/$defs/CorrelationId 的模式是 ^cor:\S+$，所以「谁问的」不能当
+// 锚点：把 by（user:alice）写进 correlationId，落进审计 trigger.correlationId 就是一条
+// 不合规记录（真冒烟暴露的 F2）；而「谁问的」已由 actor.onBehalfOf 承载，两者不是一回事。
+//
+// 用 requestId 而不是 newID()：同一句请求重放后必须仍落在同一条业务链上，否则审计对账
+// 与差异测试都对不上。请求回合是**合成事件**，没有自带锚点，所以由这里派生；事件回合
+// 不经过这里——它沿用事件自带的 correlationId。
+func RequestCorrelationID(requestID string) string {
+	return "cor:request/" + requestID
 }
 
 // RunResult 是一个回合的结局。ActionsTaken 只记**真正执行过**的动作（按执行顺序），
@@ -101,6 +128,11 @@ type RunResult struct {
 	PlanID       string
 	ActionsTaken []string
 	Detail       string
+	// PendingPlanID 非 nil 表示有一份 pending 已落盘、可被推进（approve 命中的挂起）。
+	//
+	// 结局仍是 needs_human——三态封闭，不新增第四态（run.go 的 Outcome 注释写死）：
+	// 「等审批」本来就是「agent 正确地举手」，只是这次举手带了一张可被批准的卡。
+	PendingPlanID *string
 }
 
 // Deps 是 Run 的全部外部依赖。
@@ -115,6 +147,11 @@ type Deps struct {
 	HTTP       *http.Client
 	Skills     *SkillStore
 	Trace      *[]string
+	// State 是 pending 的持久化口；为 nil 表示「没有挂起通道」，approve 一律转人工。
+	//
+	// 用 nil 而不是空串表达「没有」：NewStateStore("") 会报错（§0.1.6），
+	// 装配时把空串传进来只会在第一轮挂起时炸掉，而不是在装配时炸掉。
+	State *StateStore
 }
 
 // Run 跑完一个回合并返回结局。它**不返回 error**：三种结局已经涵盖了「要不要人来」
@@ -135,7 +172,8 @@ func Run(ctx context.Context, deps Deps, in RunInput) RunResult {
 	if correlation == "" {
 		correlation = strings.TrimSpace(event.CorrelationID)
 	}
-	r := &runner{deps: deps, host: strings.TrimRight(host, "/"), event: event, correlationID: correlation}
+	r := &runner{deps: deps, host: strings.TrimRight(host, "/"), event: event,
+		request: in.Request, correlationID: correlation}
 	r.client = deps.HTTP
 	if r.client == nil {
 		r.client = &http.Client{Timeout: defaultHTTPTimeout}
@@ -150,6 +188,8 @@ type runner struct {
 	event         DomainEvent
 	correlationID string
 	client        *http.Client
+	// request  是人工发起时的原话；事件回合为 nil（挂起时决定 origin 与 requestId）。
+	request *UserRequest
 	// modules 是「enabled 且 manifest 可达」的模块 → 基地址；执行与预演都只认它。
 	modules map[string]string
 	taken   []string // 真正执行过的动作
@@ -168,8 +208,20 @@ func (r *runner) run(ctx context.Context) RunResult {
 			Detail: "可达模块为 0：没有任何可执行能力，转人工"})
 	}
 
+	// skill 正文按回合类型分流（Task 5 复核后追加的三条）：
+	//   - request 回合：SelectSkills 做确定性粗筛，TextForSelected 渲染候选集；
+	//   - 事件回合：仍按 tenon.subscribes 取 TextFor(event.Type)，一个字都不改。
 	skillText := ""
-	if r.deps.Skills != nil {
+	if r.deps.Skills.Len() == 0 {
+		// SelectSkills 不返回 error，区分不出「压根没加载 skill」与「加载了但没命中」，
+		// 所以 0 份必须单独打出来：那是部署问题（永远没有业务语义参考），不是「这次没命中」。
+		log.Printf("agent: 没有加载任何 skill（Skills 为 0 份）：本次回合没有 skill 正文，只能靠事件与动作清单")
+	} else if r.request != nil {
+		// viewModule 传空串：**请求帧里没有视图模块**（UserRequest 只有 requestId/text/by，
+		// 本任务不为此加字段）。没有视图模块时，粗筛只看请求文本。
+		selected := SelectSkills(r.deps.Skills.All(), r.request.Text, "", 2)
+		skillText = r.deps.Skills.TextForSelected(selected)
+	} else {
 		skillText = r.deps.Skills.TextFor(r.event.Type)
 	}
 
@@ -180,6 +232,8 @@ func (r *runner) run(ctx context.Context) RunResult {
 			SkillText: skillText,
 			Modules:   digest,
 			Feedback:  feedback,
+			// 事件回合这里是 nil：prompt 不得凭空多出一个空指令块（Task 6 的判据）。
+			Request: r.request,
 		})
 		if rejection == "" {
 			return r.finish(ctx, res)
@@ -230,13 +284,25 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 	plan.Trigger = PlanTrigger{EventID: r.event.EventID, CorrelationID: r.correlationID}
 	r.planID = plan.PlanID
 
-	// 闸门 2：策略。整份计划取最严（宿主实现），agent 只认 auto。
+	// 闸门 2：策略。整份计划取最严（宿主实现）。
+	//
+	// deny 直接转人工；approve 只记下「需要审批」并继续往下走——授权与预演必须跑在
+	// 「决定挂起」之前（fail-closed 要早：注定过不了授权/预演的计划不该挂上公告板
+	// 等人白批一次），最后才由闸门 5 决定「挂起还是执行」。
 	policy, err := r.evaluatePolicies(ctx, plan)
 	if err != nil {
 		return RunResult{Outcome: OutcomeFailed,
 			Detail: "策略评估不可用（fail-closed，不做任何写）：" + err.Error()}, ""
 	}
-	if policy.Outcome != outcomeAuto {
+	if policy.Outcome == outcomeDeny {
+		return RunResult{Outcome: OutcomeNeedsHuman,
+			Detail: fmt.Sprintf("策略闸门拒绝：outcome=%s decidedBy=%v reasons=%v（转人工，不换路绕过）",
+				policy.Outcome, policy.DecidedBy, policy.Reasons)}, ""
+	}
+	// policy.schema.json 是封闭枚举，但宿主的响应不受本包控制：除 auto/approve 之外的
+	// 任何取值（含空串）都按「没放行」处理——不猜它是不是 approve，也不让它掉进执行。
+	needApproval := policy.Outcome == outcomeApprove
+	if policy.Outcome != outcomeAuto && !needApproval {
 		return RunResult{Outcome: OutcomeNeedsHuman,
 			Detail: fmt.Sprintf("策略闸门未放行：outcome=%s decidedBy=%v reasons=%v（转人工，不换路绕过）",
 				policy.Outcome, policy.DecidedBy, policy.Reasons)}, ""
@@ -283,6 +349,32 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 		}
 	}
 
+	// 闸门 5：需要审批 → 挂起（I7 三次落盘），一步都不执行。
+	//
+	// 挂起不是第四种结局：needs_human + PendingPlanID 表达「等人按一下就能继续」。
+	// 挂起失败映射成 needs_human（不是 failed）：这一轮确实什么都没做、也不该重试——
+	// 同一份 pending 再调一次 suspend 会复用同一个 auditId，审计链出现重复记录。
+	if needApproval {
+		if r.deps.State == nil {
+			return RunResult{Outcome: OutcomeNeedsHuman,
+				Detail: fmt.Sprintf("策略闸门要求审批（outcome=%s decidedBy=%v），但没有挂起通道（Deps.State 为空）：转人工",
+					policy.Outcome, policy.DecidedBy)}, ""
+		}
+		// 元信息取本轮规划用的同一份发现结果（PlanInput.Modules 已带 ActionMeta）：
+		// 渲染与规划看的是同一张能力清单，不会出现「计划里的动作渲染不出模板」。
+		pending, err := r.buildPending(plan, policy, actorMeta(in.Modules))
+		if err != nil {
+			return RunResult{Outcome: OutcomeNeedsHuman, Detail: err.Error()}, ""
+		}
+		if err := suspend(ctx, r.deps.State, r.deps, pending); err != nil {
+			return RunResult{Outcome: OutcomeNeedsHuman,
+				Detail: "挂起失败（不留半截 pending）：" + err.Error()}, ""
+		}
+		id := pending.PlanID
+		return RunResult{Outcome: OutcomeNeedsHuman, PlanID: id, PendingPlanID: &id,
+			Detail: fmt.Sprintf("已挂起等待审批：planId=%s 需要 %v", id, pending.RequiredRoles)}, ""
+	}
+
 	// 闸门 5–7：按依赖顺序执行，每步各写两段审计。
 	ordered, err := orderSteps(plan.Steps)
 	if err != nil {
@@ -293,6 +385,8 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 			outcome:  policy.Outcome,
 			policyID: firstNonEmpty(policy.DecidedBy...),
 			grantID:  grantIDs[step.StepID],
+			// approvedBy 留 nil：走到这里的计划必是 auto（approve 在挂起路径上，
+			// deny 直接转人工），这条路径确实没有人按过批准。
 		}
 		verdict := r.executeStep(ctx, plan, step, gate)
 		switch verdict.kind {
@@ -311,6 +405,81 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 	}
 	return RunResult{Outcome: OutcomeCompleted,
 		Detail: fmt.Sprintf("计划全部执行成功：%d 步", len(ordered))}, ""
+}
+
+// buildPending 把 plan 与本轮的闸门结论打包成一份 pending。
+//
+// labels 在这里渲染并落盘，恢复时不重算：白话来自身份化模板，模板改了两边文字就会
+// 不一致（spec §3 的 pending 契约）。CreatedAt/ExpiresAt 必须在这里填——suspend 只管
+// I7 的三次落盘，不碰时间；漏填 ExpiresAt 会让 Expired() 对空串 fail-closed 返回 true，
+// 下一轮自检立刻把这份 pending 归档成 expired（§0.1.7）。
+//
+// requestId 可为 null（事件回合）：spec §6.3 要求「等审批」只有一条实现路径，不分来源，
+// 所以事件回合也挂起，只是 origin=event。
+func (r *runner) buildPending(plan Plan, policy policyEvaluation, meta map[string]ActionMeta) (Pending, error) {
+	// 挂起前必须确认「谁能批」：rolesIntersect 对空集 fail-closed，requiredRoles 为空的
+	// approve 计划**谁点都是 403**。挂上去只会得到一张永远批不掉的卡——它占着公告板、
+	// 占着一个审批窗口，而审批人点下去只换来一次 403。这不是可恢复状态（换个人批也一样），
+	// 所以要当场转人工，而不是等人白点一次才发现。
+	//
+	// 空白条目同样不算审批人：["  "] 与任何角色都交不出交集，效果与空集相同。
+	if !hasApproverRole(policy.Approvers) {
+		return Pending{}, fmt.Errorf(
+			"策略要求审批但没有给审批人角色（requiredRoles 为空，谁批都会 403）：不挂起，转人工")
+	}
+	labels, details := renderSteps(plan, meta)
+	now := time.Now().UTC()
+	var reqID *string
+	if r.request != nil && r.request.RequestID != "" {
+		id := r.request.RequestID
+		reqID = &id
+	}
+	origin := "event"
+	if r.request != nil {
+		origin = "request"
+	}
+	return Pending{
+		PlanID:         plan.PlanID,
+		State:          StateAwaitingApproval,
+		RequestID:      reqID,
+		TriggerEventID: plan.Trigger.EventID,
+		Origin:         origin,
+		By:             r.deps.OnBehalfOf,
+		Plan:           plan,
+		Labels:         labels,
+		Details:        details,
+		Summary:        strings.Join(labels, "；"),
+		RequiredRoles:  policy.Approvers,
+		CreatedAt:      now.Format(time.RFC3339),
+		ExpiresAt:      now.Add(pendingTTL).Format(time.RFC3339),
+		// subject 必须落盘：恢复时 TriggerEventID 只够锚定事件、锚不住「哪个实体」，
+		// 丢了它，恢复执行的审计 effects.entities 与 Intent 帧 actions 就退化成空数组。
+		Subject: r.event.Subject,
+	}, nil
+}
+
+// actorMeta 把本轮发现结果压平成 action id → 元信息，供渲染器按 step 查。
+//
+// 模块间 action id 全局唯一（module.action 的格式），所以不需要再带模块维度；
+// 同一 id 重复出现只可能来自注册表脏数据，后者覆盖前者不影响渲染的可读性。
+func actorMeta(modules []ModuleDigest) map[string]ActionMeta {
+	out := make(map[string]ActionMeta)
+	for _, m := range modules {
+		for id, meta := range m.ActionMeta {
+			out[id] = meta
+		}
+	}
+	return out
+}
+
+// hasApproverRole 判断策略是否真的给了审批人角色（空白条目不算）。
+func hasApproverRole(roles []string) bool {
+	for _, role := range roles {
+		if strings.TrimSpace(role) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- 能力发现 ----------
@@ -349,41 +518,50 @@ func (r *runner) discover(ctx context.Context) ([]ModuleDigest, error) {
 		if !m.Enabled || id == "" || base == "" {
 			continue
 		}
-		actions, err := r.manifestActions(ctx, base)
+		actions, meta, err := r.manifestActions(ctx, base)
 		if err != nil {
 			// 模块在场却读不到 manifest：能力清单不完整，不能假装它没有动作。
 			return nil, fmt.Errorf("模块 %q 的能力发现失败：%w", id, err)
 		}
 		r.modules[id] = base
-		out = append(out, ModuleDigest{ID: id, Actions: actions})
+		out = append(out, ModuleDigest{ID: id, Actions: actions, ActionMeta: meta})
 	}
 	return out, nil
 }
 
-// manifestActions 从模块的 GET /.well-known/tenon 取动作 id 清单（摘要级，不含 schema）。
-func (r *runner) manifestActions(ctx context.Context, baseURL string) ([]string, error) {
+// manifestActions 从模块的 GET /.well-known/tenon 取动作清单（摘要级，不含 schema），
+// 顺带把渲染白话要用的 title 与 summaryTemplate 一起带走。
+//
+// 模板**不进 prompt**：它在挂起时用于渲染审批卡，属于给人看的数据。
+func (r *runner) manifestActions(ctx context.Context, baseURL string) ([]string, map[string]ActionMeta, error) {
 	status, raw, err := r.getJSON(ctx, baseURL+"/.well-known/tenon")
 	if err != nil {
-		return nil, fmt.Errorf("GET /.well-known/tenon 失败：%w", err)
+		return nil, nil, fmt.Errorf("GET /.well-known/tenon 失败：%w", err)
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("GET /.well-known/tenon 返回 %d：%s", status, snippet(raw))
+		return nil, nil, fmt.Errorf("GET /.well-known/tenon 返回 %d：%s", status, snippet(raw))
 	}
 	var manifest struct {
 		Actions []struct {
-			ID string `json:"id"`
+			ID              string `json:"id"`
+			Title           string `json:"title"`
+			SummaryTemplate string `json:"summaryTemplate"`
 		} `json:"actions"`
 	}
 	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return nil, fmt.Errorf("manifest 不是合法 JSON：%w", err)
+		return nil, nil, fmt.Errorf("manifest 不是合法 JSON：%w", err)
 	}
 	ids := make([]string, 0, len(manifest.Actions))
+	meta := make(map[string]ActionMeta, len(manifest.Actions))
 	for _, a := range manifest.Actions {
-		if id := strings.TrimSpace(a.ID); id != "" {
-			ids = append(ids, id)
+		id := strings.TrimSpace(a.ID)
+		if id == "" {
+			continue
 		}
+		ids = append(ids, id)
+		meta[id] = ActionMeta{Title: a.Title, SummaryTemplate: a.SummaryTemplate}
 	}
-	return ids, nil
+	return ids, meta, nil
 }
 
 // moduleBase 从 action id（<moduleId>.<ActionName>）反查模块基地址。
@@ -517,10 +695,16 @@ type stepVerdict struct {
 // outcome 是处置（auto/approve/deny）；policyID 是作出该处置的策略 id（来自
 // policies:evaluate 的 decidedBy），grantID 是命中的授权。三者混用会让审计
 // 「看起来有策略」却答不出是哪一条，这是我在自审时修掉的一处语义错。
+//
+// approvedBy 是**谁按的批准**，与 outcome 是两个维度：outcome 说「这道闸门怎么处置的」，
+// approvedBy 说「哪个主体批的」。auto 路径没人批，必须为 nil；人工批准过的路径（恢复
+// 执行）必须填审批人——audit-event.schema.json 规定 outcome=approve 时 approvedBy 非空，
+// 留 nil 就是一条不合规记录。
 type gateDecision struct {
-	outcome  string
-	policyID string
-	grantID  string
+	outcome    string
+	policyID   string
+	grantID    string
+	approvedBy *string
 }
 
 // executeStep 执行一步：写 dispatched 审计 → 调用 → 写 result 审计，retryable 时退避重试。
@@ -733,10 +917,12 @@ func (r *runner) auditBase(plan Plan, step PlanStep, auditID, stage string, gate
 		Action:    step.Action,
 		InputHash: inputHash,
 		Decision: auditDecision{
-			Outcome:    gate.outcome,
-			PolicyID:   nilIfEmpty(gate.policyID),
-			GrantID:    nilIfEmpty(gate.grantID),
-			ApprovedBy: nil, // 本轮没有人工批准通道：approve 一律转人工
+			Outcome:  gate.outcome,
+			PolicyID: nilIfEmpty(gate.policyID),
+			GrantID:  nilIfEmpty(gate.grantID),
+			// 审批人只能由闸门结论带进来：auto 路径的 gateDecision 不填它（那条路径确实
+			// 没人批），恢复路径填 c.By（人批过的事实必须留痕）。
+			ApprovedBy: gate.approvedBy,
 		},
 		Effects:    auditEffects{Entities: r.entities()},
 		TokenUsage: auditTokenUsage{}, // internal/llm 目前不回传用量，见交付说明的已知缺口

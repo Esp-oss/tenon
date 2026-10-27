@@ -117,6 +117,38 @@
   },
   "allOf": [
     {
+      "description": "结果段里的 approve 必须记下是谁批的。语义原本只写在 AuditDecision.approvedBy 的描述里，机器判不了——于是「恢复执行的步骤级 result 把 approvedBy 写成 null」这种缺陷能一路通过校验。这里把它变成可执行的判据。",
+      "if": {
+        "required": ["stage", "decision"],
+        "properties": {
+          "stage": {
+            "const": "result"
+          },
+          "decision": {
+            "required": ["outcome"],
+            "properties": {
+              "outcome": {
+                "const": "approve"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "required": ["approvedBy"],
+            "properties": {
+              "approvedBy": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "if": {
         "required": ["stage"],
         "properties": {

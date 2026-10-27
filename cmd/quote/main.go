@@ -112,10 +112,11 @@ func newQuoteModule(store *quoteStore) *module.Module {
 
 func createStandardPartQuoteAction() module.Action {
 	return module.Action{
-		ID:      actionCreateStandardPartQuote,
-		Version: "0.1.0",
-		Title:   "创建标准件报价单",
-		Kind:    "write",
+		ID:              actionCreateStandardPartQuote,
+		Version:         "0.1.0",
+		Title:           "创建标准件报价单",
+		SummaryTemplate: "按报价单 {quoteNo} 生成需求",
+		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
   "additionalProperties": false,
