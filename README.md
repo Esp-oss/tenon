@@ -146,18 +146,32 @@ docs/             设计文档、接口文档与架构图
 - `origin` 进策略：宿主签发合成 `evt_` 并**独立落盘登记**（这张表是治理状态，不是缓存——单删它会把在途请求静默降级成事件驱动），据此判定「对话发起 / 事件驱动」；缺 `triggerEventId` 的行为由 `TENON_REQUIRE_TRIGGER` 过渡控制（默认放行为 `event`，P4 收口时改强制）；
 - 业务级规则从 `skills/<id>/approval.json` 加载，加载期校验 `arg.*` / `risk.*` 路径并试编译，按 skill 粒度 fail-closed；与平台规则同池合并、**取更严**，所以业务规则只能收紧不能放宽。
 
-**还缺两半，所以现在不能当功能用**：agent 不消费入站队列、也不读 `confirm`（P2）；页面没有内容（P3）。即「业务员说话 → 落到队列」这一段是真的，「agent 处理 → 人看到结果」还没有。
+**链路已通（M1 切片 2）**：agent 消费入站队列、命中 `approve` 时挂起落盘（I7 三次写）、审批人批准后按原计划恢复执行，审计 `result` 段带 `approvedBy`。端到端真跑过：投一句话 → 挂起 → bob 批准 → 库存 120→108 → 归档 `done`。
 
-现在能验证到的最小链路（先起一个模块，例如 `inventory` 在 8081）：
+> **启动顺序：模块先起，host 后起**（`inventory` → `procurement` → `host` → `agent`）。
+> host 在**加载期**要拉每个模块的 `GET /tenon/actions/{id}` 来校验并加载 `skills/*/approval.json` 里的业务级规则。模块不在时那两条规则会**静默不加载**——日志里只是少了「业务级规则已加载 2 条（来自 skills）」这一行，不报错。**看到这行才算规则真的生效**。
+
+现在能验证到的最小链路（先起模块，再起 host）：
 
 ```bash
+# 1) 先起模块（各自一个终端）
+TENON_MODULE_ID=inventory PORT=8081 go run ./cmd/inventory
+# 2) 再起 host —— 顺序反了业务规则会静默不加载
 TENON_USERS_FILE=config/users.dev.json TENON_SESSION_SECRET=dev \
 TENON_INBOUND_DIR=out/inbound TENON_MODULES='inventory=http://127.0.0.1:8081' \
-go run ./cmd/host
+TENON_SKILLS_DIR=skills go run ./cmd/host
+# 3) agent（需要 LLM 凭据；无凭据时用 stub，见 .githooks 旁的说明或 compose 的 smoke profile）
+TENON_HOST_URL=http://127.0.0.1:8080 TENON_ON_BEHALF_OF=user:alice \
+TENON_AGENT_ID=ag_fulfillment TENON_AGENT_STATE_DIR=out/agent-state \
+TENON_AGENT_USER=agent TENON_AGENT_PASSWORD=agent-dev go run ./cmd/agent
+```
+
+```bash
 # 换 token，再推一句人话；返回 {"ok":true,"seq":1,"durable":true}
 curl -s -X POST localhost:8080/tenon/session -d '{"user":"alice","password":"alice-dev"}'
 curl -s -X POST localhost:8080/tenon/requests -H "Authorization: Bearer <token>" \
   -d '{"type":"tenon.request","text":"扣 12 件"}'
+# 浏览器打开 http://127.0.0.1:8080/ （需 TENON_UI_DIR=ui）即可用页面走同一条链路
 ```
 
 ### 能判定的用例（宿主模式，真进程实测）
