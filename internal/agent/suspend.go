@@ -64,6 +64,10 @@ func suspend(ctx context.Context, store *StateStore, deps Deps, p Pending) error
 			ApprovedBy: nil, // 计划级 dispatched：此刻确实还没人批（I2）
 		},
 		Effects: auditEffects{Entities: nil},
+		// audit-event.schema.json：stage=dispatched 时 result.status 必须是 "unknown"
+		// （「已派出、结果未定」）。写别的值会让这条记录连自己的 schema 都不符合——
+		// 宿主今天只校验 auditId 与 stage，但那是宽松，不是许可。
+		Result: auditResult{Status: "unknown"},
 	}
 	if err := postAuditRecord(ctx, deps, rec); err != nil {
 		return cleanup(fmt.Errorf("写 dispatched 审计失败（拒绝挂起）：%w", err))
