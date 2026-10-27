@@ -7,10 +7,10 @@
     "outcome": "auto"
   },
   {
-    "policyId": "biz-purchase-approve",
+    "policyId": "biz-purchase-approve-large",
     "priority": 100,
     "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
-    "when": {"all": []},
+    "when": {"all": [{"arg.qty": {">": 5}}]},
     "outcome": "approve",
     "approvers": ["role:procurement_manager"]
   }

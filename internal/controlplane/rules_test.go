@@ -1,12 +1,15 @@
 package controlplane
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"tenon.dev/internal/controlplane/policy"
 )
 
 // fakeModule 提供一个带 inputSchema 的 action 定义，供规则路径校验使用。
@@ -190,5 +193,62 @@ func TestLoadApprovalRulesAcceptsRiskPath(t *testing.T) {
 	}
 	if len(rules) != 1 {
 		t.Fatalf("规则应加载，得到 %+v", rules)
+	}
+}
+
+// dev 平台规则与业务规范的合并结果：业务阈值必须真的生效。
+//
+// 这条用例锁的是「合并取更严」的推论——业务文件里若留一条无条件 approve，
+// 它会把自己文件里的 auto 压死，加载日志却照样显示"规则已加载"。
+// P4 的冒烟若期望「事件驱动 qty=3 走 auto」，靠的就是这里。
+func TestDevBusinessRulesTakeEffect(t *testing.T) {
+	platform, err := LoadPolicies(filepath.Join("..", "..", "config", "policies.dev.json"))
+	if err != nil {
+		t.Fatalf("读 dev 平台规则失败：%v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join("..", "..", "skills", "quote-to-fulfillment", "approval.json"))
+	if err != nil {
+		t.Fatalf("读业务规范失败：%v", err)
+	}
+	var biz []policy.PolicyRule
+	if err := json.Unmarshal(raw, &biz); err != nil {
+		t.Fatalf("业务规范不是合法规则数组：%v", err)
+	}
+	all := append(append([]policy.PolicyRule{}, platform...), biz...)
+	engine := policy.NewPolicyEngine(all)
+
+	cases := []struct {
+		name        string
+		origin      string
+		qty         int
+		wantOutcome string
+		wantBy      string
+	}{
+		{"事件驱动小额自动过", originEvent, 3, policy.OutcomeAuto, "biz-purchase-auto-small"},
+		{"事件驱动大额要批", originEvent, 12, policy.OutcomeApprove, "biz-purchase-approve-large"},
+		{"对话发起小额也要批", originRequest, 3, policy.OutcomeApprove, "plat-request-needs-human"},
+		{"对话发起大额也要批", originRequest, 12, policy.OutcomeApprove, "plat-request-needs-human"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := json.Marshal(map[string]any{"sku": "STD-1002", "qty": tc.qty})
+			if err != nil {
+				t.Fatalf("编组入参失败：%v", err)
+			}
+			got, err := engine.Evaluate(context.Background(), policy.PolicyRequest{
+				Action: "procurement.CreatePurchaseRequest",
+				Args:   args,
+				Origin: tc.origin,
+			})
+			if err != nil {
+				t.Fatalf("求值失败：%v", err)
+			}
+			if got.Outcome != tc.wantOutcome {
+				t.Fatalf("期望 %s，得到 %s（decidedBy=%v）", tc.wantOutcome, got.Outcome, got.DecidedBy)
+			}
+			if len(got.DecidedBy) == 0 || got.DecidedBy[0] != tc.wantBy {
+				t.Fatalf("决胜规则应为 %s，得到 %v", tc.wantBy, got.DecidedBy)
+			}
+		})
 	}
 }

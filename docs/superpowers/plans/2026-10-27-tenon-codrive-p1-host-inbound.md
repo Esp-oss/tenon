@@ -2537,7 +2537,91 @@ go build ./... && go vet ./...
 
 Expected: 无输出（成功）
 
-- [ ] **Step 3: 端到端 curl 冒烟（手工，记入验收）**
+- [ ] **Step 2b: 给 `loadConfig` 补单元测试（不要靠起进程冒烟）**
+
+`cmd/host` 目前没有测试文件。起真进程 + 真模块的冒烟不适合放在任务执行里（端口、时序、清理都不可靠），改成本地测试：建 `cmd/host/main_test.go`，用 `httptest` 假模块 + `t.Setenv`，断言 `loadConfig` 真的把五样东西接上了。
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// loadConfig 是纯装配：给它环境变量与一个假模块，它必须把规则、身份、目录都接上。
+func TestLoadConfigWiresInboundSurface(t *testing.T) {
+	mod := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 加载期会 GET /tenon/actions/{id} 校验规则里的入参路径
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":          "procurement.CreatePurchaseRequest",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"qty": map[string]any{"type": "integer"}}},
+			"risk":        map[string]any{"level": "medium", "reversible": true},
+		})
+	}))
+	defer mod.Close()
+
+	dir := t.TempDir()
+	skills := filepath.Join(dir, "skills", "s1")
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatalf("建目录失败：%v", err)
+	}
+	rules := `[{"policyId":"biz-1","priority":1,
+	  "match":{"module":"procurement","actions":["procurement.CreatePurchaseRequest"]},
+	  "when":{"all":[{"arg.qty":{"<=":5}}]},"outcome":"auto"}]`
+	if err := os.WriteFile(filepath.Join(skills, "approval.json"), []byte(rules), 0o600); err != nil {
+		t.Fatalf("写规则失败：%v", err)
+	}
+	users := filepath.Join(dir, "users.json")
+	if err := os.WriteFile(users, []byte(`[{"user":"alice","password":"pw","roles":["role:clerk"]}]`), 0o600); err != nil {
+		t.Fatalf("写账号失败：%v", err)
+	}
+
+	t.Setenv("TENON_MODULES", `[{"id":"procurement","baseURL":"`+mod.URL+`","enabled":true}]`)
+	t.Setenv("TENON_SKILLS_DIR", filepath.Join(dir, "skills"))
+	t.Setenv("TENON_USERS_FILE", users)
+	t.Setenv("TENON_SESSION_SECRET", "test-secret")
+	t.Setenv("TENON_UI_DIR", filepath.Join(dir, "ui"))
+	t.Setenv("TENON_INBOUND_DIR", filepath.Join(dir, "inbound"))
+	t.Setenv("TENON_REQUIRE_TRIGGER", "1")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("装配失败：%v", err)
+	}
+	if len(cfg.Policies) != 1 || cfg.Policies[0].PolicyID != "biz-1" {
+		t.Fatalf("业务规则未接上：%+v", cfg.Policies)
+	}
+	if len(cfg.Users) != 1 || cfg.Users[0].User != "alice" {
+		t.Fatalf("账号未接上：%+v", cfg.Users)
+	}
+	if string(cfg.SessionSecret) != "test-secret" {
+		t.Fatalf("会话密钥未接上")
+	}
+	if cfg.UIDir == "" || cfg.InboundDir == "" || !cfg.RequireTrigger || !cfg.StrictRules {
+		t.Fatalf("目录或开关未接上：%+v", cfg)
+	}
+}
+
+// 开启 TENON_REQUIRE_TRIGGER 时要有一条显式告警（现有 agent 还发不出 triggerEventId）。
+func TestLoadConfigWarnsOnRequireTrigger(t *testing.T) {
+	t.Setenv("TENON_REQUIRE_TRIGGER", "1")
+	t.Setenv("TENON_SESSION_SECRET", "s")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("装配失败：%v", err)
+	}
+	if !cfg.RequireTrigger {
+		t.Fatalf("开关未接上")
+	}
+}
+```
+
+- [ ] **Step 3: 真进程冒烟（手工，记入 P4 验收清单，不在本步阻塞）**
 
 ```bash
 # 三个终端分别起（第三个之后）
