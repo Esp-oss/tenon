@@ -67,6 +67,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -103,6 +104,11 @@ const (
 	frameTypeConfirm = "tenon.confirm"
 	// sessionTTL 是 dev token 有效期。
 	sessionTTL = 8 * time.Hour
+	// defaultInboundDir 是入站队列与 origin 登记表的缺省目录。
+	defaultInboundDir = "out/inbound"
+	// maxInboundFrames 是入站队列容量。**独立于 maxIntentFrames**：后者是出站内存队列
+	// 的容量语义，给「人说过的话」复用它，会让两件事的理由互相矛盾。
+	maxInboundFrames = 1024
 )
 
 // Config 是宿主控制平面的一次装配输入。
@@ -126,6 +132,8 @@ type Config struct {
 	Users []User
 	// SessionSecret 用于签发/校验 token；为空会在 New 里报错。
 	SessionSecret []byte
+	// InboundDir 是入站队列与 origin 登记表的目录。空则用 out/inbound。
+	InboundDir string
 }
 
 // Server 是组装好的控制平面。构造后并发安全；Handler() 与服务共享同一份状态。
@@ -139,8 +147,12 @@ type Server struct {
 	intents       Queue
 	users         []User
 	sessionSecret []byte
-	policyCount   int
-	grantCount    int
+	// inbound 是落盘的入站队列（人 → agent）。它与 intents 是两条独立队列：出站的 Ack
+	// 是累积游标，两个消费者共用一条会互相吞帧。
+	inbound     Queue
+	origin      *originStore
+	policyCount int
+	grantCount  int
 }
 
 // New 装配控制平面。审计日志打不开或策略规则自检不过都会返回错误：宿主不该带着
@@ -177,6 +189,23 @@ func New(cfg Config) (*Server, error) {
 	}
 	s.users = cfg.Users
 	s.sessionSecret = cfg.SessionSecret
+	// 入站队列与 origin 登记表都落盘：入站承载「人说过的话」，丢了不会有人报错。
+	// 装配放在会话密钥校验之后、策略自检之前：前者的失败是配置错误，不该先建目录。
+	dir := cfg.InboundDir
+	if strings.TrimSpace(dir) == "" {
+		dir = defaultInboundDir
+	}
+	inboundQueue, err := newJSONLQueue(filepath.Join(dir, "requests.jsonl"), maxInboundFrames)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	origin, err := newOriginStore(filepath.Join(dir, "requests-index.jsonl"))
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	s.inbound, s.origin = inboundQueue, origin
 	if _, err := s.policyEngine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("controlplane: 策略规则自检未通过：%w", err)
@@ -190,11 +219,19 @@ func New(cfg Config) (*Server, error) {
 // 只创建一个监听器；测试里用 httptest.NewServer(s.Handler()) 即可。
 func (s *Server) Handler() http.Handler { return s }
 
-// Close 关闭审计文件的句柄。
+// Close 关闭审计文件与入站队列的句柄。
 //
 // 进程退出前必须调用：Windows 上不关句柄会锁住审计文件，下一次启动的链校验与重开
 // 都会失败。Close 之后 Query/VerifyChain 仍可读（见 audit 包）。
-func (s *Server) Close() error { return s.auditStore.Close() }
+func (s *Server) Close() error {
+	err := s.auditStore.Close()
+	if s.inbound != nil {
+		if cerr := s.inbound.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
 
 // VerifyChain 重算整条审计哈希链，供测试与运维自检使用。
 func (s *Server) VerifyChain() error { return s.auditStore.VerifyChain() }
@@ -227,6 +264,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveIntentPoll(w, r)
 	case "/tenon/intents/ack":
 		s.serveIntentAck(w, r)
+	case "/tenon/requests":
+		// 入站（人 → agent）。与 /tenon/intents 是两条队列：见 Server.inbound 的注释。
+		s.serveInboundEnqueue(w, r)
+	case "/tenon/requests/poll":
+		s.serveInboundPoll(w, r)
+	case "/tenon/requests/ack":
+		s.serveInboundAck(w, r)
 	case "/tenon/admin/modules":
 		if !s.testMode {
 			// 非测试模式回 404 而不是 403：403 等于承认「这里本来有个测试面」。

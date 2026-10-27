@@ -47,6 +47,8 @@ func newRealHost(t *testing.T) *httptest.Server {
 		Modules:   []registry.ModuleEntry{{ID: "inventory", BaseURL: "http://127.0.0.1:8081"}},
 		// 装配期要求会话密钥；一致性套件不测登录，给个固定值即可。
 		SessionSecret: []byte("conformance-secret"),
+		// 入站目录同理：缺省会落到宿主工作目录的 out/inbound，多个用例共用一份。
+		InboundDir: filepath.Join(t.TempDir(), "inbound"),
 	})
 	if err != nil {
 		t.Fatalf("装配真实宿主失败：%v", err)

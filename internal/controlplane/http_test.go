@@ -39,12 +39,15 @@ func newTestHost(t *testing.T) *Server {
 
 // newTestServer 装配一个 Server 并登记清理。
 //
-// 缺省补齐测试必需的字段：会话密钥。少了它 New 会报错，
-// 而既有用例大多不关心这个字段。
+// 缺省补齐测试必需的字段：会话密钥与入站目录。少了它们 New 会报错，
+// 而既有用例大多不关心这两个字段。
 func newTestServer(t *testing.T, cfg Config) *Server {
 	t.Helper()
 	if len(cfg.SessionSecret) == 0 {
 		cfg.SessionSecret = []byte("test-secret")
+	}
+	if strings.TrimSpace(cfg.InboundDir) == "" {
+		cfg.InboundDir = t.TempDir() + "/inbound"
 	}
 	srv, err := New(cfg)
 	if err != nil {
@@ -888,6 +891,8 @@ func TestNewRejectsBrokenPolicyConfig(t *testing.T) {
 		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
 		// 密钥校验在自检之前，这里必须给一个，否则测不到自检那条路径。
 		SessionSecret: []byte("test-secret"),
+		// 入站目录也必须给：入站队列装配在自检之前，缺省会创建 out/inbound。
+		InboundDir: filepath.Join(t.TempDir(), "inbound"),
 		Policies: []policy.PolicyRule{{
 			PolicyID: "p-bad",
 			Match:    policy.PolicyMatch{Module: "inventory"},
