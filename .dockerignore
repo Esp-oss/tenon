@@ -1,4 +1,10 @@
 # 构建上下文排除项（不影响 git，只影响 docker build 上下文）
+#
+# 前提：本文件对**所有** Dockerfile 生效（compose.yaml 的 docs/spec/go 三条构建链
+# 与根 Dockerfile 共用根上下文），所以下面只排除「任何一条构建链都不需要」的东西。
+# docs/（docs.Dockerfile 要 COPY）、scripts/、spec/、conformance/、tools/、docker/
+# 都**不能**排除，排掉就等于把既有构建链打断。
+
 **/node_modules
 **/dist
 **/*.tsbuildinfo
@@ -10,3 +16,21 @@
 .env.*
 .vscode
 .idea
+**/.DS_Store
+Thumbs.db
+
+# 运行期状态与产物：由 compose 的 bind mount 提供，不进镜像。
+# out/ 里有本机冒烟的近 100MB 二进制与 JSONL，是上下文里最大的一块。
+out/
+**/*.jsonl
+
+# 前端静态页：compose 里 bind mount 到 /app/ui，运行时才需要。
+# 若将来要把 UI 打进镜像，删掉这一行并在 Dockerfile 里 COPY。
+ui/
+
+# 本地手动构建产物（go build ./cmd/... 落在仓库根的十兆级 exe）。
+*.exe
+/tenon
+
+# 开发期密钥（.gitignore 里同样是本地目录）：绝不进镜像层。
+docker/secrets/

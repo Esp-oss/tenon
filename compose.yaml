@@ -1,15 +1,36 @@
-# Tenon —— 当前仓库状态可直接运行的容器
+# Tenon 容器编排（两段，互不干扰）
+#
+# ① 本文件原有的三条「仓库现状」链：文档站 + 规范校验 + Go 工具链
 #
 #   docker compose up -d docs     # 文档站 → http://localhost:8088
 #   docker compose run --rm spec  # 规范校验（零依赖 Node，与 CI 的 spec job 同源）
 #   docker compose run --rm go    # Go 工具链 gofmt/vet/build（与 CI 的 go job 同源）
-#   docker compose up             # 一次跑全部（spec/go 跑完即退出，属正常）
+#
+# ② 对话入口链路（本轮新增）：host + agent + inventory + procurement，以及隔离在
+#    smoke profile 里的 stub LLM
+#
+#   docker compose up -d --build                     # 四个服务（不含 stub）
+#   docker compose --profile smoke up -d --build     # 额外起 stub LLM（只有冒烟需要）
+#   docker compose down -v
+#
+# 与 compose.m0.yaml 的关系：那份是「M0.5 目标拓扑」的完整声明（含 quote /
+# conformance / lint / 命名卷 / docker secrets），本轮**没有改它**。这里补的是同一批
+# Go 服务在当前代码上的可跑编排，差异只有四处，每处都有原因：
+#   - 不放 quote：它不在「对话入口」这条链路上（它的 quote.completed 走的是事件驱动
+#     的旧路径，冒烟不需要触发器）；
+#   - 状态用宿主机目录（./out/docker-smoke）而不是命名卷：验收要直接看 pending/、
+#     archived/、processed.jsonl 与审计原文，命名卷还得 docker cp 出来；
+#   - HMAC 密钥用 compose config 内联注入，不需要先 openssl 生成文件（m0 的
+#     docker/secrets/hmac.txt 前置步骤在这里省掉了）；
+#   - 不设 TENON_TEST_MODE：设了它会摘掉四条入站路由（/tenon/requests 等直接 404），
+#     而「对话入口」正是靠这几条路由工作的。
+#
+# 端口：刻意避开 8080/8081/8082/8099——本机常有另一路本地冒烟占着那几个口。
+# 18080 也被另一个项目（fed-local 的网关容器）占着，所以宿主机侧用 18088。
 #
 # 基础镜像可用环境变量覆盖（受限网络/内网仓库时）：
+#   TENON_GO_IMAGE=golang:1.26 docker compose build
 #   TENON_NODE_IMAGE=node:22-alpine TENON_NGINX_IMAGE=nginx:1.27-alpine docker compose build
-#
-# M0 的目标拓扑（宿主 + 模块 + 套件）在 compose.m0.yaml，那里标注了哪些服务
-# 在对应代码落地前不可构建。协议接口说明见 docs/interfaces.md。
 
 name: tenon
 
@@ -54,3 +75,213 @@ services:
         GO_IMAGE: ${TENON_GO_IMAGE:-golang:1.26-alpine}
     image: tenon/go-check:dev
     restart: "no"
+
+  # ==========================================================================
+  # 对话入口链路：库存 → 采购 → 宿主 → agent（顺序是有语义的，见 depends_on）
+  # ==========================================================================
+
+  # 库存模块：主写路径（幂等、预演、G4 前置条件）。业务状态在内存里，不持久化。
+  inventory:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENTRY: ./cmd/inventory
+        GO_IMAGE: ${TENON_GO_IMAGE:-golang:1.26}
+    image: tenon/inventory:dev
+    environment:
+      PORT: "8081"
+      TENON_MODULE_ID: inventory
+      # 密钥走文件不走环境变量：/readyz 的就绪判据之一就是「读得到密钥」。
+      TENON_HMAC_SECRET_FILE: /run/tenon/hmac
+      TENON_MODULE_AUDIT_PATH: /app/out/audit-inventory.jsonl
+      # 与 cmd/inventory 的缺省 seed 一致，写出来是为了让「扣 12 件后剩 108」可核对。
+      TENON_INVENTORY_SEED: STD-1001:120,STD-1002:3
+    configs:
+      - source: tenon_hmac
+        target: /run/tenon/hmac
+    volumes:
+      # 模块侧审计与宿主/agent 的状态同处 out/ 下（不同文件，互不覆盖）。
+      - ./out/docker-smoke:/app/out
+    ports:
+      # 只绑回环：这是开发冒烟，模块不该出现在局域网上。
+      - "127.0.0.1:18081:8081"
+    healthcheck:
+      # /readyz 而不是 /healthz：后者永远 200，前者要求密钥可读 + 审计可写。
+      test: ["CMD", "/app/probe", "http://127.0.0.1:8081/readyz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+    restart: unless-stopped
+
+  # 采购模块：对话入口不直接调它，但宿主加载 skills/*/approval.json 时要拉它的
+  # action 清单（见 host 的 depends_on 注释）。差一个模块，业务规则就少一条。
+  procurement:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENTRY: ./cmd/procurement
+        GO_IMAGE: ${TENON_GO_IMAGE:-golang:1.26}
+    image: tenon/procurement:dev
+    environment:
+      PORT: "8082"
+      TENON_MODULE_ID: procurement
+      TENON_HMAC_SECRET_FILE: /run/tenon/hmac
+      TENON_MODULE_AUDIT_PATH: /app/out/audit-procurement.jsonl
+    configs:
+      - source: tenon_hmac
+        target: /run/tenon/hmac
+    volumes:
+      - ./out/docker-smoke:/app/out
+    ports:
+      - "127.0.0.1:18082:8082"
+    healthcheck:
+      test: ["CMD", "/app/probe", "http://127.0.0.1:8082/readyz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+    restart: unless-stopped
+
+  # 控制平面：策略 / 授权 / 审计链 / 注册表 / 入站队列 / 待批公告板。
+  # 它不含任何 LLM 调用，也不主动调模块——但**启动期**要读模块的 action 清单。
+  host:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENTRY: ./cmd/host
+        GO_IMAGE: ${TENON_GO_IMAGE:-golang:1.26}
+    image: tenon/host:dev
+    environment:
+      PORT: "8080"
+      # 三份治理数据只读挂载：策略 / 授权 / dev 账号表（alice、bob、agent）。
+      TENON_POLICY_FILE: /app/config/policies.dev.json
+      TENON_GRANT_FILE: /app/config/grants.dev.json
+      TENON_USERS_FILE: /app/config/users.dev.json
+      TENON_AUDIT_PATH: /app/out/audit-host.jsonl
+      # 容器网络里用服务名。顺序无所谓，但两个模块都得在（加载期要逐个拉清单）。
+      TENON_MODULES: inventory=http://inventory:8081,procurement=http://procurement:8082
+      # 显式写出而不是吃缺省值：缺省会退回 dev 常量并打警告，那在生产是漏洞。
+      TENON_SESSION_SECRET: ${TENON_SESSION_SECRET:-tenon-dev-session-secret}
+      # 复数 skills：host 读 skills/*/approval.json（业务级规则）。
+      TENON_SKILLS_DIR: /app/skills
+      # 入站队列落盘目录：requests.jsonl / .meta / requests-index.jsonl 都在这里。
+      TENON_INBOUND_DIR: /app/out/inbound
+      # ui/ 存在才挂得上（见下面 volumes 的注释）；不设它的后果只是 GET / 回 503。
+      TENON_UI_DIR: /app/ui
+      # 刻意不设 TENON_TEST_MODE：它会把四条入站路由整条摘成 404，
+      # 而「对话入口」正是靠 /tenon/requests 与 /tenon/pending 工作的。
+      # 也刻意不设 TENON_REQUIRE_TRIGGER：cmd/agent 目前发不出 triggerEventId，
+      # 开启后它的每份 plan 都会被判成策略拒绝（见 cmd/host/main.go 的 P1 说明）。
+    volumes:
+      - ./out/docker-smoke:/app/out
+      - ./config:/app/config:ro
+      - ./skills:/app/skills:ro
+      # ui/ 是可选入口（不配只是 GET / 回 503，链路不受影响），且可能正被并行开发，
+      # 所以只读挂载、不写不建。注意 compose 会给不存在的挂载源建一个空目录。
+      - ./ui:/app/ui:ro
+    ports:
+      - "127.0.0.1:18088:8080"
+    depends_on:
+      # 必须是 service_healthy 而不是裸依赖：host 在**加载期**逐个拉
+      # GET /tenon/actions/{id} 校验并加载 skills/*/approval.json 里的业务级规则。
+      # 模块还没 ready 时，那两条规则会**静默不加载**（日志里只是少一行），
+      # 于是「qty>5 的采购单必须审批」这类业务阈值失效，而且没人会注意到。
+      # 裸 depends_on 只保证「容器起过」，不保证 readyz 已 200。
+      inventory:
+        condition: service_healthy
+      procurement:
+        condition: service_healthy
+    healthcheck:
+      # /healthz 而非 /readyz：存活探针不检查依赖（interfaces.md §7）。
+      # readyz 更严（审计可写 + 策略可用），验收时单独 curl 一次。
+      test: ["CMD", "/app/probe", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+    restart: unless-stopped
+
+  # agent 运行时：纯客户端，不开端口。它启动第一件事是 POST /tenon/session 登录。
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENTRY: ./cmd/agent
+        GO_IMAGE: ${TENON_GO_IMAGE:-golang:1.26}
+    image: tenon/agent:dev
+    environment:
+      TENON_HOST_URL: http://host:8080
+      # 指向 smoke profile 里的 stub（OpenAI 兼容，POST {base}/chat/completions）。
+      # 换成真模型只改这三行：BASE_URL / API_KEY / MODEL。
+      TENON_LLM_BASE_URL: http://llmstub:8099/v1
+      TENON_LLM_API_KEY: dummy
+      TENON_LLM_MODEL: stub-plan
+      TENON_LLM_TIMEOUT: 30s
+      # 代行委托人。审计里每条 actor.onBehalfOf 都取自它；缺了 agent 启动即失败。
+      TENON_ON_BEHALF_OF: user:alice
+      # 必须与 config/grants.dev.json 的 grant.agent 一致（dev 授权表写的是
+      # ag_fulfillment）；不一致时授权闸门 fail-closed 全拒，而且看起来像策略拒绝。
+      TENON_AGENT_ID: ag_fulfillment
+      # pending/、pending/archived/、processed.jsonl 的根目录（挂到宿主机 out/ 下）。
+      TENON_AGENT_STATE_DIR: /app/out/agent-state
+      # agent 自己的服务账号：入站 poll/ack 与公告板写入都要求 role:agent。
+      TENON_AGENT_USER: agent
+      TENON_AGENT_PASSWORD: agent-dev
+      # 单数 skill 目录：cmd/agent 读 SKILL.md 的订阅声明与正文。
+      TENON_SKILL_DIR: /app/skills
+      # 游标落盘：不落盘时进程重启会从头读发件箱（重放会产出新 planId）。
+      TENON_CURSOR_FILE: /app/out/agent-state/cursors.json
+      # 每回合一行结局（outcome/planId/动作序列）：观测入口，不是协议端点。
+      TENON_RESULT_FILE: /app/out/agent-result.jsonl
+      TENON_POLL_INTERVAL: 1s
+    volumes:
+      - ./out/docker-smoke:/app/out
+      - ./skills:/app/skills:ro
+    depends_on:
+      # 登录失败即进程启动失败，所以必须等 host 真的健康。
+      host:
+        condition: service_healthy
+      # stub 在 smoke profile 里：required:false 让「没开 profile」不算错误
+      # （agent 缺模型只是这一轮规划失败，不是起不来）。
+      llmstub:
+        condition: service_started
+        required: false
+    restart: unless-stopped
+
+  # 开发/冒烟专用的 stub LLM：不是模型，只从 prompt 里抓事件锚点并回一份固定 Plan。
+  # profile `smoke` 把它隔离掉——正常 `docker compose up` 不会带上它，
+  # 但 agent 的 TENON_LLM_BASE_URL 仍指向它，所以不带 profile 起的 agent 一规划就会失败。
+  # 这是有意的：宁可「没有模型时规划明显不可用」，也不要默认塞一个假模型。
+  llmstub:
+    profiles: ["smoke"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ENTRY: ./tools/llmstub
+        GO_IMAGE: ${TENON_GO_IMAGE:-golang:1.26}
+    image: tenon/llmstub:smoke
+    environment:
+      PORT: "8099"
+    ports:
+      - "127.0.0.1:18099:8099"
+    healthcheck:
+      test: ["CMD", "/app/probe", "http://127.0.0.1:8099/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 1s
+    restart: unless-stopped
+
+# HMAC 密钥内联注入：模块读它做事件验签，/readyz 也以「读得到」为就绪判据。
+# 用 config 而不是 docker secret：非 swarm 模式下 secret 只能从文件来，那就多一步
+# openssl 前置（compose.m0.yaml 走的是那条路）。这里 0644 可读、不可写，够开发用。
+# 生产必须换成编排平台的 secret 机制——这个值在 `docker compose config` 里是明文。
+configs:
+  tenon_hmac:
+    content: "tenon-dev-hmac-0123456789abcdef0123456789abcdef"

@@ -25,6 +25,9 @@ CMD ["node", "scripts/validate-spec.mjs"]
 FROM ${GO_IMAGE} AS go
 WORKDIR /src
 COPY go.mod ./
+# go.sum 必须一起拷：conformance 依赖 jsonschema/v6，缺 go.sum 时 go vet 会在
+# `missing go.sum entry` 处失败，而镜像里连 go.sum 都没有——报错会误导成"依赖缺失"。
+COPY go.sum ./
 COPY conformance ./conformance
 COPY tools ./tools
 COPY docker/checks-go.sh /usr/local/bin/checks-go
