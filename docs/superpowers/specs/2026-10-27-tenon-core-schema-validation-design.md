@@ -29,9 +29,9 @@
 | 错误路径 | JSON Pointer（`instancePath: "/actions"`） | 数组 `["actions"]`，需转换 |
 | 与 Go 对齐 | 同一种 JSON Pointer | 需额外映射层 |
 
-**决定：用 `ajv@8` + `ajv-formats`（2020-12 入口 `ajv/dist/2020.js`）。** 理由：这个包的职责就是「校验规范本身」，任何把规范翻译第二遍的方案都会引入漂移；自研最小校验器在 `$ref` 与组合关键字上风险过高。
+**决定：用 `ajv@8`（2020-12 入口 `ajv/dist/2020.js`）。** 理由：这个包的职责就是「校验规范本身」，任何把规范翻译第二遍的方案都会引入漂移；自研最小校验器在 `$ref` 与组合关键字上风险过高。
 
-**`ajv-formats` 是必需的**：`common.schema.json` 的 `Iso8601Timestamp` 用了 `format: date-time`，`strict: true` 下未注册的 format 会编译失败。
+> **执行期更正（2026-10-27）**：初版写「必须 `ajv-formats`」，实测不成立——全仓 schema 只用到一个 `format`（`date-time`），而 `ajv-formats` 是 55 KB 的 CJS 包，在 NodeNext 下还会带来默认导入不可调用的互操作问题。改为**自己注册一个 RFC 3339 校验器**（正则与 `common.schema.json` 的 `Iso8601Timestamp.pattern` 同源，再加 `Date.parse` 兜「结构对但日期不存在」）。未注册的 format 在编译期会报错，这反而是好事（fail-closed：新 format 必须显式声明）。
 
 ## 3. 未知字段（决策二：生产严、消费宽）
 
@@ -48,10 +48,12 @@
 
 | 视图 | ajv 配置 | 用途 | 多余字段的处理 |
 |---|---|---|---|
-| `lenient`（接收侧） | `strict: false` + `removeAdditional: 'all'` | 宿主/适配器校验收到的报文 | **剥离并放行** |
-| `strict`（一致性侧） | `strict: true` | conformance 套件校验**自产**报文 | 视为错误 |
+| `lenient`（接收侧） | `removeAdditional: 'all'` | 宿主/适配器校验收到的报文 | **剥离并放行** |
+| `strict`（一致性侧） | `removeAdditional: false` | conformance 套件校验**自产**报文 | 视为错误 |
 
 两者共享同一批 `addSchema`，**不存在第二份真源**。
+
+> **执行期更正（2026-10-27）**：初版让一致性视图开 ajv 的 `strict: true`（schema lint）。实测**三处误伤**——`action#/allOf/0/then` 的 `required` 不在本分支 `properties`（`strictRequired`）、`action#/properties/inputSchema` 的 union type、`audit-event#/allOf/0/if/properties/decision` 缺 `type: object`。这些都是**合法 JSON Schema**，lint 检查的是「schema 该怎么写」而不是「实例合不合法」，而本仓库 schema 已由 Go 校验器与 `validate-spec.mjs` 把关。因此两个视图**都关 lint**（`strict: false`），唯一差别是 `removeAdditional`——严格性只体现在实例上。
 
 **附带动作（文档）**：给 `versioning.md` §3.2 补一句「`additionalProperties: false` 约束的是写入方；读取方必须按本节忽略未知字段」。不补的话，下一个人还会踩同一个坑。
 
