@@ -395,7 +395,9 @@ POST /tenon/session
 ```
 POST /tenon/pending                # agent 每 tick 重推，同 planId 覆盖（幂等 upsert）
 { "planId": "pln_01JB...", "requestId": "req_...",
-  "summary": "扣减 STD-1001 × 12 待批", "items": [ ... ],
+  "summary": "扣减 STD-1001 库存 12 件（单据 REF-…）",
+  "items": [ { "label": "扣减 STD-1001 库存 12 件（单据 REF-…）",
+               "detail": "inventory.DeductStock（{\"sku\":\"STD-1001\",\"qty\":12}）" } ],
   "requiredRoles": ["role:warehouse_manager"], "expiresAt": "2026-10-27T10:00:00Z" }
 
 → 200 { "ok": true }
@@ -406,6 +408,7 @@ GET /tenon/pending
 
 - 两个方法**都要求 Bearer token**；`POST` 的 `by` 一律用 token 的 `sub` 覆写（条目里自报的身份只是展示文案，不构成来源凭证）。`planId` 缺失 → 400 `SCHEMA_MISMATCH`。
 - `GET` 返回**全部未过期条目**（不按角色裁剪）：过期条目在读取时剔除，按 `expiresAt` 升序返回。`mine` 只表示「当前 token 的角色与 `requiredRoles` 有交集」，供页面高亮；`requiredRoles` 为空即无人匹配。**`mine` 不是授权判定**——真正的审批权限校验在 agent 恢复时做（权威侧）。
+- `items[]` 逐 step 一条：`label` 是给人看的**白话**（由模块 manifest 的 `summaryTemplate` 渲染，失败退「标题 + 参数」），`detail` 是**技术原文**（action id + args），只供页面折叠区展示。宿主**不解释、不校验**这两个键（`items` 的容器是 `[]map[string]any`），也别把它当契约字段的替代——真要加字段，先改 schema 再说。
 - 公告板是**只读 read-model，刻意不落盘**：权威状态在 agent 盘上的 pending 文件，公告板可丢、可重建（agent 每 tick 重推即自愈）。host 不判断、不执行、不授权；持久化会造出第二份「权威状态」，与 agent 盘上的文件互相漂移。
 
 ---
