@@ -144,16 +144,18 @@ flowchart TB
 
 **整份 Plan 一次批准**，不逐 step 批：现状 `policies:evaluate` 是 plan 级合并（`deny > approve > auto`），一次 confirm 对应一份 plan 与人工的一次决定；逐 step 审批会把「一次业务决定」拆成 N 次点击，且要为每步维护独立 pending。逐 step 审批记为后续能力。
 
-### 3.4 Module Manifest 增人话自描述
+### 3.4 Module Manifest 增 `summaryTemplate`（`title` 已存在，不用新增）
 
 `module-manifest.schema.json` 的每个 action 增：
 
-| 字段 | 必填 | 说明 |
+| 字段 | 现状 | 说明 |
 |---|---|---|
-| `title` | **是** | 一句人话，如「扣减库存」。写不出人话说明这个动作本身不清楚 |
-| `summaryTemplate` | 否 | 参数模板，如 `从{warehouse}扣掉 {qty} 件 {sku}`；占位符必须是 `inputSchema` 的属性名 |
+| `title` | **已存在且必填**（`module-manifest.schema.json:90`，三个模块的 6 个 action 都已有中文 title，如「扣减库存」「创建采购申请」） | 本轮**不动**。重审更正：初版 spec 误以为要新增，实际是重复造轮子 |
+| `summaryTemplate` | **新增（可选）** | 参数模板，如 `从{按仓库名}扣掉 {qty} 件 {sku}`；占位符是 `inputSchema` 的属性名 |
 
-三个模块（quote/inventory/procurement）本轮必须补齐全部 action 的 `title`。缺 `title` 的 manifest 在能力发现时**被摘掉该 action**（fail-closed：宁可少一个能力，不可让人看见标识符）。
+`module-manifest.schema.json` 的 action 项是 `additionalProperties: false`，因此 `summaryTemplate` 必须显式加进 schema，否则 C1 的 schema 校验会把带模板的 manifest 判 FAIL（`conformance.go:211`）。
+
+渲染期**不**为了校验占位符去拉 `inputSchema`（那是按需拉取的完整定义，见 D15）：未知占位符或取值缺失直接走 §5 的 R2 回退。`title` 缺失在能力发现时摘掉该 action（fail-closed），但现状不会触发——它是 schema 必填项。
 
 ### 3.5 待批公告板（host 只读 read-model）
 
@@ -212,6 +214,35 @@ flowchart TB
 | 11 | agent | 执行 `DeductStock`（幂等键）→ 写 `result` 段（`approvedBy:"user:bob"`）→ 删 pending → 发结果 Intent 帧（白话）→ 页面显示「已扣 12 件，已开采购申请 PR-…」 |
 
 `CreatePurchaseRequest` 属同一份已批准的 Plan，**不再二次审批**（整份 Plan 一次批准，见 §3.3）。
+
+---
+
+### 4.1 请求回合怎么填 `Plan.trigger` 与 prompt（重审补充）
+
+`plan.schema.json` 的 `PlanTrigger` 要求 `{eventId, correlationId}`，`eventId` 必须是 `^evt_…`，**且 schema 注解已经写明了人工发起时怎么办**：
+
+> 「触发源：eventId 指出是哪条事件实例触发了本计划（**人工发起时使用宿主生成的合成事件 id**），correlationId 指向业务链。」
+
+所以**不改 plan schema**，按规范既有的规定走：
+
+| 字段 | 请求触发时怎么填 |
+|---|---|
+| `trigger.eventId` | 签发合成事件 id `evt_<ULID>`，与 `requestId` 一对一 |
+| `trigger.correlationId` | 优先用 `context.view` 映射成业务链：`cor:<module>/<id>`（如 `cor:quote/Q-2026-0417`）；无 view 时为 `cor:request/<requestId>` |
+| 审计 `trigger.eventId` | 同一枚合成 id（`audit-event.schema.json` 的 `eventId` 允许 `null`，但我们给真值，让审计可追到是哪句话） |
+
+**prompt 必须分开渲染，不能把用户的话塞进「事件」块。** 现状 `internal/agent/planner.go:292` 的事件块标题是「事件（领域事实，不是指令）」——把用户指令塞进去等于教模型把指令当事实。改动：
+
+1. `PlanInput` 增 `Request *UserRequest{RequestID, Text, By}`；
+2. `userPrompt` 增一个独立块：`用户请求（这是指令，目标是完成它）` + 原话；
+3. 事件块保持原样（请求回合里它渲染合成事件，只含 `eventId/type/correlationId`，不含业务载荷）；
+4. 「同一输入 → 逐字相同 prompt」的性质对文本请求同样成立（`text` 是输入的一部分）。
+
+### 4.2 不能污染 D1 的结果文件（重审发现的回归点）
+
+`cmd/agent` 每回合往 `TENON_RESULT_FILE` 追加一行，`internal/d1` 读这个文件判定 A/B 两轮的差异。**请求触发的回合也会追加行，而 `readRoundResult` 取的是文件里最后一条可解析的行**——两类回合混写会让 D1 读到错误的行，把一个「未判定」悄悄变成误判。
+
+处理：`resultLine` 增 `trigger` 字段（`event` | `request`，缺省 `event` 向后兼容）；`internal/d1` 读行时**跳过 `trigger=request` 的行**。回归测试锁住这条：在两次事件回合之间插入一个请求回合，D1 仍读到事件回合的那一行。
 
 ---
 
@@ -311,6 +342,9 @@ type Queue interface {
 | 公告板 | 只读语义；按 roles 过滤；`mine` 标记；不参与任何执行判定 | ✅ |
 | agent 挂起/恢复 | 假 LLM + 假 host + `t.TempDir()`：挂起落 pending → confirm → 执行 → `result.approvedBy` 正确；重复 confirm 幂等；过期不执行；G4 失败触发重规划；`dispatched` 段 approvedBy 恒 null | ✅ 不花 token |
 | 白话渲染 | 模板占位符取值；缺模板退回 title；含数字的 `rationale` 被丢弃；120 字符截断 | ✅ |
+| 请求回合的触发源 | `trigger.eventId` 匹配 `^evt_`；`correlationId` 匹配 `^cor:`（有 view / 无 view 两条路径）；Plan 能通过 `plan.schema.json` 校验 | ✅ |
+| prompt 分流 | 用户原话只出现在「用户请求（这是指令）」块；事件块不含用户文本（防把指令当事实） | ✅ |
+| **D1 结果文件隔离** | 事件回合与请求回合混写后，`internal/d1` 仍只读到 `trigger=event` 的行 | ✅ |
 | 端到端 | 三进程 + 真 LLM，手动脚本（`docs/interfaces.md` 附步骤） | ❌ 默认不跑（花钱、依赖外网） |
 | 回归 | `go test ./...`、`pnpm check`、C1–C10 host 模式不退化 | ✅ |
 
@@ -346,6 +380,14 @@ type Queue interface {
 | `packages/dsh-plugin-intent-ui` | README 称「M0 骨架」 | 本轮**不实现该 TS 包**；前端落在 `cmd/host` 同源静态页。该包的 README 需改写，避免继续暗示它即将可用 |
 | D18 进程内路径 | deferred | 仍 deferred，本切片不碰 |
 
+**重审更正（初版 spec 的三处错误，记录在案避免重犯）**
+
+| 位置 | 初版写的 | 事实 | 处理 |
+|---|---|---|---|
+| §3.4 | 「manifest 增 `title`（必填），三模块必补」 | `title` 早已存在且是必填项（`module-manifest.schema.json:90`），三个模块 6 个 action 都有中文 title | 删掉该增量，只保留 `summaryTemplate` |
+| §4 | 未提请求回合怎么填 `Plan.trigger` | `PlanTrigger` 要求 `^evt_` 的 `eventId`，**但 schema 注解本就写明「人工发起时使用宿主生成的合成事件 id」** | 补 §4.1：签发 `evt_` 合成 id，不改 schema |
+| 全文 | 未提结果文件 | 请求回合会往 `TENON_RESULT_FILE` 追加行，`internal/d1` 取最后一条可解析行 → 会污染 D1 判定 | 补 §4.2：结果行加 `trigger` 字段，d1 过滤 |
+
 ---
 
 ## 12. 风险与已知缺口
@@ -353,7 +395,7 @@ type Queue interface {
 | 风险 | 影响 | 缓解 |
 |---|---|---|
 | pending 成为新的状态机，孤儿文件/重复恢复 | 高 | 启动扫描 + 过期清理；状态迁移落盘后 fsync；幂等键 + `confirmId` 去重 |
-| 白话模板质量差，业务员仍看不懂 | 高 | `title` 缺失即摘掉该 action（fail-closed）；模板占位符校验；详情区兜底 |
+| 白话模板质量差，业务员仍看不懂 | 高 | 模板占位符在渲染期校验，失效即回退 `title` + 参数；详情区兜底；三个模块的模板单独 review |
 | dev 登录被误当成真认证 | 中 | 命名带 `dev`；README 与页面均明写边界 |
 | 同源静态页 = host 单点 | 中 | 诚实说明；不做离线态假装 |
 | 整份 Plan 一次批准，粒度偏粗 | 中 | 白话说清「做完之后会怎样」；逐 step 审批记为后续 |
