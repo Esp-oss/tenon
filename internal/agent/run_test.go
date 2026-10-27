@@ -374,19 +374,156 @@ func TestPolicyDeniedGoesNeedsHumanWithoutWorkaround(t *testing.T) {
 	}
 }
 
+// approve 命中、但**没有挂起通道**（Deps.State 为 nil）→ 仍转人工，且不带 pendingPlanId。
+//
+// 这是 M0.5 行为的保留路径：没有状态目录时 approve 只能是「人来按」，不能假装能挂起。
+// 「没有挂起通道」的唯一表达就是 State 为 nil——空串会被 NewStateStore 拒绝（§0.1.6）。
 func TestPolicyApproveGoesNeedsHumanWithoutApprovalChannel(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{planJSON("pln_approve01", testStep{id: "s1", action: "inventory.DeductStock"})}
 	env.Host.PolicyOutcome = "approve"
 
-	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+	deps := env.Deps()
+	deps.State = nil
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
 
-	// 只有 auto 允许自动执行：approve 要人来按，而 M0.5 没有确认通道。
+	// 三态封闭：转人工就是 needs_human，不新增第四态。
 	if res.Outcome != OutcomeNeedsHuman {
 		t.Fatalf("approve 必须转人工，得到 %q（%s）", res.Outcome, res.Detail)
 	}
+	if res.PendingPlanID != nil {
+		t.Fatalf("没有挂起通道时不该报 pendingPlanId，得到 %q", *res.PendingPlanID)
+	}
 	if env.Module.WriteCalls != 0 {
 		t.Fatalf("没有人批准就不能执行写动作，实际 write=%d", env.Module.WriteCalls)
+	}
+	// 授权与预演必须在「挂起还是转人工」之前跑完（fail-closed 要早）：一份注定过不了
+	// 授权或预演的计划，不该挂上公告板等人白批一次。
+	want := []string{"policies:evaluate", "grants:evaluate", "dry-run"}
+	if !equalSeq(env.Trace, want) {
+		t.Fatalf("approve 未放行时仍要先跑完授权与预演：实际 %v，期望 %v", env.Trace, want)
+	}
+	// 事件回合的 Request 必须保持 nil：多一个空请求块，prompt 就把「事实」读成「指令」。
+	if strings.Contains(env.LLM.LastUser, "用户请求") {
+		t.Fatalf("事件回合不该出现用户请求块：\n%s", env.LLM.LastUser)
+	}
+}
+
+// approve 且配置了状态目录 → 挂起：结局仍是 needs_human，但带 pendingPlanId。
+func TestPolicyApproveSuspendsWhenChannelConfigured(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	env.LLM.replies = []string{planJSON("pln_appr01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "approve"
+
+	deps := env.Deps()
+	deps.State = store
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("挂起后结局仍是 needs_human（三态封闭），得到 %q", res.Outcome)
+	}
+	if res.PendingPlanID == nil || *res.PendingPlanID != "pln_appr01" {
+		t.Fatalf("必须带 pendingPlanId，得到 %+v", res.PendingPlanID)
+	}
+	p, ok, _ := store.Load("pln_appr01")
+	if !ok {
+		t.Fatalf("pending 未落盘")
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("挂起不是执行：write=%d execute=%d", env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+	// pending 必须填全：漏 ExpiresAt 会被 Expired() 的 fail-closed 立刻判过期（§0.1.7），
+	// 漏 labels 则审批人看到的是一张没有白活的卡。
+	if p.ExpiresAt == "" || p.Expired(time.Now()) {
+		t.Fatalf("expiresAt 必须是未来时刻，得到 %q", p.ExpiresAt)
+	}
+	if p.CreatedAt == "" || p.By != "user:alice" || p.TriggerEventID != "evt_test0001" {
+		t.Fatalf("pending 的身份锚点没填全：%+v", p)
+	}
+	if p.Origin != "event" || p.RequestID != nil {
+		t.Fatalf("事件回合的 pending 必须是 origin=event 且 requestId=null：%+v", p)
+	}
+	if len(p.Labels) != 1 || !strings.Contains(p.Labels[0], "inventory.DeductStock") {
+		t.Fatalf("labels 要逐 step 渲染：%+v", p.Labels)
+	}
+	if p.Summary == "" {
+		t.Fatalf("summary 不能为空：%+v", p)
+	}
+	if p.Plan.PlanID != "pln_appr01" || len(p.Plan.Steps) != 1 {
+		t.Fatalf("plan 要存全文（恢复时按原计划执行）：%+v", p.Plan)
+	}
+	if p.AuditSettled != true || p.DispatchedAuditID == "" {
+		t.Fatalf("I7 三次落盘没走完：%+v", p)
+	}
+}
+
+// deny 仍然直接转人工，不产生 pending。
+func TestPolicyDenyDoesNotSuspend(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	env.LLM.replies = []string{planJSON("pln_deny01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "deny"
+
+	deps := env.Deps()
+	deps.State = store
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman || res.PendingPlanID != nil {
+		t.Fatalf("deny 不该挂起：%+v", res)
+	}
+	if items, _ := store.List(); len(items) != 0 {
+		t.Fatalf("deny 不该写 pending：%+v", items)
+	}
+	// deny 之后不许再跑授权与预演：拒绝就该立刻停，别给「换个计划再试」留余地。
+	if want := []string{"policies:evaluate"}; !equalSeq(env.Trace, want) {
+		t.Fatalf("deny 之后不该再碰闸门：实际 %v，期望 %v", env.Trace, want)
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("deny 不得执行，实际 write=%d", env.Module.WriteCalls)
+	}
+}
+
+// request 回合命中 approve → 同样挂起，只是 origin=request、requestId 有值
+// （spec §6.3：「等审批」只有一条实现路径，不分来源）。
+//
+// 同时锁住 Run 把 in.Request 传给规划器这条接线：漏了它，prompt 分流永远不生效
+// （PlanInput.Request 恒 nil，用户原话进不了「指令」块）。
+func TestRequestTurnSuspendsWithOriginRequest(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	env.LLM.replies = []string{planJSON("pln_req01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "approve"
+
+	deps := env.Deps()
+	deps.State = store
+	in := RunInput{
+		Event:   DomainEvent{EventID: "evt_req_1", Type: "tenon.request", CorrelationID: "cor:req/req_1"},
+		Request: &UserRequest{RequestID: "req_1", Text: "把 Q-1 的 12 件扣掉", By: "user:alice"},
+	}
+	res := Run(context.Background(), deps, in)
+
+	if res.Outcome != OutcomeNeedsHuman || res.PendingPlanID == nil || *res.PendingPlanID != "pln_req01" {
+		t.Fatalf("request 回合命中 approve 也要挂起：%+v", res)
+	}
+	p, ok, _ := store.Load("pln_req01")
+	if !ok {
+		t.Fatalf("pending 未落盘")
+	}
+	if p.Origin != "request" || p.RequestID == nil || *p.RequestID != "req_1" {
+		t.Fatalf("request 回合的 pending 必须带 requestId：%+v", p)
+	}
+	if !strings.Contains(env.LLM.LastUser, "用户请求（这是指令") {
+		t.Fatalf("Run 必须把 in.Request 传给规划器（否则 prompt 分流永远不生效）：\n%s", env.LLM.LastUser)
 	}
 }
 

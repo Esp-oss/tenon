@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -86,6 +87,28 @@ func suspend(ctx context.Context, store *StateStore, deps Deps, p Pending) error
 
 // correlationOf 取 pending 里的业务链锚点（存在 Plan.Trigger 里）。
 func correlationOf(p Pending) string { return p.Plan.Trigger.CorrelationID }
+
+// renderLabels 逐 step 渲染一句白话。
+//
+// **这是本计划显式接受的降级，不是占位实现**：真正的人话来自模块 manifest 的
+// summaryTemplate（P1 已加 schema 字段，模块尚未填），模板实现属于 P3，届时在这里换掉
+// 兜底分支、签名与调用方都不动。在那之前只能用「动作 id + 参数摘要」——它不解释业务
+// 含义，但保证审批人看得见「要调哪个动作、带什么参数」。
+//
+// 数字只从 args 取，模型不参与（spec §5 R1–R3）：重跑恢复时若重新渲染，审批人看到的
+// 就必须是当初那份参数，而不是模型的第二次猜测。
+func renderLabels(plan Plan) ([]string, error) {
+	out := make([]string, 0, len(plan.Steps))
+	for _, step := range plan.Steps {
+		args := strings.TrimSpace(string(step.Args))
+		if args == "" || args == "{}" {
+			out = append(out, step.Action)
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s（%s）", step.Action, truncateRunes(args, 80)))
+	}
+	return out, nil
+}
 
 // postAuditRecord 把一条审计记录发给宿主；非 200 一律算失败（宿主承诺 200 即已落盘）。
 func postAuditRecord(ctx context.Context, deps Deps, rec auditRecord) error {

@@ -4,11 +4,16 @@
 // 顺序**不可调换**（TestGateOrder 锁定）：
 //
 //	1 规划（Plan 过 plan.schema.json）
-//	2 policies:evaluate   → 不是 auto 就转人工（deny 不得换路绕过，approve 也要人来按）
+//	2 policies:evaluate   → deny 直接转人工（不得换路绕过）；approve 只记下「需要审批」，
+//	  继续跑 3、4，最后才挂起。授权与预演必须早于「决定挂起」：一份注定过不了授权/
+//	  预演的计划，不该挂上公告板等人白批一次（fail-closed 要早）。没有挂起通道
+//	  （Deps.State 为 nil）时 approve 仍转人工——这是 M0.5 行为的保留路径
 //	3 grants:evaluate     → 逐 action 全部先过（不允许即转人工）
 //	4 每个 write 的 :dry-run（**404 也转人工**：模块不实现预演不等于免检；
 //	  结论不是 verified 同样转人工——fail-closed，见设计文档 §8 降级矩阵）
-//	5 每步执行前写 stage=dispatched 审计（非 200 立即终止，本次调用数必须为 0）
+//	5 需要审批 → 挂起（I7 三次落盘；结局仍是 needs_human + PendingPlanID，
+//	  三态封闭不新增第四态）。否则每步执行前写 stage=dispatched 审计
+//	  （非 200 立即终止，本次调用数必须为 0）
 //	6 执行（write 带 Idempotency-Key = protocol.IdempotencyKey(planId, stepId)）
 //	7 写 stage=result 审计
 //	8 按错误分类处理：retryable 退避重试（幂等键不变）；business_rejection 重新规划；
@@ -62,6 +67,8 @@ const (
 	// 以下取值来自 spec/0.1 的 schema（policy / plan / frames），本文件只引用字符串，
 	// 不复制它们的语义定义。
 	outcomeAuto     = "auto"     // policy.schema.json 的 outcome：可自动执行
+	outcomeApprove  = "approve"  // policy.schema.json 的 outcome：等人工批准，agent 只能挂起
+	outcomeDeny     = "deny"     // policy.schema.json 的 outcome：转人工，不得换路
 	kindRead        = "read"     // plan.schema.json 的 kind
 	kindWrite       = "write"    // plan.schema.json 的 kind
 	dryRunVerified  = "verified" // plan.schema.json 的 DryRunStatus：唯一允许自动执行的值
@@ -89,9 +96,15 @@ const (
 //
 // CorrelationID 可省略（空串时用事件自带的）：它只影响审计与 Intent 帧的业务链锚点，
 // 不影响闸门判定。
+//
+// Request 是**人工发起**时的原话（tenon.request 帧），事件回合为 nil。它与 Event 的
+// 语义不同：Event 是领域事实，Request 是**指令**，所以两者必须分块进 prompt
+// （planner.userPrompt 负责分流）。塞一个非 nil 的空 UserRequest，事件回合的 prompt
+// 就会凭空多出一个空指令块——判空要看 nil，不要看 Text 是否为空。
 type RunInput struct {
 	Event         DomainEvent
 	CorrelationID string
+	Request       *UserRequest
 }
 
 // RunResult 是一个回合的结局。ActionsTaken 只记**真正执行过**的动作（按执行顺序），
@@ -101,6 +114,11 @@ type RunResult struct {
 	PlanID       string
 	ActionsTaken []string
 	Detail       string
+	// PendingPlanID 非 nil 表示有一份 pending 已落盘、可被推进（approve 命中的挂起）。
+	//
+	// 结局仍是 needs_human——三态封闭，不新增第四态（run.go 的 Outcome 注释写死）：
+	// 「等审批」本来就是「agent 正确地举手」，只是这次举手带了一张可被批准的卡。
+	PendingPlanID *string
 }
 
 // Deps 是 Run 的全部外部依赖。
@@ -115,6 +133,11 @@ type Deps struct {
 	HTTP       *http.Client
 	Skills     *SkillStore
 	Trace      *[]string
+	// State 是 pending 的持久化口；为 nil 表示「没有挂起通道」，approve 一律转人工。
+	//
+	// 用 nil 而不是空串表达「没有」：NewStateStore("") 会报错（§0.1.6），
+	// 装配时把空串传进来只会在第一轮挂起时炸掉，而不是在装配时炸掉。
+	State *StateStore
 }
 
 // Run 跑完一个回合并返回结局。它**不返回 error**：三种结局已经涵盖了「要不要人来」
@@ -135,7 +158,8 @@ func Run(ctx context.Context, deps Deps, in RunInput) RunResult {
 	if correlation == "" {
 		correlation = strings.TrimSpace(event.CorrelationID)
 	}
-	r := &runner{deps: deps, host: strings.TrimRight(host, "/"), event: event, correlationID: correlation}
+	r := &runner{deps: deps, host: strings.TrimRight(host, "/"), event: event,
+		request: in.Request, correlationID: correlation}
 	r.client = deps.HTTP
 	if r.client == nil {
 		r.client = &http.Client{Timeout: defaultHTTPTimeout}
@@ -150,6 +174,8 @@ type runner struct {
 	event         DomainEvent
 	correlationID string
 	client        *http.Client
+	// request  是人工发起时的原话；事件回合为 nil（挂起时决定 origin 与 requestId）。
+	request *UserRequest
 	// modules 是「enabled 且 manifest 可达」的模块 → 基地址；执行与预演都只认它。
 	modules map[string]string
 	taken   []string // 真正执行过的动作
@@ -180,6 +206,8 @@ func (r *runner) run(ctx context.Context) RunResult {
 			SkillText: skillText,
 			Modules:   digest,
 			Feedback:  feedback,
+			// 事件回合这里是 nil：prompt 不得凭空多出一个空指令块（Task 6 的判据）。
+			Request: r.request,
 		})
 		if rejection == "" {
 			return r.finish(ctx, res)
@@ -230,13 +258,25 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 	plan.Trigger = PlanTrigger{EventID: r.event.EventID, CorrelationID: r.correlationID}
 	r.planID = plan.PlanID
 
-	// 闸门 2：策略。整份计划取最严（宿主实现），agent 只认 auto。
+	// 闸门 2：策略。整份计划取最严（宿主实现）。
+	//
+	// deny 直接转人工；approve 只记下「需要审批」并继续往下走——授权与预演必须跑在
+	// 「决定挂起」之前（fail-closed 要早：注定过不了授权/预演的计划不该挂上公告板
+	// 等人白批一次），最后才由闸门 5 决定「挂起还是执行」。
 	policy, err := r.evaluatePolicies(ctx, plan)
 	if err != nil {
 		return RunResult{Outcome: OutcomeFailed,
 			Detail: "策略评估不可用（fail-closed，不做任何写）：" + err.Error()}, ""
 	}
-	if policy.Outcome != outcomeAuto {
+	if policy.Outcome == outcomeDeny {
+		return RunResult{Outcome: OutcomeNeedsHuman,
+			Detail: fmt.Sprintf("策略闸门拒绝：outcome=%s decidedBy=%v reasons=%v（转人工，不换路绕过）",
+				policy.Outcome, policy.DecidedBy, policy.Reasons)}, ""
+	}
+	// policy.schema.json 是封闭枚举，但宿主的响应不受本包控制：除 auto/approve 之外的
+	// 任何取值（含空串）都按「没放行」处理——不猜它是不是 approve，也不让它掉进执行。
+	needApproval := policy.Outcome == outcomeApprove
+	if policy.Outcome != outcomeAuto && !needApproval {
 		return RunResult{Outcome: OutcomeNeedsHuman,
 			Detail: fmt.Sprintf("策略闸门未放行：outcome=%s decidedBy=%v reasons=%v（转人工，不换路绕过）",
 				policy.Outcome, policy.DecidedBy, policy.Reasons)}, ""
@@ -283,6 +323,30 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 		}
 	}
 
+	// 闸门 5：需要审批 → 挂起（I7 三次落盘），一步都不执行。
+	//
+	// 挂起不是第四种结局：needs_human + PendingPlanID 表达「等人按一下就能继续」。
+	// 挂起失败映射成 needs_human（不是 failed）：这一轮确实什么都没做、也不该重试——
+	// 同一份 pending 再调一次 suspend 会复用同一个 auditId，审计链出现重复记录。
+	if needApproval {
+		if r.deps.State == nil {
+			return RunResult{Outcome: OutcomeNeedsHuman,
+				Detail: fmt.Sprintf("策略闸门要求审批（outcome=%s decidedBy=%v），但没有挂起通道（Deps.State 为空）：转人工",
+					policy.Outcome, policy.DecidedBy)}, ""
+		}
+		pending, err := r.buildPending(plan, policy)
+		if err != nil {
+			return RunResult{Outcome: OutcomeNeedsHuman, Detail: err.Error()}, ""
+		}
+		if err := suspend(ctx, r.deps.State, r.deps, pending); err != nil {
+			return RunResult{Outcome: OutcomeNeedsHuman,
+				Detail: "挂起失败（不留半截 pending）：" + err.Error()}, ""
+		}
+		id := pending.PlanID
+		return RunResult{Outcome: OutcomeNeedsHuman, PlanID: id, PendingPlanID: &id,
+			Detail: fmt.Sprintf("已挂起等待审批：planId=%s 需要 %v", id, pending.RequiredRoles)}, ""
+	}
+
 	// 闸门 5–7：按依赖顺序执行，每步各写两段审计。
 	ordered, err := orderSteps(plan.Steps)
 	if err != nil {
@@ -311,6 +375,46 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 	}
 	return RunResult{Outcome: OutcomeCompleted,
 		Detail: fmt.Sprintf("计划全部执行成功：%d 步", len(ordered))}, ""
+}
+
+// buildPending 把 plan 与本轮的闸门结论打包成一份 pending。
+//
+// labels 在这里渲染并落盘，恢复时不重算：白话来自身份化模板，模板改了两边文字就会
+// 不一致（spec §3 的 pending 契约）。CreatedAt/ExpiresAt 必须在这里填——suspend 只管
+// I7 的三次落盘，不碰时间；漏填 ExpiresAt 会让 Expired() 对空串 fail-closed 返回 true，
+// 下一轮自检立刻把这份 pending 归档成 expired（§0.1.7）。
+//
+// requestId 可为 null（事件回合）：spec §6.3 要求「等审批」只有一条实现路径，不分来源，
+// 所以事件回合也挂起，只是 origin=event。
+func (r *runner) buildPending(plan Plan, policy policyEvaluation) (Pending, error) {
+	labels, err := renderLabels(plan)
+	if err != nil {
+		return Pending{}, fmt.Errorf("渲染白话失败：%w", err)
+	}
+	now := time.Now().UTC()
+	var reqID *string
+	if r.request != nil && r.request.RequestID != "" {
+		id := r.request.RequestID
+		reqID = &id
+	}
+	origin := "event"
+	if r.request != nil {
+		origin = "request"
+	}
+	return Pending{
+		PlanID:         plan.PlanID,
+		State:          StateAwaitingApproval,
+		RequestID:      reqID,
+		TriggerEventID: plan.Trigger.EventID,
+		Origin:         origin,
+		By:             r.deps.OnBehalfOf,
+		Plan:           plan,
+		Labels:         labels,
+		Summary:        strings.Join(labels, "；"),
+		RequiredRoles:  policy.Approvers,
+		CreatedAt:      now.Format(time.RFC3339),
+		ExpiresAt:      now.Add(pendingTTL).Format(time.RFC3339),
+	}, nil
 }
 
 // ---------- 能力发现 ----------
@@ -736,7 +840,7 @@ func (r *runner) auditBase(plan Plan, step PlanStep, auditID, stage string, gate
 			Outcome:    gate.outcome,
 			PolicyID:   nilIfEmpty(gate.policyID),
 			GrantID:    nilIfEmpty(gate.grantID),
-			ApprovedBy: nil, // 本轮没有人工批准通道：approve 一律转人工
+			ApprovedBy: nil, // 走到执行的计划必是 auto：approve 在挂起路径上（buildPending），deny 直接转人工
 		},
 		Effects:    auditEffects{Entities: r.entities()},
 		TokenUsage: auditTokenUsage{}, // internal/llm 目前不回传用量，见交付说明的已知缺口
