@@ -2303,11 +2303,16 @@ git commit -m "feat(controlplane): 公告板条目带回 state（终态覆盖否
 3. **`resumeError.Retryable` 要能被调用方判断**：加 `agent.IsRetryable(err) bool`；确定性拒绝（角色不匹配/过期/未知 planId/已归档非 done/未知处置）立即 ack，可重试才留到下一 tick。
 4. **合成事件 id 必须确定性**：`evt_req_<requestId>`，**不要用 `newID()`**（时间基会让同一 request 在重启/重放后 triggerEventId 漂移，审计对账对不上）。
 
+- **Task 10b 复核后的更正（比本节正文更权威）**：
+  1. **合成事件 id 用宿主签发的 `syntheticEventId`，不要自己拼 `evt_req_<requestId>`**（原第 4 条是错的）：`docs/interfaces.md:382` 明文要求沿用；且宿主 origin 登记表以宿主签发的 id 为键，自造 id 会把 `origin=request` 判成 `event` → `plat-request-needs-human` 失效 → **对话发起的采购单被自动放行**。
+  2. **入站游标只跟"已 ack 的 seq"**，不要用 `PollInbound` 的 `nextCursor`：宿主按 `Since(after)` 回放，用 nextCursor 会让未 ack 的帧永远回不来。
+  3. **审批人角色通道（Task 10c）**：宿主在 confirm 帧注入 token claims 的 roles（并删除客户端自报），agent 读帧里的 roles。缺这条 approve 永远 403。
+
 **Files:**
 - Modify: `cmd/agent/main.go`
 - Test: `cmd/agent/main_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // tick 的四段顺序是唯一的调度契约（入站 → 自检 → 公告板 → 事件），必须有用例锁住。
@@ -2367,7 +2372,7 @@ func (p *poller) Steps() []string {
 > （`/tenon/events`、`/tenon/modules` 契约同 `internal/agent/run_test.go` 的既有假 host），
 > 返回装好 `hostc` / `store` / `ledger` / `steps` 的 `poller`。**照 `run_test.go` 的写法抄，不要新造一套风格。**
 
-- [ ] **Step 2: 改 `cmd/agent/main.go`**
+- [x] **Step 2: 改 `cmd/agent/main.go`**
 
 ### Step 2 前置：Task 2 复核后追加的四条硬要求
 
@@ -2574,12 +2579,12 @@ func (p *poller) handleInbound(ctx context.Context, typ string, raw []byte) erro
 
 > `rolesOf` 从 token claims 拿：`HostClient` 登录响应里有 `roles`，在 `Login` 时缓存到 `poller`；本任务要求把 `HostClient` 的 claims 暴露为 `Claims() (subject string, roles []string)`。**不要**另造一次登录。
 
-- [ ] **Step 3: 跑测试**
+- [x] **Step 3: 跑测试**
 
 Run: `go build ./... && go test ./cmd/agent/ -count=1`
 Expected: 编译通过；tick 顺序用例按实现者的骨架断言通过
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add cmd/agent/main.go cmd/agent/main_test.go
