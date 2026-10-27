@@ -1,0 +1,11 @@
+{
+  "name": "@tenon/dsh-plugin-intent-ui",
+  "version": "0.0.0",
+  "private": true,
+  "description": "共驾三帧的 WS 通道 + REST 降级端点 + 前端 UI 插件",
+  "type": "module",
+  "files": ["dist"],
+  "scripts": {},
+  "peerDependencies": { "@deepseek-ai/cordis": ">=3" },
+  "engines": { "node": ">=22" }
+}

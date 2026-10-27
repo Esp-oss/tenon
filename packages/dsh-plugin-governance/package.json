@@ -1,0 +1,11 @@
+{
+  "name": "@tenon/dsh-plugin-governance",
+  "version": "0.0.0",
+  "private": true,
+  "description": "治理控制平面：registry、grant 矩阵、policy 引擎、approval、审计存储与查询、对账 job",
+  "type": "module",
+  "files": ["dist"],
+  "scripts": {},
+  "peerDependencies": { "@deepseek-ai/cordis": ">=3" },
+  "engines": { "node": ">=22" }
+}

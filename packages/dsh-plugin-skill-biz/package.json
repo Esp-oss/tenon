@@ -1,0 +1,11 @@
+{
+  "name": "@tenon/dsh-plugin-skill-biz",
+  "version": "0.0.0",
+  "private": true,
+  "description": "业务流程 skill 仓库：复用 dsh-skill，提供发布审计与一键回滚",
+  "type": "module",
+  "files": ["dist"],
+  "scripts": {},
+  "peerDependencies": { "@deepseek-ai/cordis": ">=3" },
+  "engines": { "node": ">=22" }
+}

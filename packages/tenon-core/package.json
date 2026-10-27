@@ -1,0 +1,11 @@
+{
+  "name": "@tenon/core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "协议类型、schema 校验、EntityRef 寻址、幂等键、sha256 哈希与 HMAC 签名工具",
+  "type": "module",
+  "files": ["dist"],
+  "scripts": {},
+  "peerDependencies": {},
+  "engines": { "node": ">=22" }
+}

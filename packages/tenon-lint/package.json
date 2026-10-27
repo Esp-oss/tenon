@@ -1,0 +1,11 @@
+{
+  "name": "@tenon/lint",
+  "version": "0.0.0",
+  "private": true,
+  "description": "C10 反模式 AST 扫描：事件订阅回调内的 action 字面量、错误码到 action 的映射、skill 正文里的动作标识符",
+  "type": "module",
+  "files": ["dist"],
+  "scripts": {},
+  "peerDependencies": {},
+  "engines": { "node": ">=22" }
+}
