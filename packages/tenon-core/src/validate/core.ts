@@ -58,7 +58,11 @@ function build(strict: boolean): Ajv2020 {
     strict: false,
     // 两个视图的唯一差别：接收侧剥离未知字段（versioning.md §3.2 未知字段必须忽略）；
     // 一致性侧保留未知字段，好让 additionalProperties 报错。
-    removeAdditional: strict ? false : 'all',
+    //
+    // 用 `true`（只对写了 additionalProperties:false 的对象生效）而不是 `'all'`：
+    // `'all'` 会把「不在本层 properties 里的字段」一律删掉——而本仓库有些 schema 的字段
+    // 定义在 allOf/$ref 分支里，`'all'` 会把合法字段误删，导致 required 反而报缺失。
+    removeAdditional: strict ? false : true,
   })
   addFormats(ajv)
 
