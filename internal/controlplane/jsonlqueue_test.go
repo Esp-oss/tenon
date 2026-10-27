@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -104,5 +105,54 @@ func TestJSONLQueueIgnoresTruncatedTail(t *testing.T) {
 	defer again.Close()
 	if again.Highest() != 1 {
 		t.Fatalf("半行不该被计入序号，最高应为 1，得到 %d", again.Highest())
+	}
+}
+
+// 整份文件损坏时，序号不能退回 0：否则持旧游标的客户端会漏掉以后所有帧。
+func TestJSONLQueueCorruptFileKeepsSequence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbound.jsonl")
+	q, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("打开失败：%v", err)
+	}
+	q.Push(json.RawMessage(`{"n":1}`))
+	q.Push(json.RawMessage(`{"n":2}`))
+	if err := q.Close(); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+
+	// 把主文件整体写坏：模拟磁盘损坏/被截断。
+	if err := os.WriteFile(path, []byte(`{"seq":9,"fra`), 0o600); err != nil {
+		t.Fatalf("写坏文件失败：%v", err)
+	}
+
+	again, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("重开失败：%v", err)
+	}
+	defer again.Close()
+	if got := again.Highest(); got != 2 {
+		t.Fatalf("水位应由 meta 恢复为 2，得到 %d", got)
+	}
+	if seq := again.Push(json.RawMessage(`{"n":3}`)); seq != 3 {
+		t.Fatalf("坏文件后新帧序号应为 3，得到 %d", seq)
+	}
+}
+
+// meta 文件是水位的水位：它必须真的被写下来。
+func TestJSONLQueueWritesMeta(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbound.jsonl")
+	q, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("打开失败：%v", err)
+	}
+	defer q.Close()
+	q.Push(json.RawMessage(`{"n":1}`))
+	raw, err := os.ReadFile(path + ".meta")
+	if err != nil {
+		t.Fatalf("meta 未写出：%v", err)
+	}
+	if !strings.Contains(string(raw), `"seq":1`) {
+		t.Fatalf("meta 内容不对：%s", raw)
 	}
 }

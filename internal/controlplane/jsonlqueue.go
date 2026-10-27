@@ -24,6 +24,10 @@ type jsonlQueue struct {
 
 	// broken 记住第一次落盘失败：队列已不可信，让 Close() 把它暴露出来。
 	broken error
+
+	// metaPath 存序号高位水位。它不存帧内容，只在主文件损坏时兜底序号，
+	// 避免游标退回 0 导致持旧游标的客户端永久漏帧。
+	metaPath string
 }
 
 var _ Queue = (*jsonlQueue)(nil)
@@ -37,6 +41,7 @@ func newJSONLQueue(path string, capacity int) (*jsonlQueue, error) {
 		return nil, fmt.Errorf("controlplane: 创建入站队列目录失败：%w", err)
 	}
 	q := &jsonlQueue{path: path, capacity: capacity, frames: make([]queuedFrame, 0, capacity)}
+	q.metaPath = path + ".meta"
 	if err := q.load(); err != nil {
 		return nil, err
 	}
@@ -70,12 +75,57 @@ func (q *jsonlQueue) load() error {
 		}
 		q.frames = append(q.frames, rec)
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	q.loadMeta()
+	return nil
+}
+
+// loadMeta 读回水位。失败只告警不回退：主文件里仍可能有一份更大的 seq。
+func (q *jsonlQueue) loadMeta() {
+	raw, err := os.ReadFile(q.metaPath)
+	if err != nil {
+		return // 没有 meta 是正常情况（首次运行）
+	}
+	var meta struct {
+		Seq int64 `json:"seq"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		log.Printf("controlplane: 入站队列水位文件不可解析，忽略：%v", err)
+		return
+	}
+	if meta.Seq > q.seq {
+		q.seq = meta.Seq
+	}
+}
+
+// saveMeta 落水位。先写临时文件再改名：半个 meta 比没有 meta 更坏。
+func (q *jsonlQueue) saveMeta() {
+	tmp := q.metaPath + ".tmp"
+	raw, err := json.Marshal(map[string]int64{"seq": q.seq})
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
+		log.Printf("controlplane: 写入站队列水位失败：%v", err)
+		return
+	}
+	if err := os.Rename(tmp, q.metaPath); err != nil {
+		log.Printf("controlplane: 提交入站队列水位失败：%v", err)
+	}
 }
 
 // rewrite 把存活帧重写回磁盘（ack 之后调用）。先写临时文件再改名，避免半个文件。
 func (q *jsonlQueue) rewrite() error {
 	tmp := q.path + ".tmp"
+	// 任何失败路径都清掉半成品，避免下次启动把 .tmp 误当数据；
+	// 成功路径下 os.Rename 之后 .tmp 已不存在，Stat 失败即自然跳过，不会误删。
+	defer func() {
+		if _, statErr := os.Stat(tmp); statErr == nil {
+			_ = os.Remove(tmp)
+		}
+	}()
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("controlplane: 写入站队列失败：%w", err)
@@ -103,7 +153,11 @@ func (q *jsonlQueue) rewrite() error {
 }
 
 // Push 入队一帧并返回分配的序号；队列满时丢最旧的、累加 dropped 并打一行告警。
-// 落盘失败记入 broken，不吞。
+// 落盘失败记入 broken，不吞；落盘成功后顺带刷新序号水位。
+//
+// 为什么每次都全量 rewrite 而不改成 append：文件末尾若留半行（崩溃），append 会把新帧
+// 直接拼到坏行后面，产出一条更坏的行——新帧随之静默丢失，而日志里毫无异常。
+// 全量 rewrite 走「临时文件 + rename」，顺带把坏行治好。别为省 IO 改回 append。
 func (q *jsonlQueue) Push(frame json.RawMessage) int64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -118,6 +172,10 @@ func (q *jsonlQueue) Push(frame json.RawMessage) int64 {
 	// 落盘失败不吞：调用方（POST 处理器）应当据此回 500，而不是假装入队成功。
 	if err := q.rewrite(); err != nil {
 		q.broken = err
+	} else {
+		// meta 只是主文件损坏时的兜底：帧本身已经落在主文件里了，不该让一次 push
+		// 因为兜底失败而失败，所以 saveMeta 只告警、不设 broken。
+		q.saveMeta()
 	}
 	return q.seq
 }
