@@ -1,0 +1,279 @@
+/* Tenon 对话入口的样式：单列、纯静态、无外部字体/图标/CDN。 */
+
+:root {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --ink: #1b1f24;
+  --muted: #6a7380;
+  --line: #dde1e6;
+  --accent: #1f6feb;
+  --accent-ink: #ffffff;
+  --danger: #b3261e;
+  --danger-bg: #fdecea;
+  --warn: #8a5300;
+  --warn-bg: #fff4dd;
+  --ok: #1a7f37;
+  --ok-bg: #e8f5ec;
+  --code-bg: #eef0f3;
+  --radius: 8px;
+}
+
+* { box-sizing: border-box; }
+
+/* 作者样式里的 display:flex 会盖掉 UA 的 [hidden] 规则（登录框、会话条、错误条、
+   上下文输入区都靠 hidden 开关），所以这里显式把 hidden 提到最高优先级。 */
+[hidden] { display: none !important; }
+
+html, body { margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC",
+    "Hiragino Sans GB", "Noto Sans CJK SC", sans-serif;
+}
+
+code {
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+  font-size: 12.5px;
+  background: var(--code-bg);
+  border-radius: 4px;
+  padding: 1px 4px;
+  word-break: break-all;
+}
+
+/* ---------- 顶部：品牌 + 登录/会话 ---------- */
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand h1 { margin: 0; font-size: 18px; line-height: 1.2; }
+.brand .sub { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+
+.session { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+
+.login { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.login label { color: var(--muted); }
+
+.session-info { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px; }
+.session-info b { font-weight: 600; }
+.role-line { color: var(--muted); }
+
+/* ---------- 表单元素 ---------- */
+
+input[type="text"],
+input[type="password"],
+textarea {
+  font: inherit;
+  color: inherit;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+input[type="text"], input[type="password"] { width: 150px; font-size: 13px; }
+textarea { width: 100%; resize: vertical; min-height: 76px; }
+
+input:focus, textarea:focus, button:focus-visible {
+  outline: 2px solid rgba(31, 111, 235, 0.45);
+  outline-offset: 1px;
+}
+
+input:disabled, textarea:disabled { background: #f0f1f3; color: var(--muted); }
+
+button {
+  font: inherit;
+  font-size: 13px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { border-color: #b8c0ca; }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+button.primary:hover:not(:disabled) { background: #1a5fd0; border-color: #1a5fd0; }
+
+button.danger { background: #fff; border-color: #d9a6a1; color: var(--danger); }
+button.danger:hover:not(:disabled) { background: var(--danger-bg); border-color: var(--danger); }
+
+button.link {
+  border: 0;
+  background: none;
+  color: var(--accent);
+  padding: 2px 4px;
+  text-decoration: underline;
+}
+
+/* ---------- 错误条 ---------- */
+
+.error-bar {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 12px 20px 0;
+  padding: 10px 12px;
+  border: 1px solid #e9b7b2;
+  background: var(--danger-bg);
+  border-radius: var(--radius);
+  color: #7a1c16;
+  font-size: 13px;
+}
+
+.error-label {
+  flex: none;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.error-text {
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* ---------- 主体 ---------- */
+
+main {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 16px 20px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px 16px;
+}
+
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.count { color: var(--muted); font-size: 13px; font-weight: 400; }
+
+.hint { margin: 0 0 8px; color: var(--muted); font-size: 12.5px; }
+.foot { text-align: center; margin: 0; }
+
+.row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+.row .hint { margin: 0; }
+
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.check input { width: auto; }
+
+.ctx { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; font-size: 13px; color: var(--muted); }
+.ctx label { display: inline-flex; align-items: center; gap: 6px; }
+.ctx input { width: 150px; }
+.ctx input#ctx-id { width: 170px; }
+
+.status { font-size: 13px; color: var(--muted); }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- 看板卡片 ---------- */
+
+.cards { display: flex; flex-direction: column; gap: 10px; }
+
+.card {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 10px 12px 12px;
+  background: #fff;
+}
+
+.card-terminal { border-left-color: #c3c9d1; background: #fbfbfc; }
+
+.card-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.card-head .summary { margin: 0; font-size: 14.5px; font-weight: 600; flex: 1 1 260px; }
+
+.badge {
+  flex: none;
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.badge-pending { background: #e8f0fe; color: #14418f; border-color: #c3d6fb; }
+.badge-done { background: var(--ok-bg); color: var(--ok); border-color: #bfe0c8; }
+.badge-bad { background: var(--danger-bg); color: var(--danger); border-color: #e9b7b2; }
+.badge-warn { background: var(--warn-bg); color: var(--warn); border-color: #ecd39a; }
+.badge-unknown { background: var(--warn-bg); color: var(--warn); border-color: #d9b45f; }
+
+.meta { margin: 7px 0 0; font-size: 12.5px; color: var(--muted); }
+.meta > span { margin-right: 4px; }
+.muted { color: var(--muted); }
+
+.detail { margin: 6px 0 0; padding-left: 20px; font-size: 13px; }
+.detail li { margin: 2px 0; }
+
+.role {
+  display: inline-block;
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+  font-size: 12px;
+  background: #eef1f5;
+  border: 1px solid #dbe0e6;
+  border-radius: 4px;
+  padding: 0 5px;
+  color: #33383f;
+}
+
+.expiry { color: #33383f; }
+.expiry.expired { color: var(--danger); font-weight: 600; }
+
+.card-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 11px; }
+.card-actions .muted { font-size: 12px; }
+
+.readonly {
+  font-size: 12.5px;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border: 1px solid #ecd39a;
+  border-radius: 4px;
+  padding: 3px 8px;
+}
+
+.empty { margin: 0; color: var(--muted); font-size: 13px; }
+
+@media (max-width: 640px) {
+  .topbar { padding: 12px; }
+  main { padding: 12px 12px 32px; }
+  input[type="text"], input[type="password"] { width: 120px; }
+  .ctx input, .ctx input#ctx-id { width: 100%; }
+}
