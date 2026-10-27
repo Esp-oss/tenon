@@ -1876,3 +1876,24 @@ func TestResetCallbackMayEmitEvent(t *testing.T) {
 		t.Fatalf("发件箱 = %+v，期望只有回调里发出的 evt_during_reset", page)
 	}
 }
+
+// 模板是模块声明的一部分：必须出现在摘要线里（agent 只读这条线），
+// 空模板不出现（omitempty）——老模块的 manifest 不该多一个空字段。
+func TestManifestCarriesSummaryTemplate(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	f.module.Actions[1].SummaryTemplate = "写一个 {name}"
+	srv := serve(t, f.module)
+
+	_, raw := doJSON(t, http.MethodGet, srv.URL+"/.well-known/tenon", nil, nil)
+	if !bytes.Contains(raw, []byte(`"summaryTemplate":"写一个 {name}"`)) {
+		t.Fatalf("摘要线没带模板：%s", raw)
+	}
+
+	empty := newFixture()
+	srv2 := serve(t, empty.module)
+	_, raw2 := doJSON(t, http.MethodGet, srv2.URL+"/.well-known/tenon", nil, nil)
+	if bytes.Contains(raw2, []byte("summaryTemplate")) {
+		t.Fatalf("空模板不该出现：%s", raw2)
+	}
+}

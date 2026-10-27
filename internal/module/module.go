@@ -134,17 +134,20 @@ type DryRunCapability struct {
 // 字段刻意与 schema 一一对应：action.schema.json 是 additionalProperties=false，
 // 多一个字段就会让 GET /tenon/actions/{id} 的响应不合法。
 type Action struct {
-	ID           string           `json:"id"`
-	Version      string           `json:"version"`
-	Title        string           `json:"title"`
-	Kind         string           `json:"kind"` // read | write
-	InputSchema  json.RawMessage  `json:"inputSchema"`
-	OutputSchema json.RawMessage  `json:"outputSchema,omitempty"`
-	Risk         Risk             `json:"risk"`
-	Idempotency  *Idempotency     `json:"idempotency,omitempty"`
-	Compensation *Compensation    `json:"compensation,omitempty"`
-	TimeoutMs    int              `json:"timeoutMs,omitempty"`
-	DryRun       DryRunCapability `json:"dryRun"`
+	ID      string `json:"id"`
+	Version string `json:"version"`
+	Title   string `json:"title"`
+	// SummaryTemplate 是给人看的一句话模板（module-manifest / action schema 的可选字段）。
+	// 占位符只从本次 args 取值：它渲染的是「这一次要做什么」，不是动作说明书。
+	SummaryTemplate string           `json:"summaryTemplate,omitempty"`
+	Kind            string           `json:"kind"` // read | write
+	InputSchema     json.RawMessage  `json:"inputSchema"`
+	OutputSchema    json.RawMessage  `json:"outputSchema,omitempty"`
+	Risk            Risk             `json:"risk"`
+	Idempotency     *Idempotency     `json:"idempotency,omitempty"`
+	Compensation    *Compensation    `json:"compensation,omitempty"`
+	TimeoutMs       int              `json:"timeoutMs,omitempty"`
+	DryRun          DryRunCapability `json:"dryRun"`
 }
 
 // Module 是一个模块的声明与回调集合。
@@ -452,12 +455,15 @@ type moduleInfo struct {
 
 // actionSummary 只有六个字段：摘要级刻意不含 inputSchema（D15 上下文成本）。
 type actionSummary struct {
-	ID      string           `json:"id"`
-	Version string           `json:"version"`
-	Title   string           `json:"title"`
-	Kind    string           `json:"kind"`
-	Risk    Risk             `json:"risk"`
-	DryRun  DryRunCapability `json:"dryRun"`
+	ID      string `json:"id"`
+	Version string `json:"version"`
+	Title   string `json:"title"`
+	// SummaryTemplate 必须出现在摘要线：agent 的能力发现只读这条（D15），
+	// 少了它，agent 每次渲染白话都要回拉完整 Action。
+	SummaryTemplate string           `json:"summaryTemplate,omitempty"`
+	Kind            string           `json:"kind"`
+	Risk            Risk             `json:"risk"`
+	DryRun          DryRunCapability `json:"dryRun"`
 }
 
 type eventSummary struct {
@@ -828,7 +834,8 @@ func (h *handler) serveManifest(w http.ResponseWriter, r *http.Request) {
 	for i := range m.Actions {
 		a := &m.Actions[i]
 		out.Actions = append(out.Actions, actionSummary{
-			ID: a.ID, Version: a.Version, Title: a.Title, Kind: a.Kind, Risk: a.Risk, DryRun: a.DryRun,
+			ID: a.ID, Version: a.Version, Title: a.Title, Kind: a.Kind,
+			Risk: a.Risk, DryRun: a.DryRun, SummaryTemplate: a.SummaryTemplate,
 		})
 	}
 	for _, ev := range m.Events {
