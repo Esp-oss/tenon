@@ -94,6 +94,7 @@ func getStockAction() module.Action {
 		Version:         "0.1.0",
 		Title:           "查询在库量",
 		SummaryTemplate: "查询 {sku} 在库量",
+		RequiredArgs:    []string{"sku"},
 		Kind:            "read",
 		InputSchema: json.RawMessage(`{
   "type": "object",
@@ -123,6 +124,7 @@ func deductStockAction() module.Action {
 		Version:         "0.1.0",
 		Title:           "扣减库存",
 		SummaryTemplate: "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）",
+		RequiredArgs:    []string{"sku", "qty", "referenceNo"},
 		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
@@ -169,6 +171,7 @@ func releaseStockAction() module.Action {
 		Version:         "0.1.0",
 		Title:           "回补库存（扣减的补偿动作）",
 		SummaryTemplate: "回补 {sku} 库存 {qty} 件（单据 {referenceNo}）",
+		RequiredArgs:    []string{"sku", "qty", "referenceNo"},
 		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
