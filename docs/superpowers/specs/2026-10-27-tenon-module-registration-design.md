@@ -22,8 +22,11 @@
 |---|---|---|
 | D1 | **全 push**：模块注册 + 心跳，host 不做主动探活 | 与「模块主动申报」的需求一致；host 不需要出网探测；失效判定单点在 TTL |
 | D2 | **人工 disable 粘性**：心跳只影响 `alive/lost`，不覆盖人工状态 | 否则 D1 的 B 轮（`SetEnabled(false)` 摘模块）会被心跳自动救回，测试随机变红 |
-| D3 | **注册/心跳分离 + 声明哈希**：心跳只带 `declarationHash`，不匹配则要求重申报 | 省流量；又不出现「心跳到了但声明是旧的」而无人察觉 |
+| D3 | **注册/心跳分离 + 声明哈希**：心跳只带 `declarationHash`，不匹配则要求重申报 | 省流量；又不出现「心跳到了但声明是旧的」而无人察觉。`409`（冲突）而非 `200+reRegister`：「必须重申报」是契约冲突，不是正常回执 |
 | D4 | **独立 append-only 注册事件链**，不进业务审计 | `audit-event.schema.json` 根 required 有 15 个字段（`planId`/`stepId`/`action`/`inputHash`/`idempotencyKey`…），模块生命周期与它们无关；硬塞等于造假数据或破坏性改 schema |
+| D5 | **无 static 豁免**：所有模块一律注册 + 心跳；`TENON_MODULES` 环境变量**移除** | 开发阶段不需要兼容旧部署（所有者 2026-10-27 明确）；两套注册路径会长期分叉，删掉更干净 |
+| D6 | **不做持久化**：注册表只在内存 | D5 之后恢复路径已闭合——host 重启 → 模块心跳拿到 `409` → 重申报 → `alive`，一个心跳周期内完成。落盘只会多一份可能与事件链冲突的真相 |
+| D7 | **缺 HMAC 密钥则启动失败**，不是「不挂端点」 | 静默不可用比拒绝启动更危险：运维会以为注册在工作，实际模块永远上不了线 |
 
 ## 3. 端点与报文
 
@@ -60,7 +63,8 @@ X-Tenon-Signature: t=<unix>,v1=<hex>
 
 ### 3.3 可见性（既有端点语义收紧）
 
-`GET /tenon/modules` 只返回**可见**条目：`enabled == true && (source == "static" || state == "alive")`。
+`GET /tenon/modules` 只返回**可见**条目：`enabled == true && state == "alive"`。
+**没有 static 条目可以绕过这条**（D5）：不心跳的模块就是不可见，没有例外。
 
 ## 4. 状态机
 
@@ -70,7 +74,6 @@ X-Tenon-Signature: t=<unix>,v1=<hex>
 |---|---|---|---|
 | 存活 | `alive` / `lost` | 心跳 TTL（默认 15s = 3× 5s） | `lost` 不参与可见性 |
 | 人工 | `enabled` / `disabled` | 运维（`POST /tenon/admin/modules` 的 SetEnabled） | **粘性**，心跳不能覆盖 |
-| 来源 | `static` / `dynamic` | `TENON_MODULES` / 注册 | `static` **不参与 TTL**（否则老部署一上线就全掉） |
 
 跃迁与事件（只有跃迁写 §7 的日志，心跳本身不写）：
 
@@ -87,16 +90,21 @@ disabled --SetEnabled(true)--> enabled（若 TTL 已过则仍为 lost，等心�
 - 复用 `TENON_HMAC_SECRET_FILE` 的共享密钥；
 - 签名覆盖 `"<t>." + rawBody`，与既有 `X-Tenon-Signature` 完全同形；
 - 容差 **±300s**（与 `internal/protocol.SignatureTolerance` 一致），超差返回 401 且理由区分 `格式错` / `过期` / `不匹配`；
-- 未配置密钥时**注册端点不挂载**（fail-closed：宁可没有动态注册，也不要匿名注册）；
+- 未配置密钥时**host 启动直接失败**（D7）：打印明确原因（缺哪个环境变量、注册端点会因此不可用），退出码非零。静默「不挂端点」会让运维以为注册在工作、实际模块永远上不了线；
 - 同一 `moduleId` 的 `baseURL` 变化视为**新声明**（`declarationHash` 变），走重申报路径；
 - **注册不改变人工状态**：对一个 `disabled` 的模块注册，只更新声明与存活状态，仍保持 `disabled`（D2 粘性）。
 
-## 6. 持久化
+## 6. 持久化：**不做**（D6）
 
-- `registry.json`：**原子写**（临时文件 + `os.Rename`），boot 时加载；
-- `dynamic` 条目恢复为 **`lost`**，等首个心跳转 `alive`；
-- `static` 条目由 env 重新构建，不写入 `registry.json`（避免两份真源）；
-- 写失败**不改内存态**，只记日志（与既有「观测文件可用性不决定业务处置」一致）。
+注册表只在内存。恢复路径靠协议本身闭合：
+
+```
+host 重启 → 注册表为空
+模块下一次心跳（≤5s）→ host 不认识这个 moduleId → 409 {reRegister}
+模块收到 409 → 立即 POST /register（带完整声明与哈希）→ alive
+```
+
+**代价**：重启后最多有一个心跳周期（≤5s）的「不可见窗口」，期间 agent 看不到这些模块。这比「落盘可能引入第二份真相」更可接受；窗口长度由心跳间隔决定，验收口径里要显式断言它。
 
 ## 7. 注册事件日志
 
@@ -125,9 +133,9 @@ disabled --SetEnabled(true)--> enabled（若 TTL 已过则仍为 lost，等心�
 
 | 项 | 处理 |
 |---|---|
-| D1 测试 | 不受影响：`SetEnabled(false)` 仍粘性；`static` 条目行为不变 |
+| D1 测试 | `SetEnabled(false)` 仍粘性——但 **`TENON_MODULES` 移除后脚本要改**：三模块改为自注册（`scripts/d1-e2e.ps1` / `dev-up.ps1` 不再传该 env），B 轮摘除仍用 admin 端点 |
 | 业务审计 schema | **一字不改**（决策 D4） |
-| `TENON_MODULES` | 保留为 bootstrap 与「不实现心跳的模块」的兼容路径，标 `source=static` |
+| `TENON_MODULES` | **移除**（D5）：无 static 豁免、无兼容路径；不心跳的模块即不可见 |
 | 失联期间的回合 | 沿用既有 fail-closed（step 失败 → 回合 `failed`），不新增语义 |
 | ADR §3 三条不变量 | 不变；注册端点属新增写入口，按 §5 鉴权 |
 
@@ -136,18 +144,18 @@ disabled --SetEnabled(true)--> enabled（若 TTL 已过则仍为 lost，等心�
 1. 注册后 `GET /tenon/modules` **立即**出现该模块；
 2. 停心跳 → **≤15s** 内从 agent 视图消失，`registry-events` 出现 `lost`；
 3. 心跳带错哈希 → `409`；模块重申报后恢复 `alive`（`registry-events` 出现 `re-registered`）；
-4. host 重启 → `registry.json` 恢复、dynamic 条目为 `lost`，首心跳后 `alive`（期间 agent 视图不含它）；
+4. **host 重启 → 注册表为空，模块在 ≤1 个心跳周期内收到 409 并重申报 → `alive`**（断言这个窗口存在且不超过 5s，而不是「重启后立刻可见」）；
 5. 人工 `disable` 后即使心跳正常也不可见；`enable` 后立即可见；
 6. 篡改 `registry-events.jsonl` 任一行 → 链校验失败；
-7. 未配置 HMAC 密钥时注册端点不挂载（404/未注册），且 host 启动日志有明确警告。
+7. 未配置 HMAC 密钥 → **host 启动失败**（退出码非零、错误信息点名缺哪个环境变量）。
 
 ## 11. 风险
 
 | 风险 | 处理 |
 |---|---|
 | 心跳把 host 打爆（模块多、间隔短） | 默认 5s；端点无状态、只做哈希比对与 TTL 刷新，单条 O(1)；后续可加限流 |
-| 注册端点成为攻击面 | HMAC + ±300s 容差；未配密钥不挂载；注册只增改自己 id 的条目 |
-| `registry.json` 与 `registry-events.jsonl` 两份状态 | 前者是当前视图、后者是历史；以事件链为准做校验，冲突时**以事件链回放结果覆盖**并在日志里报冲突 |
+| 注册端点成为攻击面 | HMAC + ±300s 容差；缺密钥拒绝启动；注册只增改自己 id 的条目 |
+| **重启窗口**：host 重启后 ≤1 个心跳周期内所有模块不可见 | D6 的直接代价，已写进验收口径（断言窗口 ≤5s）；若将来不可接受，再引入落盘或「模块侧感知 host 重启立即重申报」 |
 | 时钟漂移导致 TTL 误判 | TTL 用 host 单调时钟（`time.Since`），不依赖模块时间 |
 
 ## 12. 非目标
