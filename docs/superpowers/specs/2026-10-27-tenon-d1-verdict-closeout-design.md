@@ -89,7 +89,17 @@
 
 - verdict 来源：`out/d1/report.json`（runner 产物，含两轮动作序列与四条合取的逐条结论）；
 - 证据来源：`out/d1/agent-result.jsonl`（每回合一行：结局、planId、动作序列）；
-- 落文档：`README.md` 新增一节「D1 判定（2026-10-27）」，写 verdict + 四条逐条 + 复现命令。**SKIP 与 FAIL 都不写成 PASS**。
+- 落文档：`README.md` 新增一节「D1 判定结果」，写 verdict + 逐次尝试 + 复现命令。**SKIP / FAIL / INCONCLUSIVE 都不写成 PASS**。
+
+### 2.2b 判据收紧（执行期变更，已获准）
+
+第一次真跑暴露了「空洞通过」：A 轮计划里没有引用被摘的 `procurement` 时，「B 轮不碰它」是白送的，四条判据自动成立。因此新增第三态 **`inconclusive`**：
+
+- 触发条件：四条判据都过，但 A 轮没有任何被摘模块的动作；
+- 语义：命题未被检验，**不算通过**；退出码仍非 0（不会被 CI 当成合格）；
+- 用例：`TestD1InconclusiveWhenADidNotUseRemovedModule`。
+
+这一改动是**变严格**，与「不为了让结果变绿而调参」的边界一致。
 
 ### 2.3 判 fail 时的交付（已定边界）
 
@@ -100,6 +110,12 @@
 3. 模型 `rationale` 原文摘录（判断是「prompt 里没交代被摘模块」还是「模型无视了事实」）。
 
 在此之上给**最小修复建议**（例如：prompt 的能力摘要是否需要显式标注 `enabled=false` 的模块不可用），但不实现。
+
+### 2.4 执行期发现的已知阻塞（未修，需评审）
+
+真跑把「判定受阻」的根因按顺序暴露成三层：`expectedDiff` 形状（已修）→ 判据被计划质量架空（已用 `inconclusive` 兜住）→ **prompt 不带入参契约**：动作清单只列 action id，模型不知道 `DeductStock` 需要 `referenceNo`，写动作只能靠猜，预演 400 `SCHEMA_MISMATCH` 直接 fail-closed。
+
+第三层要改 prompt 的信息量（带上每个动作的 `required` 字段与类型，或让规划器按需 `GET /tenon/actions/{id}`），涉及上下文成本与「摘要先看、完整按需」的既有取舍（D15），不属于本切片范围，须单独评审。
 
 ---
 

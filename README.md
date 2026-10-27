@@ -211,7 +211,7 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 
 **一键复现**（前置条件全部写成启动断言）：`powershell -NoProfile -File scripts/d1-e2e.ps1`（`-Stub` 只验编排，不出判定）。
 
-### D1 判定结果（2026-10-27，真模型 A/B，两次尝试）
+### D1 判定结果（2026-10-27，真模型 A/B，三次尝试）
 
 模型 `deepseek-flash`，报告 `out/d1/report.json`。
 （`deepseek-v4-pro` 实测不可用：推理模型，同一条规划请求 600 token 全花在 reasoning 上、可见 `content` 为空，真实链路里会把轮次拖过超时——所以脚本缺省用 flash。）
@@ -219,25 +219,18 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 | 次 | 条件 | 机械结论 | 实质 |
 |---|---|---|---|
 | #1 | 修 prompt 前 | `fail` | **判定受阻**：A 轮模型输出连续 2 次没过 `plan.schema.json`，两轮无可比 |
-| #2 | 修 prompt 后 | `pass` | **空洞通过**：A 轮只有 `inventory.GetStock`，本就没引用被摘的 `procurement`，两轮差异不是摘除造成的 |
+| #2 | 修 prompt 后 | 当时记 `pass` | **空洞通过**：A 轮只有 `inventory.GetStock`，本就没引用被摘的 `procurement`，两轮差异不是摘除造成的 |
+| #3 | 判据收紧后 | `fail` | B 轮规划出 `inventory.DeductStock` 但**缺 `referenceNo`** → 预演 400 `SCHEMA_MISMATCH` → fail-closed，B 轮 `failed` |
 
-**结论：D1 至今没有被真正判定过一次。** 第 2 次虽然退出码 0，但 runner 自己在 `reason` 里写了「D1 的命题没有被真正检验」——A 轮的计划里没有被摘模块可摘，所谓「差异」与命题无关。不能拿这次 pass 宣称「agent 在推理而非跑流水线」。
+**结论：D1 至今没有被真正判定过一次。** 三种形态各不相同，但都不是「agent 自适应」的证据。
 
-**第 1 次的根因（已修，属真缺陷）**：prompt 与 `plan.schema.json` 对 `expectedDiff` 的约定不一致。
+**根因链（三层，前两层已修，第三层需单独评审）**
 
-1. prompt 没说元素必须含 `field`/`from`/`to`，模型自造 `{op, note}` → `additional properties 'op' not allowed`；
-2. prompt 说 entity 可写「字符串简写」但没给格式，模型写了裸主键 `"STD-1002"`，而 `EntityRefString` 要求三段 `模块:类型/主键`（如 `inventory:SKU/STD-1002`）→ 报 `got string, want object`（`oneOf` 两侧都不匹配时的报错文本会误导成「只收对象」）。
+1. **`expectedDiff` 的形状没写给模型**（已修）：prompt 没说元素必须含 `field`/`from`/`to`，模型自造 `{op, note}`；prompt 说 entity 可写「字符串简写」却没给格式，模型写了裸主键 `"STD-1002"`，而 `EntityRefString` 要求三段 `模块:类型/主键`（`oneOf` 两侧都不匹配时报错文本会误导成「只收对象」）。修法：第 7 条给出两种等价写法的占位示例 + 明说「只写主键是错的」，`TestPromptStatesExpectedDiffShape` 锁住。
+2. **判据会被计划质量架空**（已修）：A 轮若不含被摘模块的动作，「B 轮不碰它」是白送的。现在这种空洞通过记 **`inconclusive`**（新增第三态）而不是 `pass`，用例 `TestD1InconclusiveWhenADidNotUseRemovedModule` 锁住；退出码仍为非 0，不会被 CI 当成合格。
+3. **prompt 不带入参契约**（未修，需评审）：动作清单只列 action id（`internal/agent/planner.go` 的「可调动作」块），模型不知道 `DeductStock` 需要 `referenceNo`，写动作必然靠猜——#3 的 400 就是它。要让 D1 可判定，得把每个动作的**最小入参契约**（`required` 字段名与类型）带进 prompt，或让规划器按需拉 `GET /tenon/actions/{id}`。这是设计变更（上下文成本 vs 计划合法率），不在本轮边界内。
 
-修法：`systemPrompt` 第 7 条改成给出两种等价写法的占位示例 + 明说「只写主键是错的」，并用 `TestPromptStatesExpectedDiffShape` 锁住（同时断言 system prompt 仍不含真实模块名与动作 id）。
-
-**第 2 次暴露的问题（未修，需评审）**：模型的 A 轮计划退化成「只查一次库存」，于是
-「B 轮不碰被摘模块」这条判据**自动成立**，「序列不同」也只是因为 B 轮多了一步 `quote.GetQuote`——
-判定被计划质量架空。要让 D1 有意义，得二选一：
-
-- **收紧判据**：要求 A 轮至少含一个 write 且**必须引用**被摘模块（`procurement`），否则记 `inconclusive` 而不是 `pass`；
-- **让规划完整**：修 skill / prompt，让 A 轮按业务真的扣库存 + 建采购（但这件容易被做成「调参凑绿」，应单独评审）。
-
-两件事都不在本轮边界内（本轮只判不调）。用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
+> 本轮边界是「只判不调」：已修的两层都是**让判定成为可能**的缺陷（不是为了让结果变绿），第三层会让判定继续受阻，但它改变的是 prompt 的信息量与上下文成本，必须单独评审。用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
 
 ### 其它检查
 

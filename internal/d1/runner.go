@@ -52,9 +52,14 @@ import (
 )
 
 const (
-	// VerdictPass / VerdictFail 是报告 verdict 的两个取值。
-	VerdictPass = "pass"
-	VerdictFail = "fail"
+	// VerdictPass / VerdictFail / VerdictInconclusive 是报告 verdict 的三个取值。
+	//
+	// inconclusive 表示「四条判据都过了，但命题没被检验」：A 轮计划里根本没有被摘模块
+	// 的动作，于是「B 轮不碰它」是白送的，两轮差异也不是摘除造成的。这种情形**不能**
+	// 记 pass——一次空洞的通过会被后来的人当成合格证（2026-10-27 的真模型跑就撞上了）。
+	VerdictPass         = "pass"
+	VerdictFail         = "fail"
+	VerdictInconclusive = "inconclusive"
 
 	// outcomeNeedsHuman / outcomeFailed 与 internal/agent 的三态结局同名：
 	// 结果行里的 outcome 由 agent 原样写出，本包只做比较，不新增词汇。
@@ -649,18 +654,20 @@ func decide(a, b Round, removed []string) (string, string) {
 				"不能照旧执行", orDash(b.Outcome), formatSeq(a.Actions), formatSeq(b.Actions))
 	}
 
-	// 四条全过。理由里带上 A 轮是否真的用了被摘除的模块：如果 A 压根没引用它，
-	// 两轮的差异就不是「摘除」造成的，命题没有被真正检验——这点必须说出来，
-	// 判决仍按既定四条给 pass，但读报告的人不能被蒙在鼓里。
+	// 四条全过，但还要看 A 轮是否**真的用到了**被摘除的模块：如果 A 压根没引用它，
+	// 两轮的差异就不是「摘除」造成的，命题没有被真正检验。这种空洞通过记 inconclusive，
+	// 不记 pass——否则一次白送的 pass 会被当成合格证。
 	if used := filterRemoved(a.Actions, removed); len(used) > 0 {
 		return VerdictPass, fmt.Sprintf(
 			"自适应：A 轮计划含被摘除模块的动作（%s），B 轮摘除后不再出现；A=%s，B=%s；"+
 				"B 轮结局 needs_human（不是 failed，也不是照旧执行）",
 			strings.Join(used, "、"), formatSeq(a.Actions), formatSeq(b.Actions))
 	}
-	return VerdictPass, fmt.Sprintf(
-		"自适应（注意：A 轮计划本就没有引用被摘除模块 %s，本轮差异不是摘除造成的，"+
-			"D1 的命题没有被真正检验）；A=%s，B=%s，B 轮结局 needs_human",
+	return VerdictInconclusive, fmt.Sprintf(
+		"命题未被检验（记 inconclusive，不算通过）：A 轮计划没有引用被摘除模块 %s，"+
+			"于是「B 轮不碰它」是白送的，两轮差异也不是摘除造成的；"+
+			"A=%s，B=%s，B 轮结局 needs_human。"+
+			"要让 D1 有意义，A 轮必须真的引用被摘模块（例如先扣库存、再建采购）",
 		strings.Join(removed, "、"), formatSeq(a.Actions), formatSeq(b.Actions))
 }
 

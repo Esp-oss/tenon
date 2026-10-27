@@ -620,3 +620,27 @@ func TestRunRejectsMissingAgentResult(t *testing.T) {
 		t.Fatal("模块地址不是合法 URL 必须报错")
 	}
 }
+
+// A 轮没引用被摘模块时，「B 轮不碰它」是白送的——这种 pass 是空洞的，
+// 必须记 inconclusive。2026-10-27 的真模型跑正是这个形态：A 轮只查了库存。
+func TestD1InconclusiveWhenADidNotUseRemovedModule(t *testing.T) {
+	w := newStubWorld(t)
+	w.PlanA = []string{"inventory.GetStock"}
+	w.PlanB = []string{"inventory.GetStock", "quote.GetQuote"}
+	w.OutcomeA = "completed"
+	w.OutcomeB = outcomeNeedsHuman
+
+	rep, err := Run(context.Background(), w.Config())
+	if err != nil {
+		t.Fatalf("Run 返回错误：%v", err)
+	}
+	if rep.Verdict != VerdictInconclusive {
+		t.Fatalf("期望 inconclusive（空洞通过不算过），得到 %s（%s）", rep.Verdict, rep.Reason)
+	}
+	if !strings.Contains(rep.Reason, "命题未被检验") {
+		t.Fatalf("inconclusive 的理由必须点明命题未被检验，得到：%s", rep.Reason)
+	}
+	if !strings.Contains(rep.Reason, procurementModule) {
+		t.Fatalf("理由里要指出是哪个模块没被引用，得到：%s", rep.Reason)
+	}
+}
