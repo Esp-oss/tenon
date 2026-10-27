@@ -150,6 +150,12 @@ type Config struct {
 	// P1 的过渡开关（默认 false：缺 triggerEventId 视为事件驱动，保证现有 agent 可用），
 	// P4 收口时把缺省行为改成强制。见 spec §3.11 的「分阶段启用」。
 	RequireTrigger bool
+	// StrictRules 为 true 时，业务级规则有任一份未生效（TENON_STRICT_RULES=1）即启动失败，
+	// 而不是「告警 + 该 skill 的规则不生效」（spec §3.8）。CI 与生产推荐打开。
+	//
+	// 本字段只在装配侧（cmd/host）读取：是否容忍坏的 approval.json 是部署决定，
+	// New() 不替调用方做这个判断，因此引擎行为不受它影响。
+	StrictRules bool
 }
 
 // Server 是组装好的控制平面。构造后并发安全；Handler() 与服务共享同一份状态。

@@ -17,13 +17,19 @@
     "approvers": ["role:warehouse_manager"]
   },
   {
-    "policyId": "pol-procurement-create-approve",
-    "priority": 100,
+    "policyId": "plat-request-needs-human",
+    "priority": 1000,
     "match": {
       "module": "procurement",
       "actions": ["procurement.CreatePurchaseRequest"]
     },
-    "when": { "all": [] },
+    "when": {
+      "all": [
+        {
+          "origin": { "eq": "request" }
+        }
+      ]
+    },
     "outcome": "approve",
     "approvers": ["role:procurement_manager"]
   },

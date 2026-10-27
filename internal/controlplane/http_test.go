@@ -945,8 +945,11 @@ func TestLoadDevConfigFiles(t *testing.T) {
 			[]string{"role:warehouse_manager"}, []string{policy.ReasonApprovalRequired}},
 		{"inventory.DeductStock", `{"sku":"STD-1001","qty":3}`, policy.OutcomeDeny,
 			[]string{}, []string{policy.ReasonNoMatch}},
-		{"procurement.CreatePurchaseRequest", `{"sku":"STD-1002","qty":12}`, policy.OutcomeApprove,
-			[]string{"role:procurement_manager"}, []string{policy.ReasonApprovalRequired}},
+		// 平台级不再对事件驱动的采购单无条件 approve（否则它会把业务级阈值整份压住，
+		// 见实施计划 Task 9 Step 1b）：这里没有 triggerEventId，origin=event，
+		// 无命中即 deny，处置留给业务级规则。
+		{"procurement.CreatePurchaseRequest", `{"sku":"STD-1002","qty":12}`, policy.OutcomeDeny,
+			[]string{}, []string{policy.ReasonNoMatch}},
 		// 读动作逐个登记后的效果：读 get 放行（auto）。
 		{"inventory.GetStock", `{"sku":"STD-1001"}`, policy.OutcomeAuto,
 			[]string{}, []string{policy.ReasonAuto}},
@@ -972,6 +975,30 @@ func TestLoadDevConfigFiles(t *testing.T) {
 		wantStrings(t, "approvers", got.Approvers, tc.wantApprovers)
 		wantStrings(t, "reasons", got.Reasons, tc.wantReasons)
 	}
+
+	// 对话发起的采购单一律人按：宿主签发并登记的合成事件 id 才把 origin 判成 request。
+	// 这条规则（plat-request-needs-human）是 dev 配置里唯一给采购单要求审批的平台规则，
+	// 事件驱动下它不成立，因此必须用登记过的 triggerEventId 才测得到。
+	const reqEventID = "evt_test_dev_config_request"
+	if err := srv.originRegistry().Register(originRecord{
+		EventID: reqEventID, RequestID: "req_test_dev_config", By: "user:alice",
+	}); err != nil {
+		t.Fatalf("登记合成事件 id 失败：%v", err)
+	}
+	reqBody := `{"triggerEventId":"` + reqEventID + `","plan":{"planId":"pln_test","steps":[` +
+		`{"stepId":"s1","action":"procurement.CreatePurchaseRequest","args":{"sku":"STD-1002","qty":3}}]}}`
+	reqStatus, reqRaw := postJSON(t, ts.URL+"/tenon/policies:evaluate", reqBody)
+	if reqStatus != 200 {
+		t.Fatalf("对话发起的采购单求值失败：%d %s", reqStatus, reqRaw)
+	}
+	var asked policy.PolicyEvaluation
+	decodeInto(t, reqRaw, &asked)
+	if asked.Outcome != policy.OutcomeApprove {
+		t.Fatalf("对话发起（origin=request）的采购单必须 approve，得到 %s", reqRaw)
+	}
+	wantStrings(t, "decidedBy", asked.DecidedBy, []string{"plat-request-needs-human"})
+	wantStrings(t, "approvers", asked.Approvers, []string{"role:procurement_manager"})
+	wantStrings(t, "reasons", asked.Reasons, []string{policy.ReasonApprovalRequired})
 
 	// 读 + 写的多步 plan：读步骤（auto）不得把整份 plan 拉到 deny，最终仍取写步骤的 approve。
 	st, raw := postJSON(t, ts.URL+"/tenon/policies:evaluate", planBody(
