@@ -10,16 +10,20 @@
 # 会按系统代码页解码，中文串会把引号吃掉并报「string is missing the terminator」。
 #
 # 用法（本机没有 pwsh 时用 powershell）：
-#   powershell -NoProfile -File scripts/d1-e2e.ps1              # 真模型（读 docker/secrets/llm.key）
-#   powershell -NoProfile -File scripts/d1-e2e.ps1 -Stub        # 只验编排：用 tools/llmstub，不出判定
-#   powershell -NoProfile -File scripts/d1-e2e.ps1 -Model deepseek-flash
+#   powershell -NoProfile -File scripts/d1-e2e.ps1                      # 真模型（读 docker/secrets/llm.key）
+#   powershell -NoProfile -File scripts/d1-e2e.ps1 -Stub                # 只验编排：用 tools/llmstub，不出判定
+#   powershell -NoProfile -File scripts/d1-e2e.ps1 -Model deepseek-v4-pro  # 换模型（见下方注意）
+#
+# 模型选择（2026-10-27 实测）：缺省用 deepseek-flash。deepseek-v4-pro 是**推理模型**，
+# 同一条规划请求实测 600 token 全花在 reasoning 上、可见 content 为空，真实链路里
+# 会把轮次拖过超时被杀——所以它不作为 D1 的缺省，想用就显式传。
 [CmdletBinding()]
 param(
-	[string]$Model   = 'deepseek-v4-pro',
+	[string]$Model   = 'deepseek-flash',
 	[string]$BaseUrl = 'https://api.deepseek.com',
 	[string]$KeyFile = 'docker/secrets/llm.key',
 	[switch]$Stub,
-	[int]$RoundTimeoutSec = 120
+	[int]$RoundTimeoutSec = 180
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,7 +33,17 @@ Set-Location $root
 $out = Join-Path $root 'out/d1'
 $bin = Join-Path $out 'bin'
 $logDir = Join-Path $out 'logs'
+$stateDir = Join-Path $out 'agent-state'
 New-Item -ItemType Directory -Force -Path $bin, $logDir, (Join-Path $out 'inbound') | Out-Null
+
+# 每次运行都从干净状态开始：上一轮留下的 pending/ 会被自检当成活条目重推，
+# processed.jsonl 与 result 文件则会让「本轮结果行」的判定含糊。
+foreach ($p in $stateDir, (Join-Path $out 'inbound')) {
+	if (Test-Path $p) { Remove-Item -Recurse -Force $p }
+}
+New-Item -ItemType Directory -Force -Path $stateDir, (Join-Path $out 'inbound') | Out-Null
+$resultFile = Join-Path $out 'agent-result.jsonl'
+if (Test-Path $resultFile) { Remove-Item -Force $resultFile }
 
 function Fail([string]$message) {
 	Write-Host "✗ $message" -ForegroundColor Red
@@ -156,8 +170,11 @@ try {
 		TENON_HOST_URL = 'http://127.0.0.1:8080'; TENON_AGENT_ID = 'ag_fulfillment'
 		TENON_ON_BEHALF_OF = 'user:alice'; TENON_ONCE = '1'
 		TENON_AGENT_USER = 'agent'; TENON_AGENT_PASSWORD = 'agent-dev'
-		TENON_AGENT_STATE_DIR = "$out/agent-state"; TENON_RESULT_FILE = "$out/agent-result.jsonl"
-		TENON_SKILLS_DIR = 'skills'; TENON_LLM_TIMEOUT = '120s'
+		TENON_AGENT_STATE_DIR = $stateDir; TENON_RESULT_FILE = $resultFile
+		TENON_SKILLS_DIR = 'skills'
+		# 模型超时必须短于轮次超时：否则模型还在等、runner 已经判「等不到结果行」，
+		# 报告里只会看到超时，看不出是模型慢。
+		TENON_LLM_TIMEOUT = "$($RoundTimeoutSec - 30)s"
 	}
 	if ($Stub) {
 		$agentEnv.TENON_LLM_BASE_URL = 'http://127.0.0.1:8099/v1'
@@ -185,7 +202,7 @@ try {
 	& (Join-Path $bin 'tenon.exe') d1 run `
 		--host 'http://127.0.0.1:8080' --quote 'http://127.0.0.1:8083' `
 		--inventory 'http://127.0.0.1:8081' --procurement 'http://127.0.0.1:8082' `
-		--agent-result (Join-Path $out 'agent-result.jsonl') `
+		--agent-result $resultFile `
 		--report $reportPath --round-timeout "${RoundTimeoutSec}s"
 	$exitCode = $LASTEXITCODE
 

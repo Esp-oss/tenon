@@ -198,7 +198,7 @@ go run ./cmd/tenon conformance run --target http://127.0.0.1:8081 --host http://
 
 不给 `--host` 时 C4/C5 仍记 SKIP 并写明原因——模块模式没有宿主侧端点可查。
 
-### D1 差异测试：runner 已实现，结论未判定
+### D1 差异测试：runner 已实现，判定见下
 
 ```bash
 go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
@@ -209,10 +209,32 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 
 `internal/d1` 会做两轮：A 轮三个模块全在 → B 轮 `POST /tenon/admin/modules` 把 procurement 置 `enabled=false`，两轮之间 reset 所有模块、换一个报价单号（SKU 与数量不变），然后比对 agent 结果文件里两轮**规划出来的**动作序列（判据：序列不同、B 轮不碰被摘模块、B 轮转人工、两轮都没崩）。
 
-**但它还没跑过真 LLM 的 A/B**，所以 D1 的结论是「未判定」，不是「已通过」：
+**一键复现**（前置条件全部写成启动断言）：`powershell -NoProfile -File scripts/d1-e2e.ps1`（`-Stub` 只验编排，不出判定）。
 
-- 本轮没有用真凭据跑过 agent 回合，自然也没有 A/B 两轮可比（没跑 ≠ 通过）；
-- 前置接线都已就位、并逐条实测过：宿主 `TENON_TEST_MODE=1` 挂 `POST /tenon/admin/modules`；三个模块 `TENON_TEST_MODE=1` 挂 `POST /tenon/admin/reset`（设 `1` → 200 `{"reset":true}`，设 `0` → 404）；agent 的 `TENON_RESULT_FILE` 每回合追加一行，正是 `--agent-result` 读的文件。
+### D1 判定结果（2026-10-27，真模型 A/B）
+
+模型 `deepseek-flash`，报告 `out/d1/report.json`。
+（`deepseek-v4-pro` 实测不可用：推理模型，同一条规划请求 600 token 全花在 reasoning 上、可见 `content` 为空，真实链路里会把轮次拖过超时——所以脚本缺省用 flash。）
+
+| 判据 | 结果 | 证据 |
+|---|---|---|
+| A/B 两轮动作序列不同 | **不成立（A 轮没产出合法计划）** | A 轮 `outcome=failed`；B 轮 `[inventory.GetStock]` |
+| B 轮不碰被摘的 procurement | 成立 | B 轮只有 `inventory.GetStock` |
+| B 轮转人工（`needs_human`） | **不成立** | B 轮 `outcome=completed` |
+| 两轮都没崩 | **不成立** | A 轮 `outcome=failed` |
+
+**结论：FAIL——且这是「判定受阻」型 fail，不是「行为看错」型 fail。** A 轮在 schema 闸门就崩了（模型输出连续 2 次未通过 `plan.schema.json`），两轮对比没有意义；D1 到今天仍然没有被真正判定过一次。
+
+**根因：prompt 与 `plan.schema.json` 的两处真矛盾**
+
+1. planner prompt 允许 `expectedDiff[].entity` 写成 `module:Type/id` 字符串（`internal/agent/planner.go:295`），而 schema 要求它是**对象**——照 prompt 写就必被拒，实测报 `got string, want object`；
+2. prompt 没有说明 `expectedDiff` 元素必须含 `field` / `from` / `to`，模型自造了 `{op, note}`，实测报 `additional properties 'op' not allowed`。
+
+**最小修复建议（本轮只诊断、未实施，以免把 D1 调成假命题）**
+
+- 在 planner prompt 里给出 `expectedDiff` 的最小合法示例（`entity` 对象 + `field`/`from`/`to`），并删掉「字符串简写」那条；
+- 或者反过来，把 schema 的 `entity` 放宽到 `EntityRefLike`（字符串或对象）——那是在放宽契约，需单独评审；
+- 修好后用同一脚本重跑，才算第一次具备 D1 的判定条件。届时还要盯 B 轮：「只查一次库存就收工」（`completed` 而非 `needs_human`）本身也不满足「B 轮转人工」。
 
 用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
 
