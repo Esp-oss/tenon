@@ -1,0 +1,17 @@
+[
+  {
+    "policyId": "biz-purchase-auto-small",
+    "priority": 100,
+    "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
+    "when": {"all": [{"arg.qty": {"<=": 5}}]},
+    "outcome": "auto"
+  },
+  {
+    "policyId": "biz-purchase-approve",
+    "priority": 100,
+    "match": {"module": "procurement", "actions": ["procurement.CreatePurchaseRequest"]},
+    "when": {"all": []},
+    "outcome": "approve",
+    "approvers": ["role:procurement_manager"]
+  }
+]
