@@ -252,6 +252,8 @@ dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、�
 
 > **Go host 的接收侧与 `versioning.md` §3.2 不一致**：§3.2 要求「消费方遇到未知字段必须忽略并继续」，但 `internal/spec` 的校验入口按 `additionalProperties: false` 直接拒绝（2026-10-27 加 `requiredArgs` 时，`additional properties 'requiredArgs' not allowed` 就是现场）。TS 侧（`@tenon/core` 的 `src/validate`）已按「接收侧宽松、一致性侧严格」双视图实现；**Go 侧待对齐**，修它要动校验入口并评估既有用例，需单独评估。
 
+> **DSH 还不是业务驱动（0 实现）**：全仓**没有一行 dsh/cordis 代码**；今天操作业务的是 Go 的 `cmd/agent` + `cmd/host` + 模块。最终验收（DSH 对话页驱动业务）与模块动态注册/健康检查这三条需求已记录在 [`docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md`](docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md)（R1–R3 / Q1–Q3），**均未开始**。另有两处与「插件架构」说法不符的硬耦合待修：`TENON_MODULES` 只能启动时静态注册（改模块要重启 host）、`internal/agent/skillselect.go` 的 `knownModuleNames` 硬编码模块词表（新增模块不改这里，请求回合会静默选不中 skill）。
+
 > 页面已交付（`TENON_UI_DIR=ui`，无构建链静态页）：白话来自身份化模板，技术信息在折叠区。**可回归的验收**：`powershell -NoProfile -File scripts/verify-ui.ps1`——它起 stub 全链路、造一张待批卡，再用 Edge(CDP) 断言「卡面只有人话、技术信息默认收起、非审批人没有批准按钮」，并落两张截图到 `out/ui-verify/`。
 
 > **审批人角色只有一条来路**：`tenon.confirm` 帧里的 `roles` **由宿主写入**（取提交者 token 的 `claims.roles`，先删客户端自报再写）。agent 侧不读登录身份、不做兜底——它若读自己的登录角色，等于用服务账号的身份给人授权。也因此：**策略必须真的给出 `approvers`**，否则 `requiredRoles` 为空、`rolesIntersect` 对空集 fail-closed，会出现"板上有卡、谁点都 403"。这是 fail-closed 的必然结果，不是 bug。
