@@ -21,8 +21,9 @@
 - 对 dsh：**无依赖**。任何语言的实现都应能跑这套用例（§10、§12 M2 出口判据），runner 绑死 dsh 就失去意义。
 - 对 Node：**无依赖**。套件自身不装 Node；被测目标是 TS 实现时，只是把它的地址交给 `--target`。
 - 仓内依赖：→ `tenon.dev/tools/lint`（C10 扫描器，同仓 Go 包）。
-- schema 校验（C1/C4 需要）：用 Go 的 JSON Schema 库解析 `spec/0.1/schemas/`。**库选型是 M0 的阻塞项**，必须是支持 draft 2020-12 的实现，且用「一份已知应失败的实例」做正反对拍（设计文档 §15 未决问题 6）。
-- 方向：conformance → lint；被测目标通过 `--target` 以 HTTP / MCP 交互，不被 import。
+- schema 校验（C1 需要）：用 Go 的 JSON Schema 库解析 `spec/0.1/schemas/`。**库选型是 M0 的阻塞项**，必须是支持 draft 2020-12 的实现，且用「一份已知应失败的实例」做正反对拍（设计文档 §15 未决问题 6）。
+- 方向：conformance → lint；被测目标通过 `--target` / `--host` 以 HTTP 交互，不被 import。
+  - 例外在测试侧：`host_test.go` import `internal/controlplane` 起**真实宿主**来证明 C4/C5 判 PASS。它只是测试脚手架，非测试包不引用它，runner 仍是黑盒。
 
 ## 用例表
 
