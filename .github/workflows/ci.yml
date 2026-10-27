@@ -72,9 +72,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 不在这里写 version：package.json 的 packageManager 已经是真源，
+      # 两处同时声明会被 action-setup 判成「Multiple versions of pnpm specified」（实测 7s 红）。
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
 
       - uses: actions/setup-node@v4
         with:
