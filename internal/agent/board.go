@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -51,8 +52,14 @@ func boardExpiry(raw string, now time.Time) string {
 // agent 的 payload（Task 12 的文档修订也是按「条目带 state」写的）。
 func boardPayloadAt(p Pending, state PendingState, now time.Time) map[string]any {
 	items := make([]map[string]any, 0, len(p.Labels))
-	for _, l := range p.Labels {
-		items = append(items, map[string]any{"label": l})
+	for i, l := range p.Labels {
+		item := map[string]any{"label": l}
+		// detail 只服务页面折叠区：老 pending 没有这一列时不要推空键，
+		// 否则页面会渲染一个空的「技术详情」。
+		if i < len(p.Details) && strings.TrimSpace(p.Details[i]) != "" {
+			item["detail"] = p.Details[i]
+		}
+		items = append(items, item)
 	}
 	roles := p.RequiredRoles
 	if roles == nil {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -212,5 +213,29 @@ func TestPendingBoardDefaultsStateToAwaiting(t *testing.T) {
 	s.pending.mu.RUnlock()
 	if stored != "awaiting_approval" {
 		t.Fatalf("公告板上存的缺省 state 应是 awaiting_approval，得到 %q", stored)
+	}
+}
+
+// host 不解释 items 的内容：带 detail 进来就要原样带回去（页面靠它渲染折叠区）。
+func TestPendingBoardKeepsItemDetail(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, Config{
+		AuditPath:     dir + "/audit.jsonl",
+		SessionSecret: []byte("secret"),
+		InboundDir:    dir + "/inbound",
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	agentTok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", []string{roleAgent}, time.Now().UTC(), time.Hour)
+	body := `{"planId":"pln_1","summary":"扣减 STD-1002 库存 3 件","state":"awaiting_approval",
+	          "requiredRoles":["role:warehouse_manager"],"expiresAt":"2099-01-01T00:00:00Z",
+	          "items":[{"label":"扣减 STD-1002 库存 3 件","detail":"inventory.DeductStock（{\"qty\":3}）"}]}`
+	if status, resp := postJSONAuth(t, ts.URL+"/tenon/pending", agentTok, body); status != http.StatusOK {
+		t.Fatalf("推公告板失败 %d：%s", status, resp)
+	}
+	code, raw := getJSONAuth(t, ts.URL+"/tenon/pending", agentTok)
+	if code != http.StatusOK || !strings.Contains(raw, `"detail":"inventory.DeductStock`) {
+		t.Fatalf("detail 没有被透传：%d %s", code, raw)
 	}
 }

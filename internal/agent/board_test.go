@@ -272,6 +272,33 @@ func TestBoardPayloadFixesUnparsableExpiry(t *testing.T) {
 	}
 }
 
+// 公告板每个 step 一条 item，同时带白话（label）与技术原文（detail）。
+func TestBoardPayloadCarriesDetail(t *testing.T) {
+	p := samplePending()
+	p.Details = []string{"inventory.DeductStock（{\"sku\":\"STD-1002\"}）"}
+
+	got := boardPayload(p, StateAwaitingApproval)
+	items, ok := got["items"].([]map[string]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("items 形状不对：%#v", got["items"])
+	}
+	if items[0]["label"] != p.Labels[0] {
+		t.Fatalf("label = %v，期望 %q", items[0]["label"], p.Labels[0])
+	}
+	if items[0]["detail"] != p.Details[0] {
+		t.Fatalf("detail = %v，期望 %q", items[0]["detail"], p.Details[0])
+	}
+}
+
+// 旧 pending 没有 details：不许推空 detail，也不许把 label 顶上去。
+func TestBoardPayloadOmitsMissingDetail(t *testing.T) {
+	p := samplePending()
+	items := boardPayload(p, StateAwaitingApproval)["items"].([]map[string]any)
+	if _, has := items[0]["detail"]; has {
+		t.Fatalf("没有 details 时不该出现 detail 键：%#v", items[0])
+	}
+}
+
 // toString 把 payload 里的值读成字符串（map[string]any 里是 any）。
 func toString(v any) string {
 	s, _ := v.(string)
