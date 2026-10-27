@@ -2514,6 +2514,7 @@ git commit -m "fix(controlplane): 测试模式下不挂入站通道（D1 可重�
 1. M0.5 spec §1 的 agent 行：把「不开端口、不持久化状态」改为「不开端口；持久状态只有 `TENON_AGENT_STATE_DIR` 下的 `pending/`、`archived/` 与 `processed.jsonl`」。
 2. README「还没做的」：删掉「agent 侧的挂起/恢复」「前端页面（P3 未做）」中的**前者**（后者保留，P3 未做）。
 3. `docs/interfaces.md` §4.7：公告板条目字段补 `state`（`awaiting_approval` / `done` / `rejected` / `expired` / `stale`），并注明「过滤是页面的事，协议层返回全部未过期条目」。
+4. **README 的已知缺口必须写明审计形状偏离**：挂起/恢复的计划级审计 `stepId=null`、无 `action`/`inputHash`，**不满足 `audit-event.schema.json` 的完整 required 集**；宿主当前只校验 `auditId` 与 `stage`，加严校验会让挂起路径全线失败。这是评审选定的 A 案（语义最诚实），不是疏漏。
 
 - [ ] **Step 2: 全量回归**
 

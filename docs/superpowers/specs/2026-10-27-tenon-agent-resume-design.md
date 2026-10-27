@@ -138,6 +138,8 @@ out/agent-state/
 
 **审计粒度先说清（否则实施时会两处打架）**：挂起路径的审计是**计划级**——`stepId=null`，一条 `dispatched` + 一条 `result`，`auditId` 复用同一个。理由是**人批准的对象是整份 plan**，不是某一步：若按步写，就得分清"这步的批准是哪次 confirm 给的"，而设计上一次 confirm 放行整份 plan。auto 路径仍按步两段写（既有行为不变）。
 
+**已知偏离（评审时选定 A 案，记在 README）**：计划级记录没有 `action` / `inputHash`，因此**不满足 `audit-event.schema.json` 的完整 required 集**。宿主当前的 `POST /tenon/audit` 只校验 `auditId` 与 `stage`，所以能落盘；一旦校验加严到 schema 完整，挂起路径会全线失败。选这条而不是"按第一步写"（B）或"只在恢复时写"（C），是因为它在语义上最诚实——批准的对象确实是整份 plan。代价是审计链里存在非标准记录，必须写进 README 的已知缺口，不让后来者以为是疏漏。
+
 ```
 ① 写 pending/<planId>.json  (state=awaiting_approval, auditSettled=false, dispatchedAuditId 已生成) + fsync
 ② POST /tenon/audit         (stage=dispatched, stepId=null, decision.approvedBy=null)

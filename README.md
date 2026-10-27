@@ -214,6 +214,8 @@ docker compose -f compose.m0.yaml config --quiet
 
 dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、**agent 侧的挂起/恢复**（不消费入站队列、不读 `confirm`，所以审批通过也恢复不了执行）、**前端页面**（`GET /` 只是路由，`TENON_UI_DIR` 不配就回 503）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
 
+> **审计形状的一处已知偏离（加严校验时会撞上）**：挂起与恢复的审计是**计划级**——`stepId=null`、没有 `action` / `inputHash`（人工批准的对象是整份 plan，不是某一步）。宿主当前的 `POST /tenon/audit` 只校验 `auditId` 非空与 `stage ∈ {dispatched, result}`，所以这些记录能落盘；但它们**不满足** `audit-event.schema.json` 的完整 required 集。也就是说：**审计链里存在非标准记录**。哪天宿主把校验加严到 schema 完整，挂起路径会全线失败——这是刻意接受的取舍（P2 设计 §4），不是疏漏。
+
 里程碑：
 
 | 阶段 | 内容 | 出口判据 |
