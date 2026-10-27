@@ -504,41 +504,50 @@ func (r *runner) discover(ctx context.Context) ([]ModuleDigest, error) {
 		if !m.Enabled || id == "" || base == "" {
 			continue
 		}
-		actions, err := r.manifestActions(ctx, base)
+		actions, meta, err := r.manifestActions(ctx, base)
 		if err != nil {
 			// 模块在场却读不到 manifest：能力清单不完整，不能假装它没有动作。
 			return nil, fmt.Errorf("模块 %q 的能力发现失败：%w", id, err)
 		}
 		r.modules[id] = base
-		out = append(out, ModuleDigest{ID: id, Actions: actions})
+		out = append(out, ModuleDigest{ID: id, Actions: actions, ActionMeta: meta})
 	}
 	return out, nil
 }
 
-// manifestActions 从模块的 GET /.well-known/tenon 取动作 id 清单（摘要级，不含 schema）。
-func (r *runner) manifestActions(ctx context.Context, baseURL string) ([]string, error) {
+// manifestActions 从模块的 GET /.well-known/tenon 取动作清单（摘要级，不含 schema），
+// 顺带把渲染白话要用的 title 与 summaryTemplate 一起带走。
+//
+// 模板**不进 prompt**：它在挂起时用于渲染审批卡，属于给人看的数据。
+func (r *runner) manifestActions(ctx context.Context, baseURL string) ([]string, map[string]ActionMeta, error) {
 	status, raw, err := r.getJSON(ctx, baseURL+"/.well-known/tenon")
 	if err != nil {
-		return nil, fmt.Errorf("GET /.well-known/tenon 失败：%w", err)
+		return nil, nil, fmt.Errorf("GET /.well-known/tenon 失败：%w", err)
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("GET /.well-known/tenon 返回 %d：%s", status, snippet(raw))
+		return nil, nil, fmt.Errorf("GET /.well-known/tenon 返回 %d：%s", status, snippet(raw))
 	}
 	var manifest struct {
 		Actions []struct {
-			ID string `json:"id"`
+			ID              string `json:"id"`
+			Title           string `json:"title"`
+			SummaryTemplate string `json:"summaryTemplate"`
 		} `json:"actions"`
 	}
 	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return nil, fmt.Errorf("manifest 不是合法 JSON：%w", err)
+		return nil, nil, fmt.Errorf("manifest 不是合法 JSON：%w", err)
 	}
 	ids := make([]string, 0, len(manifest.Actions))
+	meta := make(map[string]ActionMeta, len(manifest.Actions))
 	for _, a := range manifest.Actions {
-		if id := strings.TrimSpace(a.ID); id != "" {
-			ids = append(ids, id)
+		id := strings.TrimSpace(a.ID)
+		if id == "" {
+			continue
 		}
+		ids = append(ids, id)
+		meta[id] = ActionMeta{Title: a.Title, SummaryTemplate: a.SummaryTemplate}
 	}
-	return ids, nil
+	return ids, meta, nil
 }
 
 // moduleBase 从 action id（<moduleId>.<ActionName>）反查模块基地址。

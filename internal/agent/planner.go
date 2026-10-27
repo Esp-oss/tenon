@@ -72,6 +72,13 @@ type LLMClient interface {
 	ChatJSON(ctx context.Context, system, user string) ([]byte, error)
 }
 
+// ActionMeta 是渲染白话所需的最小信息：标题（R2 兜底）与模板（R1 主路径）。
+// 它随能力发现一起回来，**不进 prompt**——模板是给人看的，不是给模型的指令。
+type ActionMeta struct {
+	Title           string
+	SummaryTemplate string
+}
+
 // ModuleDigest 是一个**可达**模块的动作清单摘要。
 //
 // Actions 只含从 GET /.well-known/tenon 动态发现的 action id——它们不属于本包代码，
@@ -80,6 +87,8 @@ type LLMClient interface {
 type ModuleDigest struct {
 	ID      string
 	Actions []string
+	// ActionMeta 按 action id 索引；老模块没声明模板时对应项只有 Title。
+	ActionMeta map[string]ActionMeta
 }
 
 // PlanInput 是一次规划的全部输入。

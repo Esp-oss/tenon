@@ -142,6 +142,8 @@ type fakeModule struct {
 
 	ModuleID string
 	Actions  []string
+	// Templates 是 action id → 人话模板；空表示该动作没声明（渲染侧走 R2）。
+	Templates map[string]string
 
 	DryRunStatus  string // 默认 verified
 	DryRunMissing bool   // 声明「不支持预演」：回 404 空体
@@ -175,7 +177,11 @@ func (m *fakeModule) serve(w http.ResponseWriter, r *http.Request) {
 		m.mu.Unlock()
 		actions := make([]map[string]any, 0, len(m.Actions))
 		for _, id := range m.Actions {
-			actions = append(actions, map[string]any{"id": id, "version": "0.1.0", "title": id, "kind": "write"})
+			item := map[string]any{"id": id, "version": "0.1.0", "title": id, "kind": "write"}
+			if tpl, ok := m.Templates[id]; ok {
+				item["summaryTemplate"] = tpl
+			}
+			actions = append(actions, item)
 		}
 		writeTestJSON(w, http.StatusOK, map[string]any{
 			"tenon":   "0.1",
@@ -1086,4 +1092,48 @@ func writeTestError(w http.ResponseWriter, status int, class, code, message stri
 			"retryable": class == "retryable",
 		},
 	})
+}
+
+// newRunnerForDiscover 造一个只够跑 discover 的 runner：宿主注册表指向假模块。
+func newRunnerForDiscover(t *testing.T, moduleBase string) *runner {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tenon/modules" {
+			http.NotFound(w, r)
+			return
+		}
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"modules": []map[string]any{{"id": "inventory", "baseURL": moduleBase, "enabled": true}},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return &runner{host: srv.URL, client: srv.Client()}
+}
+
+// 模板必须随能力发现一起到 agent 手里：它是渲染白话的唯一来源，
+// 少了它就只能退回 R2（标题 + 参数），卡上读不到「扣减 … 库存 3 件」这种话。
+func TestDiscoverCarriesActionMeta(t *testing.T) {
+	mod := newFakeModule(t, "inventory", []string{"inventory.DeductStock"}, new([]string))
+	mod.Templates = map[string]string{
+		"inventory.DeductStock": "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）",
+	}
+	r := newRunnerForDiscover(t, mod.Server.URL)
+
+	got, err := r.discover(context.Background())
+	if err != nil {
+		t.Fatalf("能力发现失败：%v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("期望 1 个模块，得到 %d", len(got))
+	}
+	meta, ok := got[0].ActionMeta["inventory.DeductStock"]
+	if !ok {
+		t.Fatalf("ActionMeta 缺 inventory.DeductStock：%+v", got[0])
+	}
+	if meta.SummaryTemplate != "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）" {
+		t.Fatalf("模板不符：%q", meta.SummaryTemplate)
+	}
+	if meta.Title == "" {
+		t.Fatalf("Title 也要带走（R2 兜底要用）")
+	}
 }
