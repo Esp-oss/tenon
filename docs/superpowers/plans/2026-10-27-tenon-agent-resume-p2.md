@@ -65,11 +65,13 @@
 
 ## Task 1: 状态目录与 `Pending` 读写
 
+**状态：✅ 已完成（commit `3421ff0`）**
+
 **Files:**
 - Create: `internal/agent/state.go`
 - Test: `internal/agent/state_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -178,12 +180,12 @@ func TestPendingExpired(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestStateStore|TestPendingExpired' -count=1`
 Expected: `undefined: Pending`
 
-- [ ] **Step 3: 实现 `state.go`**
+- [x] **Step 3: 实现 `state.go`**
 
 ```go
 package agent
@@ -412,12 +414,12 @@ func listPendingDir(dir string) ([]Pending, error) {
 }
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestStateStore|TestPendingExpired' -count=1 -v`
 Expected: 4 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/state.go internal/agent/state_test.go
@@ -428,11 +430,13 @@ git commit -m "feat(agent): 状态目录与 Pending 读写（tmp+rename 原子�
 
 ## Task 2: 去重账本（write-ahead）
 
+**状态：✅ 已完成（commit `92815e3`）**
+
 **Files:**
 - Create: `internal/agent/ledger.go`
 - Test: `internal/agent/ledger_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -486,12 +490,12 @@ func TestLedgerDoneRecorded(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestLedger' -count=1`
 Expected: `undefined: NewLedger`
 
-- [ ] **Step 3: 实现 `ledger.go`**
+- [x] **Step 3: 实现 `ledger.go`**
 
 ```go
 package agent
@@ -607,12 +611,12 @@ func (l *Ledger) append(e ledgerEntry) error {
 }
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestLedger' -count=1 -v`
 Expected: 3 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/ledger.go internal/agent/ledger_test.go
@@ -623,12 +627,14 @@ git commit -m "feat(agent): requestId 去重账本（write-ahead，claimed 落�
 
 ## Task 3: 挂起的三次落盘（I7）与崩溃分流
 
+**状态：✅ 已完成（commit `3302ac5` + 审计补丁 `c97277e`）**
+
 **Files:**
 - Create: `internal/agent/suspend.go`
 - Modify: `internal/agent/state.go`（只加 `CountCorrupt` 与改准一句注释）
 - Test: `internal/agent/suspend_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -766,12 +772,12 @@ func TestSelfCheckCountsCorruptFiles(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestSuspend|TestSelfCheck' -count=1`
 Expected: `undefined: suspend`
 
-- [ ] **Step 3: 实现 `suspend.go`**
+- [x] **Step 3: 实现 `suspend.go`**
 
 ```go
 package agent
@@ -983,12 +989,12 @@ func postJSONWith(ctx context.Context, client *http.Client, url string, body any
 
 （`import` 需补 `bytes`、`encoding/json`、`io`。）
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestSuspend|TestSelfCheck' -count=1 -v`
 Expected: 4 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/suspend.go internal/agent/suspend_test.go
@@ -999,11 +1005,13 @@ git commit -m "feat(agent): 挂起的 I7 三次落盘与自检分流"
 
 ## Task 4: host 客户端（登录 / 重登 / 入站 poll+ack / 公告板）
 
+**状态：✅ 已完成（commit `f192b94`）**
+
 **Files:**
 - Create: `internal/agent/hostapi.go`
 - Test: `internal/agent/hostapi_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -1097,12 +1105,12 @@ func TestHostClientReLoginsOnUnauthorized(t *testing.T) {
 func itoa(n int) string { return string(rune('0' + n)) }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestHostClient' -count=1`
 Expected: `undefined: NewHostClient`
 
-- [ ] **Step 3: 实现 `hostapi.go`**
+- [x] **Step 3: 实现 `hostapi.go`**
 
 ```go
 package agent
@@ -1299,12 +1307,12 @@ func getJSONWith(ctx context.Context, client *http.Client, url string, headers m
 }
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestHostClient' -count=1 -v`
 Expected: 2 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/hostapi.go internal/agent/hostapi_test.go
@@ -2270,6 +2278,29 @@ func (l *Ledger) Phase(requestID string) string {
 
 3. **`Done` 必须覆盖所有返回路径**，包括 `res.Outcome == NeedsHuman`（挂起成功，那也是一次完整的处理）。实现时把 `Done` 放在 `Run` 之后立刻执行，不要让它排在可能失败的 `writeRequestResult` 之后。
 4. **装配**：`NewLedger(filepath.Join(cfg.stateDir, "processed.jsonl"))`（**文件**路径，不是目录）；`poller.ledger` 必须注入，否则 `drainInbound` 会 nil 解引用。`Deps.State` 为 nil 表示"没有挂起通道"，**不要把空串传给 `NewStateStore`**。
+
+5. **`auditProbe` 的 host 归属已定（`c97277e` 之后）**：签名已改成 `Has(ctx, auditID)`——**没有 host 参数**，空串在类型上不存在了。真实现放在 Task 10：
+
+```go
+// hostAuditProbe 用 HostClient 查审计链；host 绑在 client 里，不进签名。
+type hostAuditProbe struct{ client *HostClient }
+
+func (h hostAuditProbe) Has(ctx context.Context, auditID string) (bool, error) {
+	status, raw, err := h.client.do(ctx, http.MethodGet, h.client.base+"/tenon/audit", nil)
+	if err != nil {
+		return false, err
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("查审计返回 %d：%s", status, snippet(raw))
+	}
+	return bytes.Contains(raw, []byte(`"auditId":"`+auditID+`"`)), nil
+}
+```
+
+`HostClient.base` 是小写字段，同包可直接读；若确实需要外部访问，加 `BaseURL() string`，**不要**把字段导出。
+
+6. **自检的导出包装与日志**：`selfCheck` 是小写、返回未导出类型 `selfCheckReport`。Task 10 加个导出包装 `SelfCheck(...) (selfCheckReport, error)` 即可（调用方用 `rep.Kept` 这类导出字段，不需要命名类型）。日志行**必须包含 `Corrupt`**——坏文件唯一的告警出口。
+
 
 
 `config` 增字段（沿用现有 env 读取风格）：

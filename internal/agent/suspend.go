@@ -15,16 +15,21 @@ const pendingTTL = 15 * time.Minute
 
 // auditProbe 用于自检：审计链上有没有这条 dispatched 记录。
 type auditProbe interface {
-	Has(ctx context.Context, host, auditID string) (bool, error)
+	// Has 回答「审计链上有没有这条 dispatched 记录」。
+	//
+	// 签名里刻意**没有 host**：probe 由谁持有 host 是它的实现细节（真实现是
+	// hostAuditProbe，绑 HostClient；测试桩不需要 host）。早先的签名带一个 host 参数、
+	// 调用处传空串，等于给「拼出相对 URL」留了个口子——空串在类型上就不该出现。
+	Has(ctx context.Context, auditID string) (bool, error)
 }
 
 type auditProbeFound struct{}
 
-func (auditProbeFound) Has(context.Context, string, string) (bool, error) { return true, nil }
+func (auditProbeFound) Has(context.Context, string) (bool, error) { return true, nil }
 
 type auditProbeNotFound struct{}
 
-func (auditProbeNotFound) Has(context.Context, string, string) (bool, error) { return false, nil }
+func (auditProbeNotFound) Has(context.Context, string) (bool, error) { return false, nil }
 
 // suspend 执行 I7 的三次落盘：
 //
@@ -123,7 +128,7 @@ func selfCheck(ctx context.Context, store *StateStore, probe auditProbe) func(ti
 		}
 		for _, p := range items {
 			if !p.AuditSettled {
-				found, perr := probe.Has(ctx, "", p.DispatchedAuditID)
+				found, perr := probe.Has(ctx, p.DispatchedAuditID)
 				if perr != nil {
 					return rep, perr
 				}
