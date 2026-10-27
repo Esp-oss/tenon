@@ -49,7 +49,7 @@ flowchart TB
     subgraph FE["前端（可选增强）"]
         UI["业务页面 + 共驾 SDK<br/>消费 Intent / 产出 Context·Confirm"]
     end
-    subgraph RT["Agent 运行时（参考实现#1：dsh）"]
+    subgraph RT["Agent 运行时（本轮参考实现：cmd/agent）"]
         AG["事件→回合→技能→能力发现→规划<br/>产出 Plan"]
     end
     subgraph MOD["业务模块（任意语言/框架）"]
@@ -58,7 +58,7 @@ flowchart TB
         M3["procurement"]
     end
     subgraph L1["L1 传输"]
-        T["HTTP/JSON · Webhook(HMAC) · MCP(双向) · 事件信封"]
+        T["HTTP/JSON · Webhook(HMAC) · MCP(双向，M2) · 事件信封"]
     end
     subgraph X["L3 执行语义 + L4 控制平面（不依赖运行时）"]
         X1["幂等 · dry-run · 重试/熔断 · saga 补偿 · 审计两段写"]
@@ -72,7 +72,7 @@ flowchart TB
     X -.横切.-> MOD
 ```
 
-**协议住在规范里，dsh 只是第一个宿主。** 协议层不 import 任何 dsh 类型；非 TypeScript 系统通过 HTTP 侧车接入，一样合规。
+**协议住在规范里，宿主与运行时都可替换。** 协议层不 import 任何宿主类型：本轮的参考宿主是 Go 的 `cmd/host`，参考运行时是 `cmd/agent`；dsh 插件的进程内宿主是 M1 的另一种接入形态，不是前提。
 
 ## 语言选型：按层选，不按偏好选
 
@@ -83,6 +83,8 @@ flowchart TB
 | 一致性套件 + lint | **Go** | 交付形态是单文件二进制——第三方下载即自证合规，不必先装 Node/Python |
 | HTTP 侧车 / demo 模块 | Go | 与套件共用一套工具链；跨进程强制走真实报文，堵住"绕过协议直接 import"的偷懒 |
 | 协议类型定义 | TypeScript | 由 schema 派生，供 dsh 侧编译期使用 |
+
+> M0.5 的**参考宿主是 Go**（`cmd/host`，决策 A）：控制平面只做策略/授权/审计/注册表，没有一行 LLM 调用，用 Go 与模块、套件共用工具链。TypeScript 的 dsh 插件宿主仍未实现（D18 的进程内路径 deferred）——上表的「dsh 宿主」说的是 M1 的接入形态，不是本轮的 `host`。
 
 **为什么不用 Rust / C++**：本项目是 I/O 与编排密集型，零 GC 与零开销带来的收益接近于零，而 JSON Schema draft 2020-12 的生态成熟度与开发速度是实质收益。真出现热点（HMAC 验签、批量 schema 校验）再局部换语言，那是实现细节，不是选型。
 
@@ -120,58 +122,114 @@ flowchart TB
 
 ```
 spec/0.1/         规范：schema 是唯一真源，md 只写语义（JSON Schema）
-conformance/      可执行规范：C1–C10 + D1 差异测试（Go）
+conformance/      可执行规范：C1–C10 一致性用例（D1 的 runner 在 internal/d1，经 `tenon d1 run` 调用）
 tools/lint/       C10 反模式扫描器（Go）
-packages/         @tenon/core 类型 + 4 个 dsh 插件 + HTTP 侧车（TypeScript）
-demo/mini-erp/    quote（TS 插件）+ inventory / procurement（Go 侧车）
-docs/             设计文档与架构图
+internal/         协议实现对外的全部内核：protocol / spec / module / controlplane / llm / agent / d1
+cmd/              host（控制平面）、agent（AI 运行时）、quote / inventory / procurement（模块）、tenon（工具）
+skills/           业务流程知识：每个子目录一份 SKILL.md（订阅声明 + 业务语义正文）
+packages/         @tenon/core 类型 + dsh 插件（TypeScript，M1 的进程内路径，本轮未接）
+demo/mini-erp/    demo 的场景说明与 D1 期望形态
+docs/             设计文档、接口文档与架构图
 ```
 
 ## 当前状态
 
-**M0 内核已跑通**：规范 10 份 schema + Go 工具链（`cmd/tenon`：一致性套件 / lint / schema 校验）+ 两个真实模块（`cmd/inventory`、`cmd/procurement`）。约 5000 行 Go，四个包全绿。
+**M0.5 已落地三个进程**：宿主 `cmd/host`（控制平面：策略 / 授权 / 审计链 / 注册表 / 共驾帧 REST）、agent 运行时 `cmd/agent`（轮询发件箱 → 读 skill → 能力发现 → LLM 规划 → 闸门 → 两段审计 → 执行）、触发器模块 `cmd/quote`；M0 的 `cmd/inventory` / `cmd/procurement` 继续可用。协议侧的三处扩展（`POST /tenon/audit`、`GET /tenon/modules`、模块发件箱 `direction=out`）见 [spec/0.1/CHANGELOG.md](spec/0.1/CHANGELOG.md) 的 `0.2.0` 提案段与 [docs/interfaces.md](docs/interfaces.md)。
 
-一条命令跑一致性测试（模块需先起在 8081/8082）：
+### 对话入口（M1 切片 1）：后端就绪，链路未通
+
+`cmd/host` 已具备「人 → agent」的入站面：
+
+- 入站队列**落盘**（`requests.jsonl` + `.meta` 序号水位），独立于出站内存队列——两者的 `ack` 都是累积游标，共用一个会互相吞帧；
+- `POST /tenon/session` 口令换**无状态 token**（dev 账号表 `config/users.dev.json`：`alice` / `bob` / `agent`）；
+- 入站三端点 + 待批公告板 + `GET /` 同源静态页；**消费侧**（`poll` / `ack` / 公告板写入）要求 `role:agent`，普通用户 token 一律 403；
+- `origin` 进策略：宿主签发合成 `evt_` 并**独立落盘登记**（这张表是治理状态，不是缓存——单删它会把在途请求静默降级成事件驱动），据此判定「对话发起 / 事件驱动」；缺 `triggerEventId` 的行为由 `TENON_REQUIRE_TRIGGER` 过渡控制（默认放行为 `event`，P4 收口时改强制）；
+- 业务级规则从 `skills/<id>/approval.json` 加载，加载期校验 `arg.*` / `risk.*` 路径并试编译，按 skill 粒度 fail-closed；与平台规则同池合并、**取更严**，所以业务规则只能收紧不能放宽。
+
+**还缺两半，所以现在不能当功能用**：agent 不消费入站队列、也不读 `confirm`（P2）；页面没有内容（P3）。即「业务员说话 → 落到队列」这一段是真的，「agent 处理 → 人看到结果」还没有。
+
+现在能验证到的最小链路（先起一个模块，例如 `inventory` 在 8081）：
 
 ```bash
-go run ./cmd/tenon conformance run \
-  --target http://127.0.0.1:8081 --module inventory \
-  --fixtures conformance/fixtures/mini-erp.json --source-dir . --report out/report.json
+TENON_USERS_FILE=config/users.dev.json TENON_SESSION_SECRET=dev \
+TENON_INBOUND_DIR=out/inbound TENON_MODULES='inventory=http://127.0.0.1:8081' \
+go run ./cmd/host
+# 换 token，再推一句人话；返回 {"ok":true,"seq":1,"durable":true}
+curl -s -X POST localhost:8080/tenon/session -d '{"user":"alice","password":"alice-dev"}'
+curl -s -X POST localhost:8080/tenon/requests -H "Authorization: Bearer <token>" \
+  -d '{"type":"tenon.request","text":"扣 12 件"}'
 ```
 
-对真实模块实测（`exit=0`，pass 6 / fail 0 / skip 3）：
+### 能判定的用例（宿主模式，真进程实测）
+
+```bash
+# 宿主 + inventory 先起在 8080/8081
+go run ./cmd/tenon conformance run --target http://127.0.0.1:8081 --host http://127.0.0.1:8080 \
+  --module inventory --fixtures conformance/fixtures/mini-erp.json --source-dir . --report out/report.json
+```
+
+2026-10-27 10:59 实测输出：`小计：pass 8 / fail 0 / skip 1`，`exit=0`。
 
 | 用例 | 结果 | 断言的是什么 |
 |---|---|---|
 | C1 | pass | manifest 合法、摘要不含 `inputSchema`、每个 write 都有幂等声明 |
 | C2 | pass | 同 `Idempotency-Key` 两次 → 响应一致、副作用一次 |
 | C3 | pass | 注入未知字段 → 200 而非 400（前向兼容） |
-| C8 | pass | 不支持 dry-run 的 action → 404/501 优雅降级 |
+| C8 | pass | 不支持 dry-run 的 action → 404/501 优雅降级（agent 侧据此强制转人工） |
 | C9 | pass | 库存不足 → 422 `business_rejection`，`retryable=false` |
 | C10 | pass | 全仓反模式扫描 0 命中 |
-| C4 / C5 / D1 | **skip** | 需要宿主侧端点或 LLM 规划器；**SKIP 不等于 PASS**，报告会明说不能视为整体合规 |
+| **C4** | **pass** | 审计两段写齐备 + `prevHash` 链连续（给 `--host` 才判定） |
+| **C5** | **pass** | 4 个探针（空 plan / 无规则命中 / 未知动作 / 未登记模块）一律 `deny` |
+| D1 | **skip** | 需要一个会推理的规划器；**SKIP 不等于 PASS**，报告会明说不能视为整体合规 |
 
-其它检查：
+不给 `--host` 时 C4/C5 仍记 SKIP 并写明原因——模块模式没有宿主侧端点可查。
+
+### D1 差异测试：runner 已实现，结论未判定
 
 ```bash
-pnpm check        # 规范 schema 校验 + TS 类型检查
-go test ./... -count=1
+go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
+  --quote http://127.0.0.1:8083 --inventory http://127.0.0.1:8081 \
+  --procurement http://127.0.0.1:8082 \
+  --agent-result out/agent-result.jsonl --report out/d1.json
 ```
 
-**还没做的**：dsh 宿主（`dsh-plugin-module-host` / governance / intent-ui / skill-biz）、`quote` 进程内模块、D1 需要的 LLM 规划器。没有 LLM 凭据之前，D1 保持 SKIP——用规则式规划器让它「通过」就是把核心命题做成假命题。
+`internal/d1` 会做两轮：A 轮三个模块全在 → B 轮 `POST /tenon/admin/modules` 把 procurement 置 `enabled=false`，两轮之间 reset 所有模块、换一个报价单号（SKU 与数量不变），然后比对 agent 结果文件里两轮**规划出来的**动作序列（判据：序列不同、B 轮不碰被摘模块、B 轮转人工、两轮都没崩）。
+
+**但它还没跑过真 LLM 的 A/B**，所以 D1 的结论是「未判定」，不是「已通过」：
+
+- 本轮没有用真凭据跑过 agent 回合，自然也没有 A/B 两轮可比（没跑 ≠ 通过）；
+- 前置接线都已就位、并逐条实测过：宿主 `TENON_TEST_MODE=1` 挂 `POST /tenon/admin/modules`；三个模块 `TENON_TEST_MODE=1` 挂 `POST /tenon/admin/reset`（设 `1` → 200 `{"reset":true}`，设 `0` → 404）；agent 的 `TENON_RESULT_FILE` 每回合追加一行，正是 `--agent-result` 读的文件。
+
+用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
+
+### 其它检查
+
+```bash
+pnpm check                    # 规范 schema 校验 + TS 类型检查
+go test ./... -count=1
+docker compose -f compose.m0.yaml config --quiet
+```
+
+### 还没做的
+
+dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、**agent 侧的挂起/恢复**（不消费入站队列、不读 `confirm`，所以审批通过也恢复不了执行）、**前端页面**（`GET /` 只是路由，`TENON_UI_DIR` 不配就回 503）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
+
+> **审计形状的一处已知偏离（加严校验时会撞上）**：挂起与恢复的审计是**计划级**——`stepId=null`、没有 `action` / `inputHash`（人工批准的对象是整份 plan，不是某一步）。宿主当前的 `POST /tenon/audit` 只校验 `auditId` 非空与 `stage ∈ {dispatched, result}`，所以这些记录能落盘；但它们**不满足** `audit-event.schema.json` 的完整 required 集。也就是说：**审计链里存在非标准记录**。哪天宿主把校验加严到 schema 完整，挂起路径会全线失败——这是刻意接受的取舍（P2 设计 §4），不是疏漏。
 
 里程碑：
 
 | 阶段 | 内容 | 出口判据 |
 |---|---|---|
-| M0 | schema + conformance C1–C5/C8/C9/C10 + D1 + lint + mini-erp 三模块 + module-host 插件 | D1 与 C10 全绿；注入 `dispatched` 写失败必须拒绝执行 |
-| M1 | grant 矩阵 + policy 引擎 + 审批 + 审计查询/回放 + 对账 | 高风险路径必须人工；对账能发现篡改 |
+| M0 | schema + conformance C1–C3/C8/C9/C10 + lint + `inventory` / `procurement` 两个侧车 | 模块侧用例全绿 |
+| **M0.5（已完成）** | `host` + `agent` + `quote` + 协议扩展三处（写审计 / 注册表 / 发件箱） | C4/C5 判 PASS（**已达成**）；D1 需真 LLM 跑一次 A/B（**未跑**，接线已就位） |
+| **M1 切片 1（已完成）** | host 入站面：落盘入站队列 / dev 身份 / `origin` 进策略 / 业务级规则 / 待批公告板 / 同源静态页 | 入站与策略侧用例全绿；**链路未通**——agent 侧（P2）与页面（P3）未做 |
+| M1（剩余） | agent 挂起/恢复 + `pendingPlanId` + 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 | 高风险路径必须人工；对账能发现篡改 |
 | M2 | HTTP 侧车 SDK + MCP 双向 + 非 TS 示例 | 非 TS 模块跑通全套用例 |
 | M3 | skill 仓库 + 轨迹蒸馏 + 发布审计/回滚 | 新流程只改 skill 即可上线 |
 
 ## 容器
 
-三层，**只有第一层现在能跑**（细节与判据见 [docker/README.md](docker/README.md)）：
+三层（细节与判据见 [docker/README.md](docker/README.md)）：检查/文档层现在就能跑；服务镜像的 **build 阶段**四个 Go 入口都已实测通过，完整镜像受运行时基础镜像与卷权限限制仍未验；拓扑层 `compose.m0.yaml` 语法可验、端到端 `up` 未验。
 
 ```bash
 docker compose up -d docs      # 文档站 → http://localhost:8088（规范 + 架构图 + 设计文档）
@@ -179,12 +237,15 @@ docker compose run --rm spec   # 规范校验（与 CI 的 spec job 同源）
 docker compose run --rm go     # Go 工具链 gofmt/vet/build（与 CI 的 go job 同源）
 ```
 
-M0 的目标拓扑（`host` + `inventory` + `procurement` + `conformance` + `lint`，两段网络）在 [compose.m0.yaml](compose.m0.yaml)：
-`docker compose -f compose.m0.yaml config` 现在就能过；`build` 会在 `go build ./cmd/...` 与
-`pnpm run build` 处失败——**这是「代码还没写」的契约信号，不是缺陷**。
+M0.5 的目标拓扑是 7 个服务（`host`、`agent`、`quote`、`inventory`、`procurement` + 一次性的 `conformance`、`lint`）、2 个网络、2 个 secret、5 个命名卷，见 [compose.m0.yaml](compose.m0.yaml)：
 
-对外接口（端口分配、模块侧 6 端点、宿主侧 4 端点 + WS、请求头与 HMAC、健康探针、调用矩阵、已知缺口）：
-[**docs/interfaces.md**](docs/interfaces.md)。
+```bash
+docker compose -f compose.m0.yaml config --quiet   # 现在就能过
+docker compose -f compose.m0.yaml build            # 逐服务构建；运行时阶段仍未验
+```
+
+对外接口（端口分配、模块侧 6 端点、宿主侧 **13 个协议端点 + 2 个探针 + 静态页**、请求头与 token、游标与方向、健康探针、调用矩阵、G1 的 fail-closed 语义、已知缺口）：
+[**docs/interfaces.md**](docs/interfaces.md)（§4 有逐条清单）。
 
 ## 与相邻协议的关系
 

@@ -119,7 +119,7 @@
       ]
     },
     "ConditionLeaf": {
-      "description": "算子叶：恰好一个字段路径映射到一个算子对象（例 {\"arg.qty\": {\">\": 10}}）。多个条件必须用 all 组合，不得塞进同一个对象，以保证求值顺序无歧义。",
+      "description": "算子叶：恰好一个字段路径映射到一个算子对象（例 {\"arg.qty\": {\">\": 10}}）。多个条件必须用 all 组合，不得塞进同一个对象，以保证求值顺序无歧义。路径前缀为 arg / risk / origin；origin 是单段路径（不带点），语义由引擎校验。",
       "type": "object",
       "minProperties": 1,
       "maxProperties": 1,
@@ -127,7 +127,7 @@
         "$ref": "#/$defs/OperatorExpression"
       },
       "propertyNames": {
-        "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+$"
+        "pattern": "^([A-Za-z_][A-Za-z0-9_]*)(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
       }
     },
     "OperatorExpression": {

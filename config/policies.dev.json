@@ -1,0 +1,56 @@
+[
+  {
+    "policyId": "pol-inventory-deduct-approve",
+    "priority": 100,
+    "match": {
+      "module": "inventory",
+      "actions": ["inventory.DeductStock"]
+    },
+    "when": {
+      "all": [
+        {
+          "arg.qty": { ">": 10 }
+        }
+      ]
+    },
+    "outcome": "approve",
+    "approvers": ["role:warehouse_manager"]
+  },
+  {
+    "policyId": "plat-request-needs-human",
+    "priority": 1000,
+    "match": {
+      "module": "procurement",
+      "actions": ["procurement.CreatePurchaseRequest"]
+    },
+    "when": {
+      "all": [
+        {
+          "origin": { "eq": "request" }
+        }
+      ]
+    },
+    "outcome": "approve",
+    "approvers": ["role:procurement_manager"]
+  },
+  {
+    "policyId": "pol-inventory-getstock-auto",
+    "priority": 10,
+    "match": {
+      "module": "inventory",
+      "actions": ["inventory.GetStock"]
+    },
+    "when": { "all": [] },
+    "outcome": "auto"
+  },
+  {
+    "policyId": "pol-quote-getquote-auto",
+    "priority": 10,
+    "match": {
+      "module": "quote",
+      "actions": ["quote.GetQuote"]
+    },
+    "when": { "all": [] },
+    "outcome": "auto"
+  }
+]

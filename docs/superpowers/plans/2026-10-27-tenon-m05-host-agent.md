@@ -19,8 +19,8 @@
 ### Task 1: Policy 引擎
 
 **Files:**
-- Create: `internal/controlplane/policy.go`
-- Test: `internal/controlplane/policy_test.go`
+- Create: `internal/controlplane/policy/policy.go`（包 `policy`；拆子包是为了让 Task 1–4 能并行且互不打断编译）
+- Test: `internal/controlplane/policy/policy_test.go`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -107,8 +107,8 @@ git commit -m "feat(controlplane): policy 引擎（9 算子 + all/any/not + deny
 ### Task 2: Grant 引擎（交集 + 配额窗口）
 
 **Files:**
-- Create: `internal/controlplane/grant.go`
-- Test: `internal/controlplane/grant_test.go`
+- Create: `internal/controlplane/grant/grant.go`（包 `grant`）
+- Test: `internal/controlplane/grant/grant_test.go`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -181,8 +181,8 @@ git commit -m "feat(controlplane): grant 引擎（权限取交集 + 配额窗口
 ### Task 3: 审计存储（两段写 + 哈希链 + 注入失败）
 
 **Files:**
-- Create: `internal/controlplane/audit.go`
-- Test: `internal/controlplane/audit_test.go`
+- Create: `internal/controlplane/audit/audit.go`（包 `audit`）
+- Test: `internal/controlplane/audit/audit_test.go`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -261,8 +261,8 @@ git commit -m "feat(controlplane): 审计存储（两段写 + prevHash 链 + 失
 ### Task 4: 模块注册表
 
 **Files:**
-- Create: `internal/controlplane/registry.go`
-- Test: `internal/controlplane/registry_test.go`
+- Create: `internal/controlplane/registry/registry.go`（包 `registry`）
+- Test: `internal/controlplane/registry/registry_test.go`
 
 - [ ] **Step 1: 写失败测试**
 

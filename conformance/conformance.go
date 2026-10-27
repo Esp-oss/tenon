@@ -1,23 +1,46 @@
 // Package conformance 是 Tenon 的可执行规范：把 spec/0.1 的断言做成能对任意实现跑的黑盒测试。
 //
-// M0 覆盖模块侧：C1（manifest）、C2（幂等）、C3（未知字段）、C8（可选能力容忍）、
+// 模块侧用例：C1（manifest）、C2（幂等）、C3（未知字段）、C8（可选能力容忍）、
 // C9（错误分类）、C10（反模式扫描）。
-// 宿主侧用例（C4 审计、C5 fail-closed）与 D1 差异测试在本包里**显式记为 SKIP 并写明原因**，
+//
+// 宿主侧用例：C4（审计两段写 + 哈希链）与 C5（fail-closed）只有在给了宿主地址
+// （Options.HostTarget）时才能判定；没有宿主地址就**显式记为 SKIP 并写明原因**，
 // 不允许用「没跑就是通过」蒙过去——见 Report.ExitCode 与 --strict 的语义。
+// D1 差异测试需要会推理的规划器（LLM），本包永远记 SKIP。
 package conformance
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"tenon.dev/internal/spec"
 	"tenon.dev/tools/lint"
+)
+
+// 以下取值都是 spec 词表，不是某个实现的内部常量：conformance 是黑盒套件（README 的
+// 「职责边界」），断言只能建立在规范文本上。若改成 import 宿主包里的同名常量，
+// 「规范」就跟着实现漂——实现改常量等于改判据，第三方自证合规也就没有意义了。
+const (
+	// stageDispatched / stageResult 是审计两段写的两段（interfaces.md §4.3）。
+	stageDispatched = "dispatched"
+	stageResult     = "result"
+	// outcomeDeny 是策略处置的拒绝态（policy.schema.json#/$defs/PolicyOutcome）。
+	outcomeDeny = "deny"
+	// reasonNoMatch 是「无任何策略命中 → 默认拒绝」的理由码
+	// （policy.schema.json#/$defs/PolicyEvaluationResponse 的示例值）。
+	reasonNoMatch = "NO_POLICY_MATCH_DEFAULT_DENY"
+	// hashScheme 是审计链摘要的前缀（common.schema.json#/$defs/Sha256Hash）。
+	hashScheme = "sha256:"
 )
 
 // Status 是一条用例的结论。SKIP 不等于 PASS：它表示「这条没资格下结论」。
@@ -92,6 +115,12 @@ type Options struct {
 	Client *http.Client
 	// ModuleID 用于挑选 Fixtures 里的模块；空则用 Target 对应唯一模块。
 	ModuleID string
+	// HostTarget 是被测宿主的基地址（控制平面端点：policies:evaluate / grants:evaluate /
+	// audit），例如 http://localhost:8080。
+	//
+	// 为空时 C4/C5 记 SKIP：模块模式下这两条在本轮**没有判定**，报告必须能区分
+	// 「判过且成立」与「没判」。非空但不可达则判 FAIL——你要求测宿主，宿主没应答就是失败。
+	HostTarget string
 }
 
 // Invocation 是一条带真实参数的调用场景。
@@ -154,7 +183,7 @@ func Run(ctx context.Context, opts Options) Report {
 	rep.Results = append(rep.Results, checkErrorClass(ctx, client, opts.Target, fix)...)
 	rep.Results = append(rep.Results, checkDryRunOptional(ctx, client, opts.Target, manifest, raws)...)
 	rep.Results = append(rep.Results, checkLint(opts.LintRoot))
-	rep.Results = append(rep.Results, hostSideSkips()...)
+	rep.Results = append(rep.Results, hostSideChecks(ctx, client, opts.HostTarget)...)
 
 	rep.FinishedAt = time.Now()
 	return rep
@@ -479,16 +508,313 @@ func checkLint(root string) Result {
 	return res
 }
 
-// hostSideSkips 明确记录本轮**没有判定**的用例，避免「没跑就是通过」。
-func hostSideSkips() []Result {
-	return []Result{
-		{Case: "C4", Title: "审计可查（两段写 + 哈希链）", Status: Skip,
-			Detail: "需要宿主侧 GET /tenon/audit；模块模式不覆盖。宿主实现落地后由 --target 指向宿主运行。"},
-		{Case: "C5", Title: "fail-closed：策略/授权不可达时拒绝写操作", Status: Skip,
-			Detail: "需要宿主侧 policies:evaluate 与 grants:evaluate；模块模式不覆盖。"},
-		{Case: "D1", Title: "差异测试：摘掉 procurement 后 Plan 必须改变且不抛错", Status: Skip,
-			Detail: "需要会推理的规划器（LLM）。未配置 LLM 时不能声称通过——规则式规划器会让 D1 变成假命题。"},
+// --- 宿主侧用例（需要 Options.HostTarget）---
+
+// 三条宿主侧用例的固定标题：报告按 case 号取值，标题只作人读。
+const (
+	auditCaseTitle      = "审计可查（两段写 + 哈希链）"
+	failClosedCaseTitle = "fail-closed：证据不足时必须 deny"
+	diffCaseTitle       = "差异测试：摘掉 procurement 后 Plan 必须改变且不抛错"
+)
+
+// hostSideChecks 返回宿主侧三条用例：C4/C5 取决于有没有宿主地址，D1 永远 SKIP。
+//
+// 没有宿主地址时 C4/C5 记 SKIP 而不是「通过」：模块模式没有宿主侧端点，这两条本轮
+// 没有下过任何结论。
+func hostSideChecks(ctx context.Context, client *http.Client, host string) []Result {
+	host = strings.TrimSpace(host)
+	out := make([]Result, 0, 3)
+	if host == "" {
+		out = append(out,
+			Result{Case: "C4", Title: auditCaseTitle, Status: Skip,
+				Detail: "未给宿主地址（Options.HostTarget 为空）：模块模式没有宿主侧 GET /tenon/audit 可查，两段写与哈希链本轮未判定。"},
+			Result{Case: "C5", Title: failClosedCaseTitle, Status: Skip,
+				Detail: "未给宿主地址（Options.HostTarget 为空）：模块模式没有宿主侧 POST /tenon/policies:evaluate 可查，fail-closed 本轮未判定。"},
+		)
+	} else {
+		host = strings.TrimSuffix(host, "/")
+		out = append(out, checkAuditTrail(ctx, client, host), checkPolicyFailClosed(ctx, client, host))
 	}
+	out = append(out, Result{Case: "D1", Title: diffCaseTitle, Status: Skip,
+		Detail: "需要会推理的规划器（LLM）：未配置 LLM 时不能声称通过——规则式规划器会让 D1 变成假命题（摘掉模块后 Plan 必然不变）。"})
+	return out
+}
+
+// checkAuditTrail 是宿主模式下的 C4：两段写各写一条，再从 GET /tenon/audit 查回来验链。
+//
+// 判据（interfaces.md §4.3）：同一 auditId 的 stage=dispatched 与 stage=result 都在、
+// prevHash 串成链且链首为 null、hash 以 sha256: 开头。
+//
+// 前提：本轮运行期间没有别的写入者。两段之间若有别人插队，result 的 prevHash 会指向插队
+// 那条（链本身没断），本用例会把它当失败——并发写入下的链连续性校验是 M1 的事。
+func checkAuditTrail(ctx context.Context, client *http.Client, host string) Result {
+	res := Result{Case: "C4", Title: auditCaseTitle}
+	tag := strconv.FormatInt(time.Now().UnixNano(), 36)
+	auditID := "aud_conformance_" + tag
+	planID := "pln_conformance_" + tag
+
+	// inputHash / outputHash 用真实摘要而不是常量：审计记录若拿假值也能通过，用例就只
+	// 证明了「字段存在」，证明不了宿主原样保存了调用方的摘要。
+	//
+	// 两段的公共字段形状按 audit-event.schema.json：actor 的键是 type 不是 kind；
+	// decision（outcome/policyId/grantId/approvedBy）与 result（status/outputHash/
+	// errorClass）都是封闭对象，缺键与给 null 在哈希链里是不同的字节，所以这里写全。
+	args := []byte(`{"sku":"STD-1001","qty":2,"referenceNo":"CONF-1"}`)
+	output := []byte(`{"onHand":98}`)
+	common := fmt.Sprintf(`"auditId":%q,"planId":%q,"stepId":"s1","action":"inventory.DeductStock",`+
+		`"actor":{"type":"agent","id":"ag_conformance","onBehalfOf":"user:alice"},`+
+		`"decision":{"outcome":"auto","policyId":"pol.conformance.auto","grantId":null,"approvedBy":null},`+
+		`"inputHash":%q,"idempotencyKey":"tenon:%s/s1"`,
+		auditID, planID, hashScheme+sha256Hex(args), planID)
+	segments := []struct {
+		stage string
+		label string
+		extra string
+	}{
+		{stageDispatched, "第一段（stage=dispatched）", ""},
+		{stageResult, "第二段（stage=result）", fmt.Sprintf(
+			`,"result":{"status":"ok","outputHash":%q,"errorClass":null}`,
+			hashScheme+sha256Hex(output))},
+	}
+	for _, seg := range segments {
+		body := []byte(fmt.Sprintf(`{%s,"stage":%q%s}`, common, seg.stage, seg.extra))
+		raw, status, err := doJSON(ctx, client, http.MethodPost, host+"/tenon/audit", body, nil)
+		if err != nil {
+			res.Status = Fail
+			res.Detail = fmt.Sprintf("%s审计写入请求失败：%v —— 审计落不了盘时两段写不成立，写操作必须中止", seg.label, err)
+			return res
+		}
+		if status != http.StatusOK {
+			res.Status = Fail
+			res.Detail = fmt.Sprintf("%s审计写入返回 %d（期望 200）：%s", seg.label, status, clip(raw))
+			return res
+		}
+		res.Evidence = append(res.Evidence, fmt.Sprintf("%s写入 %d（auditId=%s）", seg.label, status, auditID))
+	}
+
+	// 查回来：按 planId 过滤，是 interfaces.md §4.3 给出的查询形态。
+	raw, status, err := doJSON(ctx, client, http.MethodGet,
+		host+"/tenon/audit?"+url.Values{"planId": {planID}}.Encode(), nil, nil)
+	if err != nil {
+		res.Status = Fail
+		res.Detail = "审计查询请求失败：" + err.Error()
+		return res
+	}
+	if status != http.StatusOK {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("GET /tenon/audit?planId=%s 返回 %d（期望 200）：%s", planID, status, clip(raw))
+		return res
+	}
+	var got AuditQueryResponse
+	if err := json.Unmarshal(raw, &got); err != nil {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("审计查询响应不是 {records,nextCursor}：%v（原文 %s）", err, clip(raw))
+		return res
+	}
+
+	idxDispatched, idxResult := -1, -1
+	for i, rec := range got.Records {
+		if rec.AuditID != auditID {
+			continue
+		}
+		switch rec.Stage {
+		case stageDispatched:
+			if idxDispatched < 0 {
+				idxDispatched = i
+			}
+		case stageResult:
+			if idxResult < 0 {
+				idxResult = i
+			}
+		}
+	}
+	if idxDispatched < 0 {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("审计查询缺第一段：GET /tenon/audit?planId=%s 的 %d 条记录里没有 auditId=%s 且 stage=dispatched 的那条",
+			planID, len(got.Records), auditID)
+		return res
+	}
+	if idxResult < 0 {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("审计查询缺第二段：GET /tenon/audit?planId=%s 里只有 stage=dispatched，没有 auditId=%s 且 stage=result 的那条 —— 两段写只做了一段",
+			planID, auditID)
+		return res
+	}
+	if idxResult < idxDispatched {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("两段顺序颠倒：stage=result 在第 %d 条、stage=dispatched 在第 %d 条 —— dispatched 必须是先落盘的那条",
+			idxResult+1, idxDispatched+1)
+		return res
+	}
+	dispatched, result := got.Records[idxDispatched], got.Records[idxResult]
+	if !strings.HasPrefix(dispatched.Hash, hashScheme) || !strings.HasPrefix(result.Hash, hashScheme) {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("hash 未按 %s 前缀编码：dispatched=%q result=%q（common.schema.json#/$defs/Sha256Hash）",
+			hashScheme, dispatched.Hash, result.Hash)
+		return res
+	}
+	if result.PrevHash == nil || *result.PrevHash != dispatched.Hash {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("prevHash 未接上第一段：result.prevHash=%s，dispatched.hash=%s —— 链断在两段之间，审计无法自证未被改动",
+			describeHash(result.PrevHash), dispatched.Hash)
+		return res
+	}
+
+	// 链首：interfaces.md §4.3 要求链首 prevHash 为 null。取全链第一条（limit=1）来断言，
+	// 这样宿主上已有历史记录时也能判定「链的起点是 null」，而不是要求本次写入恰好在最前。
+	headRaw, headStatus, headErr := doJSON(ctx, client, http.MethodGet, host+"/tenon/audit?limit=1", nil, nil)
+	if headErr != nil {
+		res.Status = Fail
+		res.Detail = "读取审计链首失败：" + headErr.Error()
+		return res
+	}
+	var head AuditQueryResponse
+	if headStatus != http.StatusOK || json.Unmarshal(headRaw, &head) != nil || len(head.Records) == 0 {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("读取审计链首失败：GET /tenon/audit?limit=1 返回 %d、记录数 %d（原文 %s）",
+			headStatus, len(head.Records), clip(headRaw))
+		return res
+	}
+	headRec := head.Records[0]
+	if headRec.PrevHash != nil {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("链首 prevHash 不是 null（auditId=%s 的 prevHash=%s）：审计链的起点必须为空，否则第一条记录在引用一条不存在的记录",
+			headRec.AuditID, describeHash(headRec.PrevHash))
+		return res
+	}
+	// 中段的 prevHash 为 null 等价于「链在这里断成两条」：只有链首可以是 null。
+	if dispatched.PrevHash == nil && headRec.AuditID != dispatched.AuditID {
+		res.Status = Fail
+		res.Detail = fmt.Sprintf("中段的 prevHash 为 null（auditId=%s 不是链首，链首是 %s）：审计链断成两条互不相干的链",
+			dispatched.AuditID, headRec.AuditID)
+		return res
+	}
+
+	res.Evidence = append(res.Evidence,
+		fmt.Sprintf("GET /tenon/audit?planId=%s → %d，命中 2 条（该查询共 %d 条）", planID, status, len(got.Records)),
+		fmt.Sprintf("两段齐备：dispatched 在第 %d 条、result 在第 %d 条（写入顺序）", idxDispatched+1, idxResult+1),
+		fmt.Sprintf("hash 前缀 %s：dispatched=%s result=%s", hashScheme, shortenHash(dispatched.Hash), shortenHash(result.Hash)),
+		fmt.Sprintf("prevHash：result.prevHash == dispatched.hash（%s）", shortenHash(dispatched.Hash)),
+		fmt.Sprintf("链首（写入顺序第 1 条）prevHash=null：auditId=%s", headRec.AuditID),
+	)
+	if dispatched.PrevHash == nil {
+		res.Evidence = append(res.Evidence, "本次两段是全链最先两条（dispatched.prevHash=null）")
+	} else {
+		res.Evidence = append(res.Evidence, fmt.Sprintf("本次两段接在历史之后：dispatched.prevHash=%s（宿主审计日志非空）",
+			shortenHash(*dispatched.PrevHash)))
+	}
+	res.Status = Pass
+	return res
+}
+
+// checkPolicyFailClosed 是宿主模式下的 C5：证据不足时必须 deny，不能因为「没有规则/不认识
+// 这个动作」就放行（interfaces.md §4.2：无命中 = deny；semantics.md §12：不可用默认 deny）。
+//
+// 四个探针的共同点是宿主**不可能**有正当理由放行：
+//
+//	① 空 plan（零步计划）：没有可执行的步骤，放行等于给「什么都不做」发通行证；
+//	② 合法 ActionId 但没有任何规则命中：配置缺口不等于可以执行；
+//	③ 未知动作（连 ActionId 词法都不成立）：请求本身不成立时也必须落在拒绝上；
+//	④ 语法成立但没有模块声明它的动作：宿主不认识的动作不得被当成可执行。
+//
+// 断言锁 outcome=deny；①② 额外要求 reasons 里出现 NO_POLICY_MATCH_DEFAULT_DENY（「无命中
+// 默认拒绝」的显式证据）。③④ 只锁 outcome：一个会先查注册表的宿主完全可以用别的理由码拒绝，
+// 那是更强的实现，不该被判失败。
+func checkPolicyFailClosed(ctx context.Context, client *http.Client, host string) Result {
+	res := Result{Case: "C5", Title: failClosedCaseTitle}
+	probes := []struct {
+		label      string
+		plan       string
+		mustReason string
+	}{
+		{"① 空 plan（零步）", `{"plan":{}}`, reasonNoMatch},
+		{"② 合法 action 但无规则命中",
+			`{"plan":{"planId":"pln_conformance_nomatch","steps":[{"stepId":"s1","action":"tenonconformance.ProbeNoRuleMatch","args":{}}]}}`,
+			reasonNoMatch},
+		{"③ 未知动作（不满足 ActionId 词法）",
+			`{"plan":{"planId":"pln_conformance_unknown","steps":[{"stepId":"s1","action":"UnknownAction","args":{}}]}}`,
+			""},
+		{"④ 未登记模块的动作",
+			`{"plan":{"planId":"pln_conformance_ghost","steps":[{"stepId":"s1","action":"ghostmod.GhostAction","args":{}}]}}`,
+			""},
+	}
+	withReason := make([]string, 0, len(probes))
+	for _, p := range probes {
+		raw, status, err := doJSON(ctx, client, http.MethodPost, host+"/tenon/policies:evaluate", []byte(p.plan), nil)
+		if err != nil {
+			res.Status = Fail
+			res.Detail = fmt.Sprintf("探针 %s 的 policies:evaluate 请求失败：%v —— 策略评估不可达时必须由调用方 fail-closed，本用例却无法确认宿主的判定", p.label, err)
+			return res
+		}
+		if status != http.StatusOK {
+			res.Status = Fail
+			res.Detail = fmt.Sprintf("探针 %s 返回 %d（期望 200 + outcome=deny）：%s", p.label, status, clip(raw))
+			return res
+		}
+		var ev PolicyEvaluationView
+		if err := json.Unmarshal(raw, &ev); err != nil {
+			res.Status = Fail
+			res.Detail = fmt.Sprintf("探针 %s 的响应不是 PolicyEvaluationResponse：%v（原文 %s）", p.label, err, clip(raw))
+			return res
+		}
+		if ev.Outcome != outcomeDeny {
+			res.Status = Fail
+			res.Detail = fmt.Sprintf("探针 %s 得到 outcome=%q（decidedBy=%v），期望 deny —— 宿主在证据不足时放行了写操作，这是 fail-open",
+				p.label, ev.Outcome, ev.DecidedBy)
+			return res
+		}
+		res.Evidence = append(res.Evidence, fmt.Sprintf("%s → 200 outcome=deny decidedBy=%v reasons=%v",
+			p.label, ev.DecidedBy, ev.Reasons))
+		// 「无命中默认拒绝」出现与否要按实际响应统计，而不是按探针的期望统计：
+		// 汇总数字若只数期望值，证据就会自说自话。
+		if hasString(ev.Reasons, reasonNoMatch) {
+			withReason = append(withReason, p.label)
+		}
+		if p.mustReason != "" {
+			if !hasString(ev.Reasons, p.mustReason) {
+				res.Status = Fail
+				res.Detail = fmt.Sprintf("探针 %s 判 deny 但 reasons 里没有 %s（实际 %v）：拒绝理由分不清「策略本意拒绝」与「无命中默认拒绝」，运维看不出这是配置缺口",
+					p.label, p.mustReason, ev.Reasons)
+				return res
+			}
+		}
+	}
+	res.Evidence = append(res.Evidence, fmt.Sprintf("%d 个探针全部 outcome=deny；%s 出现在 %d 个探针的 reasons 里（%s）",
+		len(probes), reasonNoMatch, len(withReason), strings.Join(withReason, "、")))
+	res.Status = Pass
+	return res
+}
+
+// describeHash 把可空的 hash 打成日志里能读的形式（null 与空串要能区分）。
+func describeHash(h *string) string {
+	if h == nil {
+		return "null"
+	}
+	return *h
+}
+
+// shortenHash 只截掉长摘要的中段，保留前缀与头部字符，便于证据里对齐比较。
+func shortenHash(h string) string {
+	if len(h) <= len(hashScheme)+8 {
+		return h
+	}
+	return h[:len(hashScheme)+8] + "…"
+}
+
+// sha256Hex 返回 b 的 SHA-256 十六进制摘要（不带前缀）。
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// hasString 判断列表里有没有某个值（探针的理由码检查用，元素量级只有个位数）。
+func hasString(list []string, want string) bool {
+	for _, item := range list {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 // --- 传输辅助 ---

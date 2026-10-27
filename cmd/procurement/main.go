@@ -49,12 +49,13 @@ const (
 func main() {
 	store := &store{byReference: make(map[string]string)}
 	mod := &module.Module{
-		ID:      moduleID,
-		Title:   moduleTitle,
-		Version: moduleVersion,
-		Actions: []module.Action{createPurchaseRequestAction()},
-		Events:  []string{"purchase.requested"},
-		Handle:  store.handle,
+		ID:       moduleID,
+		Title:    moduleTitle,
+		Version:  moduleVersion,
+		TestMode: os.Getenv("TENON_TEST_MODE") == "1", // D1 的 A/B 两轮要靠 /tenon/admin/reset 造同输入
+		Actions:  []module.Action{createPurchaseRequestAction()},
+		Events:   []string{"purchase.requested"},
+		Handle:   store.handle,
 		// DryRun 刻意留空：C8 要的是「模块没实现预演」这个真实状态，
 		// 而不是实现了却报告 unsupported。
 		DryRun: nil,

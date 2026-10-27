@@ -215,6 +215,8 @@ verified < pending < unsupported < unsafe
 
 宿主侧四个端点（控制平面实现，模块不必实现）：`GET /tenon/audit?planId=&since=`、`POST /tenon/grants:evaluate`、`POST /tenon/policies:evaluate`、`WS /tenon/intents`（REST 降级为 `GET /tenon/intents/poll` + `POST /tenon/intents/ack`）。
 
+> **实现侧现状（不是 0.1 的规范内容）**：`cmd/host` 到 0.2.0 提案为止实际有 **13 个协议端点 + 2 个探针 + 静态页**——除上面四个之外还实现了 `POST /tenon/audit`、`GET /tenon/modules`、模块发件箱方向，以及 M1 切片 1 的入站面六个（`POST /tenon/session`、`POST /tenon/requests`、`GET /tenon/requests/poll`、`POST /tenon/requests/ack`、`POST /tenon/pending`、`GET /tenon/pending`）；`policies:evaluate` 还多收一个 `triggerEventId`。清单见 [`docs/interfaces.md`](../../docs/interfaces.md) §4，提案正文见 [`CHANGELOG.md`](CHANGELOG.md) 的 0.2.0 段。上面那句「四个端点」请按 0.1 的历史文本读，不要当成当前端点数。
+
 **Webhook 签名**（§4.6）：`HMAC-SHA256(secret, timestamp + "." + rawBody)`，头 `X-Tenon-Signature: t=<unix>,v1=<hex>`，**时钟容差 ±300s**，超时即拒（防重放）。签名验证必须基于原始字节，不能基于反序列化后再序列化的结果。
 
 **MCP 映射**（§4.10 D7）：以 MCP server 暴露时 tool 名固定为 `tenon_<module>_<action>`（下划线），避免点号在部分客户端被截断。

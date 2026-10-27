@@ -61,9 +61,10 @@ func main() {
 		log.Fatalf("inventory: 初始库存不可用：%v", err)
 	}
 	mod := &module.Module{
-		ID:      moduleID,
-		Title:   moduleTitle,
-		Version: moduleVersion,
+		ID:       moduleID,
+		Title:    moduleTitle,
+		Version:  moduleVersion,
+		TestMode: os.Getenv("TENON_TEST_MODE") == "1", // D1 的 A/B 两轮要靠 /tenon/admin/reset 造同输入
 		Actions: []module.Action{
 			getStockAction(),
 			deductStockAction(),

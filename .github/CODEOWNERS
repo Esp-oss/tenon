@@ -1,0 +1,11 @@
+# CODEOWNERS：给「规则文件」装一道 review 闸门。
+#
+# 为什么有 skills/ 这一行：skills/*/approval.json 是业务级审批规则（spec §3.8、§3.10），
+# 它决定「什么动作要人批、谁批、阈值多少」。规则放进文档目录，就等于「改文档即改权限」——
+# 一次不经 review 的 skills 改动就能把审批门槛降成 auto。因此 skills/ 下的任何改动
+# 都必须经审批者 review 才能合入。
+#
+# 占位说明：@tenon-maintainers 是**占位 Handle**，接入方需替换为实际审批者
+# （GitHub 用户名或 team，如 @your-org/tenon-approvers）。GitHub 对不存在的
+# handle 只会忽略这一行、不会报错，所以「替换」这一步是生效前提，别当成已完成。
+/skills/ @tenon-maintainers
