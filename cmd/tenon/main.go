@@ -77,6 +77,7 @@ func runConformance(args []string) (int, error) {
 	}
 	fs := flag.NewFlagSet("conformance run", flag.ContinueOnError)
 	target := fs.String("target", "", "被测模块基地址，例如 http://localhost:8081")
+	host := fs.String("host", "", "宿主基地址；提供时 C4/C5 可判定，否则保持 SKIP")
 	module := fs.String("module", "", "模块 id（用于挑选 fixtures）")
 	fixturesPath := fs.String("fixtures", "", "场景数据 JSON 路径（可选）")
 	sourceDir := fs.String("source-dir", "", "C10 扫描根目录（可选，通常传仓库根）")
@@ -112,11 +113,12 @@ func runConformance(args []string) (int, error) {
 	defer cancel()
 
 	rep := conformance.Run(ctx, conformance.Options{
-		Target:   *target,
-		Spec:     set,
-		LintRoot: *sourceDir,
-		Fixtures: fixtures,
-		ModuleID: *module,
+		Target:     *target,
+		HostTarget: *host,
+		Spec:       set,
+		LintRoot:   *sourceDir,
+		Fixtures:   fixtures,
+		ModuleID:   *module,
 	})
 
 	printReport(rep)
