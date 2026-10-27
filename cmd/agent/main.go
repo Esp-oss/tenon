@@ -20,6 +20,7 @@
 //	TENON_ONCE            真值时只跑一轮就退出（D1 差异测试用它取「一轮」的语义）
 //	TENON_CURSOR_FILE     事件游标持久化文件；缺省只在内存里（重启即从头读，安全）
 //	TENON_SPEC_DIR        schema 目录，缺省 spec/0.1/schemas
+//	TENON_RESULT_FILE     每回合追加一行 JSON 的运行结果（供 D1 取 A/B 两轮的动作序列）
 //
 // 模型配置由 internal/llm 读取（TENON_LLM_BASE_URL / TENON_LLM_API_KEY[_FILE] /
 // TENON_LLM_MODEL / TENON_LLM_TIMEOUT）。
@@ -27,6 +28,13 @@
 // **缺 LLM key 必须启动即失败**（设计 §5）：没有模型就不可能规划，静默降级只会让
 // agent 在没有模型的情况下假装「已规划」——那是最坏的失败方式。同理，schema 读不到
 // 也不允许启动：没有 plan.schema.json 就没有判据，模型输出什么都会被当成可用。
+//
+// 关于 TENON_RESULT_FILE：它是**运维产物，不是协议端点**。一行一个回合，字段是
+// {at, correlationId, outcome, planId, actions, detail}。其中 actions 是**规划出来的**
+// 动作序列（按计划声明顺序），而不是「执行过的」——D1 判的正是规划层的差异：A 轮
+// 常在预演闸门就 fail-closed 转人工，真正执行的动作是 0 个，只有计划里才看得见
+// 「它原本打算调什么」。写失败只记日志、不改结局：一份观测文件的可用性不该决定
+// 一笔业务的处置（与 Intent 帧同一条原则）。
 //
 // 关于 TENON_ON_BEHALF_OF 为什么必填：每一条写审计的 actor.onBehalfOf 都取自它，
 // 而授权评估的权限是「agent 被授予 ∩ 委托人权限」。给它编一个默认身份，等于让审计
@@ -45,6 +53,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -63,6 +72,7 @@ const (
 	envOnce         = "TENON_ONCE"
 	envCursorFile   = "TENON_CURSOR_FILE"
 	envSpecDir      = "TENON_SPEC_DIR"
+	envResultFile   = "TENON_RESULT_FILE"
 
 	// defaultHost 是 interfaces.md §1 给宿主的端口。
 	defaultHost = "http://127.0.0.1:8080"
@@ -78,6 +88,9 @@ const (
 	pollTimeout = 30 * time.Second
 	// maxBodyBytes 是响应体上限（事件页与注册表都是 KB 量级）。
 	maxBodyBytes = 1 << 20
+	// maxObservedPlans 是每回合最多留存的规划原始输出份数（一次规划最多 2 次尝试，
+	// 一个回合最多 3 轮：8 份足够找到「被接受的那份」，且不会无界增长）。
+	maxObservedPlans = 8
 )
 
 // 规范词法（common.schema.json#/$defs/Actor）：启动时就把不合法的身份拦下来，
@@ -105,6 +118,7 @@ type config struct {
 	once         bool
 	cursorFile   string
 	specDir      string
+	resultFile   string
 	llm          llm.Config
 }
 
@@ -123,6 +137,7 @@ func loadConfig() (config, error) {
 		pollInterval: defaultPollInterval,
 		cursorFile:   strings.TrimSpace(os.Getenv(envCursorFile)),
 		specDir:      firstNonEmpty(os.Getenv(envSpecDir), spec.DefaultDir),
+		resultFile:   strings.TrimSpace(os.Getenv(envResultFile)),
 		llm:          llmCfg,
 	}
 
@@ -227,11 +242,15 @@ func run(ctx context.Context) error {
 			"（skill 的 tenon.subscribes 决定是否思考）", cfg.skillDir)
 	}
 
+	// 规划器观测层：只是把模型返回的原始 Plan 记下来，供结果行报告「规划出来的
+	// 动作序列」（RunResult.ActionsTaken 只含执行过的动作，而闸门拦下时是 0 个）。
+	plans := newPlanObserver(llm.New(cfg.llm))
+
 	deps := agent.Deps{
 		Host:       cfg.host,
 		AgentID:    cfg.agentID,
 		OnBehalfOf: cfg.onBehalfOf,
-		Planner:    &agent.Planner{LLM: llm.New(cfg.llm), Spec: specSet},
+		Planner:    &agent.Planner{LLM: plans, Spec: specSet},
 		HTTP:       &http.Client{Timeout: pollTimeout},
 		Skills:     skills,
 	}
@@ -240,9 +259,12 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	p := &poller{cfg: cfg, deps: deps, client: deps.HTTP, cursors: cursors}
+	p := &poller{cfg: cfg, deps: deps, client: deps.HTTP, cursors: cursors, plans: plans}
 	log.Printf("agent: host=%s agent=%s onBehalfOf=%s skill=%d 模型=%s 轮询间隔=%s once=%v",
 		cfg.host, cfg.agentID, cfg.onBehalfOf, skills.Len(), cfg.llm.Model, cfg.pollInterval, cfg.once)
+	if cfg.resultFile != "" {
+		log.Printf("agent: 每回合向 %s 追加一行结果（供 D1 取 A/B 两轮的动作序列）", cfg.resultFile)
+	}
 
 	for {
 		rounds, pollErr := p.pollOnce(ctx)
@@ -268,6 +290,152 @@ func run(ctx context.Context) error {
 	}
 }
 
+// ---------- 结果行 ----------
+
+// resultLine 是结果文件的一行：一回合一条。
+//
+// 它是**运维产物**，不是协议端点——协议面只有 interfaces.md 里那几个端点，
+// 这里不做版本协商、不发事件、不参与任何闸门判定。字段是 D1 需要的最小集合：
+// 结局、计划标识、规划出来的动作序列，以及能串回审计的业务链标识。
+type resultLine struct {
+	At            string   `json:"at"`
+	CorrelationID string   `json:"correlationId"`
+	Outcome       string   `json:"outcome"`
+	PlanID        string   `json:"planId"`
+	Actions       []string `json:"actions"`
+	Detail        string   `json:"detail"`
+}
+
+// writeResult 把一个回合的结局追加成一行 JSON（未配结果文件时什么都不做）。
+//
+// 写失败只记日志、不改结局：审计与 Intent 帧已经承载了业务结论，一份观测文件的
+// 可用性不该决定一笔业务的处置。代价是 D1 会因等不到结果行而失败——那条理由里
+// 会带上路径与最后一次观测，排查方向仍然清楚。
+func (p *poller) writeResult(event agent.DomainEvent, res agent.RunResult) {
+	if p.cfg.resultFile == "" {
+		return
+	}
+	actions := p.plans.actionsFor(res.PlanID)
+	line := resultLine{
+		At:            time.Now().UTC().Format(time.RFC3339Nano),
+		CorrelationID: strings.TrimSpace(event.CorrelationID),
+		Outcome:       string(res.Outcome),
+		PlanID:        res.PlanID,
+		Actions:       actions,
+		Detail:        res.Detail,
+	}
+	if err := appendResultLine(p.cfg.resultFile, line); err != nil {
+		log.Printf("agent: 写结果行失败（不改结局；D1 会因等不到结果行而失败）：%v", err)
+	}
+}
+
+// appendResultLine 追加一行。用 O_APPEND 打开：多回合之间只加不改，
+// 也不会把别的进程写的行覆盖掉。
+func appendResultLine(path string, line resultLine) error {
+	if line.Actions == nil {
+		// 空序列要序列化成 [] 而不是 null：D1 按数组读，null 会让判据变成「没有观测」。
+		line.Actions = []string{}
+	}
+	raw, err := json.Marshal(line)
+	if err != nil {
+		return fmt.Errorf("结果行编组失败：%w", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("打开结果文件 %q 失败：%w", path, err)
+	}
+	// 一次 Write 写完整行：读侧不会读到半行（换行是行分隔符，不是格式细节）。
+	if _, err := f.Write(append(raw, '\n')); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("写结果文件 %q 失败：%w", path, err)
+	}
+	return f.Close()
+}
+
+// planObserver 包在模型客户端外面，只做一件事：把模型返回的原始 Plan 记下来。
+//
+// 为什么需要这一层：RunResult.ActionsTaken 只含**真正执行过**的动作，而 D1 判的是
+// 规划层——A 轮在预演闸门（procurement 没有 :dry-run，404 即 fail-closed）就转人工，
+// 一个动作都没执行，ActionsTaken 必然是空；B 轮也可能根本不派发。只有模型返回的
+// Plan 里才有「A/B 两轮的规划差异」。
+//
+// 这不改 internal/agent 一行代码：Planner.LLM 是 agent.LLMClient 接口，本就是给
+// 外部注入客户端的缝（设计 §6 用它注入假 LLM），这里注入的是一个纯透传包装。
+type planObserver struct {
+	inner agent.LLMClient
+
+	mu   sync.Mutex
+	raws [][]byte
+}
+
+func newPlanObserver(inner agent.LLMClient) *planObserver {
+	return &planObserver{inner: inner}
+}
+
+// ChatJSON 透传模型调用，顺带留存返回的原始字节。
+func (o *planObserver) ChatJSON(ctx context.Context, system, user string) ([]byte, error) {
+	raw, err := o.inner.ChatJSON(ctx, system, user)
+	if err != nil {
+		return nil, err
+	}
+	o.mu.Lock()
+	if len(o.raws) >= maxObservedPlans {
+		o.raws = o.raws[len(o.raws)-maxObservedPlans+1:]
+	}
+	o.raws = append(o.raws, append([]byte(nil), raw...))
+	o.mu.Unlock()
+	return raw, nil
+}
+
+// beginRound 清掉上一回合的观测。每回合只用本回合的计划，避免跨回合串味。
+func (o *planObserver) beginRound() {
+	o.mu.Lock()
+	o.raws = o.raws[:0]
+	o.mu.Unlock()
+}
+
+// actionsFor 取「被接受的那份计划」的动作序列。
+//
+// 先按 planId 精确匹配（一次回合里的重规划会留下多份计划，结局说的是最终那份）；
+// 匹配不上（例如模型给的 Plan 没通过 schema，Run 的 planId 来自别处）就退化成
+// 最近一份能解出 steps 的原始输出——这时它只是尽力而为的观测，不是判据。
+func (o *planObserver) actionsFor(planID string) []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	var fallback []string
+	for i := len(o.raws) - 1; i >= 0; i-- {
+		var plan struct {
+			PlanID string `json:"planId"`
+			Steps  []struct {
+				Action string `json:"action"`
+			} `json:"steps"`
+		}
+		if err := json.Unmarshal(o.raws[i], &plan); err != nil {
+			continue
+		}
+		actions := make([]string, 0, len(plan.Steps))
+		for _, step := range plan.Steps {
+			if action := strings.TrimSpace(step.Action); action != "" {
+				actions = append(actions, action)
+			}
+		}
+		if len(actions) == 0 {
+			continue
+		}
+		if planID != "" && plan.PlanID == planID {
+			return actions
+		}
+		if fallback == nil {
+			fallback = actions
+		}
+	}
+	if fallback == nil {
+		return []string{}
+	}
+	return fallback
+}
+
 // ---------- 轮询 ----------
 
 // moduleEntry 是 GET /tenon/modules 的一行（管理面视图，含 enabled=false）。
@@ -283,6 +451,7 @@ type poller struct {
 	deps    agent.Deps
 	client  *http.Client
 	cursors *cursorStore
+	plans   *planObserver
 }
 
 // pollOnce 跑一轮：注册表 → 每个 enabled 模块的发件箱 → 命中 skill 的事件开回合。
@@ -307,10 +476,13 @@ func (p *poller) pollOnce(ctx context.Context) (int, error) {
 				log.Printf("agent: 事件 %s（%s）没有 skill 订阅，跳过", event.EventID, event.Type)
 				continue
 			}
+			// 每回合清掉上一回合的规划观测：结果行只能报告本回合的计划。
+			p.plans.beginRound()
 			res := agent.Run(ctx, p.deps, agent.RunInput{Event: event})
 			rounds++
 			log.Printf("agent: 事件 %s（%s）→ 结局 %s planId=%s 动作=%v 说明=%s",
 				event.EventID, event.Type, res.Outcome, res.PlanID, res.ActionsTaken, res.Detail)
+			p.writeResult(event, res)
 		}
 		// 游标在整页处理完之后才前进，并且**逐模块落盘**：后面某个模块读失败时，
 		// 前面已经处理过的模块不会因此重放（重放会产出新 planId → 新幂等键 →
