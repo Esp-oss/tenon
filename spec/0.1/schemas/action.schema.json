@@ -21,6 +21,11 @@
       "minLength": 1,
       "maxLength": 120
     },
+    "summaryTemplate": {
+      "description": "人话模板：占位符 {argName} 只从该动作的 args 取值，不做跨 step、不做计算。占位符名须匹配 ^[A-Za-z_][A-Za-z0-9_]*$ 且应出现在 inputSchema.properties 里（约定，不在加载期强校验）。渲染是 agent 的职责：审批卡上的白话由它生成。",
+      "type": "string",
+      "maxLength": 200
+    },
     "kind": {
       "description": "读写分类，必填。read 无副作用，不得声明 idempotency；write 有副作用，必须声明 idempotency。C1 用例按此分支断言。",
       "type": "string",
