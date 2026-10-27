@@ -281,6 +281,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveStatic(w, r)
 		return
 	}
+	// 测试模式下入站通道整条不挂（404，不是 401/405）。
+	//
+	// 理由是 D1 的「同一输入 → 同一行为」：入站承载「人说过的话」，是**外部输入**，
+	// 它的存在与否会改变 agent 的结局。留给它一条后门，就等于承认 D1 的输入集合不可控。
+	//
+	// 注意 /tenon/session 不在此列：agent 启动要登录，关掉它 agent 根本起不来；
+	// 而它只发 token，不携带任何业务输入，不影响 D1 的可重复性。
+	if s.testMode && isInboundPath(r.URL.Path) {
+		writeTenonErrorStatus(w, http.StatusNotFound, unknownEndpoint(r.URL.Path))
+		return
+	}
 	switch r.URL.Path {
 	case "/healthz":
 		s.serveHealth(w, r)
