@@ -14,6 +14,17 @@
 
 ## 0. 前置说明（执行前必读）
 
+### 0.1 Task 1 复核后追加的执行期约束（比正文更权威）
+
+1. **测试夹具一律注入固定时间，不许用 `time.Now()`**。`samplePending().ExpiresAt = 2026-10-27T09:30:03Z` 是个会到期的常量：任何断言"保留/补标记"的用例若传 `time.Now()`，越过该时刻后就会自己变红。Task 3 的 `TestSelfCheck*` 必须传 `time.Parse(time.RFC3339, "2026-10-27T09:20:00Z")`。
+2. **`Archive` 不幂等**：pending 不在盘时返回 `agent: 归档时找不到 <id>`。Task 8 的恢复路径要允许"已被别人归档"，把该错误当已归档处理并记日志。
+3. **`Archive` 两步（写归档件 → 删 pending 件）之间失败会留双份**：`List()` 仍会返回那份 `awaiting_approval` 的 pending。恢复路径必须容忍"pending 与 archived 同名共存"——进 resume 前先查 archived，若已 `done` 直接按幂等返回。
+4. **`StateStore.List()` 静默跳过坏 JSON**：损坏的 pending 文件对 `List()`/`selfCheck` 都不可见。Task 3 必须补一个 `CountCorrupt()` 并在自检里报数（只告警、不中断）。
+5. **`Save` 是整文件替换、无锁**：串行化只能落在单线程 tick（Task 10），不要指望 store。
+6. **`NewStateStore("")` 报错**：`Deps.State == nil` 才表示"没有挂起通道"；装配时不要把空串传进去。
+7. **夹具必须填 `ExpiresAt`**：`Expired()` 对解析失败 fail-closed 返回 true，漏填的夹具会被立刻判过期。
+
+
 **已完成的前置**：P1 全量落地（host 入站面 + `origin` + 业务规则 + `role:agent`），commit `74182cd`。本次改动**只碰 `internal/agent/`、`cmd/agent/`、`internal/controlplane/`（仅 Task 11）与文档**。
 
 **已存在的类型（别重复定义，先读再写）**：
@@ -614,6 +625,7 @@ git commit -m "feat(agent): requestId 去重账本（write-ahead，claimed 落�
 
 **Files:**
 - Create: `internal/agent/suspend.go`
+- Modify: `internal/agent/state.go`（只加 `CountCorrupt` 与改准一句注释）
 - Test: `internal/agent/suspend_test.go`
 
 - [ ] **Step 1: 写失败测试**
@@ -695,12 +707,13 @@ func TestSuspendFailsClosedWhenAuditFails(t *testing.T) {
 // 崩溃分流：pending 在、审计链查不到 → 归档 stale，绝不执行。
 func TestSelfCheckArchivesStaleWhenAuditMissing(t *testing.T) {
 	store, p, _ := newSuspendFixture(t, "http://127.0.0.1:1")
-	// 造一份「标记未落」且审计不存在的 pending。
 	p.AuditSettled = false
 	if err := store.Save(p); err != nil {
 		t.Fatalf("保存失败：%v", err)
 	}
-	rep, err := selfCheck(context.Background(), store, auditProbeNotFound{})(time.Now().UTC())
+	// 固定时间：夹具的 ExpiresAt 是会到期的常量，用 time.Now() 会让用例过几小时自己变红。
+	fixedNow, _ := time.Parse(time.RFC3339, "2026-10-27T09:20:00Z")
+	rep, err := selfCheck(context.Background(), store, auditProbeNotFound{})(fixedNow)
 	if err != nil {
 		t.Fatalf("自检失败：%v", err)
 	}
@@ -719,7 +732,8 @@ func TestSelfCheckSettlesAuditWhenPresent(t *testing.T) {
 	if err := store.Save(p); err != nil {
 		t.Fatalf("保存失败：%v", err)
 	}
-	rep, err := selfCheck(context.Background(), store, auditProbeFound{})(time.Now().UTC())
+	fixedNow, _ := time.Parse(time.RFC3339, "2026-10-27T09:20:00Z")
+	rep, err := selfCheck(context.Background(), store, auditProbeFound{})(fixedNow)
 	if err != nil {
 		t.Fatalf("自检失败：%v", err)
 	}
@@ -729,6 +743,25 @@ func TestSelfCheckSettlesAuditWhenPresent(t *testing.T) {
 	got, ok, _ := store.Load(p.PlanID)
 	if !ok || !got.AuditSettled {
 		t.Fatalf("标记未补上：%+v ok=%v", got, ok)
+	}
+}
+
+// 坏文件必须被看见：List() 会跳过它，自检要单独把它数出来（只告警）。
+func TestSelfCheckCountsCorruptFiles(t *testing.T) {
+	store, p, _ := newSuspendFixture(t, "http://127.0.0.1:1")
+	if err := store.Save(p); err != nil {
+		t.Fatalf("保存失败：%v", err)
+	}
+	if err := os.WriteFile(filepath.Join(store.Dir(), "pending", "pln_broken.json"), []byte("{半截"), 0o600); err != nil {
+		t.Fatalf("写坏文件失败：%v", err)
+	}
+	fixedNow, _ := time.Parse(time.RFC3339, "2026-10-27T09:20:00Z")
+	rep, err := selfCheck(context.Background(), store, auditProbeFound{})(fixedNow)
+	if err != nil {
+		t.Fatalf("自检失败：%v", err)
+	}
+	if rep.Corrupt != 1 {
+		t.Fatalf("应报 1 个坏文件，得到 %+v", rep)
 	}
 }
 ```
@@ -841,12 +874,18 @@ type selfCheckReport struct {
 	Expired int // 归档 expired
 	Stale   int // 归档 stale（审计缺失）
 	Settled int // 补上 auditSettled 标记
+	Corrupt int // 无法解析的 pending 文件数（List 会跳过它们）
 }
 
 // selfCheck 按 I7 的表给每份 pending 分流。返回一个以「now」为参数的函数，便于测试注入时间。
 func selfCheck(ctx context.Context, store *StateStore, probe auditProbe) func(time.Time) (selfCheckReport, error) {
 	return func(now time.Time) (selfCheckReport, error) {
 		var rep selfCheckReport
+		corrupt, cerr := store.CountCorrupt()
+		if cerr != nil {
+			return rep, cerr
+		}
+		rep.Corrupt = corrupt
 		items, err := store.List()
 		if err != nil {
 			return rep, err
@@ -884,6 +923,36 @@ func selfCheck(ctx context.Context, store *StateStore, probe auditProbe) func(ti
 	}
 }
 ```
+
+`CountCorrupt` 补进 `state.go`（Task 3 允许改这个文件，只加这一个方法与一句注释）：
+
+```go
+// CountCorrupt 数一遍 pending/ 下解析不了的文件。
+//
+// 必须有这个出口：List() 刻意跳过坏文件（不让一个坏件拖垮整个列表），
+// 但「被跳过」不等于「不存在」——不数出来它就会永远躺在盘上、永不清理、也永不告警。
+func (s *StateStore) CountCorrupt() (int, error) {
+	entries, err := os.ReadDir(filepath.Join(s.dir, "pending"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	bad := 0
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		if _, ok, err := readPending(filepath.Join(s.dir, "pending", e.Name())); err != nil || !ok {
+			bad++
+		}
+	}
+	return bad, nil
+}
+```
+
+同时把 `state.go` 里 `listPendingDir` 的那句注释改准——它现在写着「坏文件不让整个列表失败；自检会另外报它」，而自检的报数正是本任务补的 `CountCorrupt`。
 
 `postJSONWith` 是抽出来的最小化 POST 助手（`run.go` 里现有的 `postJSON` 是 `runner` 的方法，不能复用）：
 
