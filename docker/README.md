@@ -122,11 +122,13 @@ docker build -f docker/go-service.Dockerfile --target build --build-arg ENTRY=./
 | `docker compose run --rm go` | ✅ gofmt / vet / build 全 ok | M0 轮 |
 | `node-service --target build` | ❌ 预期失败：`ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT` | M0 轮 |
 | 模块 `TENON_TEST_MODE=1` 挂 `admin/reset` | ✅ 设 `1` → 200 `{"reset":true}`；设 `0` → 404 | 本轮（本机进程，非容器） |
-| `go-service` **完整镜像**（运行时阶段） | ❌ 未验：`alpine:3.20` 本机拉不到 | — |
-| `compose.m0.yaml` 端到端 `up` | ❌ 未验 | — |
-| 命名卷对 uid 10001 的可写性 | ❌ 未验 | — |
+| 对话入口四服务（`inventory`/`procurement`/`host`/`agent`）端到端 | ✅ 跑通：投一句话 → 挂起 → bob 批准 → 库存 120→108 → 归档 `done`；审计 step 级 `approvedBy=user:bob`、哈希链连续 | 2026-10-27，`compose.yaml` + `--profile smoke` |
+| `compose.m0.yaml` 端到端 `up`（M0.5 拓扑） | ❌ 未验 | — |
+| 命名卷对 uid 10001 的可写性 | ❌ 未验（对话入口冒烟用宿主目录而非命名卷） | — |
 | 模块 ↔ 宿主 HMAC 实际握手 | ❌ 未验：M0.5 走的是发件箱轮询，这个方向没有调用方 | — |
+
+> 对话入口那次冒烟用的是 `tools/llmstub`（stub 规划器），它证明的是**编排与落盘链路**，不是模型能力；D1 判定必须用真模型（见根 README 的「D1 判定结果」一节，结论仍是未判定）。
 
 补充一条不属于容器、但决定本层判据的实测：真宿主（`cmd/host`）+ 真模块（`cmd/inventory`）在**本机进程**上跑了宿主模式一致性，C4/C5 判 PASS、pass 8 / fail 0 / skip 1（D1），exit 0。证据与复现命令在 [`docs/interfaces.md`](../docs/interfaces.md) §11——它证明的是**协议能用**，不是**容器能起**。
 
-**未验证的部分不许当成已实现来宣称。** 本层剩下的工作量是：完整镜像（运行时基础镜像 + 卷权限）、端到端 `up`、以及 D1 的执行器。
+**未验证的部分不许当成已实现来宣称。** 本层剩下的工作量是：完整镜像（运行时基础镜像 + 卷权限）、端到端 `up`。D1 的执行器已有（`internal/d1` + `scripts/d1-e2e.ps1`），缺的是让规划器产出合法计划的入参契约（见根 README）。

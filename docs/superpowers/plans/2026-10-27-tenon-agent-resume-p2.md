@@ -2599,7 +2599,7 @@ git commit -m "feat(agent): tick 四段顺序（入站/自检/公告板/事件�
 - Modify: `internal/controlplane/http.go`
 - Test: `internal/controlplane/http_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // D1 的「同一输入同一行为」要求入站通道在测试模式下不存在：
@@ -2624,12 +2624,12 @@ func TestInboundEndpointsAbsentInTestMode(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/controlplane/ -run 'TestInboundEndpointsAbsentInTestMode' -count=1`
 Expected: 得到 401/405 而不是 404
 
-- [ ] **Step 3: 改 `ServeHTTP`**
+- [x] **Step 3: 改 `ServeHTTP`**
 
 ```go
 	case "/tenon/requests":
@@ -2660,12 +2660,12 @@ Expected: 得到 401/405 而不是 404
 
 并在包注释的端点清单里注明「测试模式下入站四路由不挂（D1 可重复性）」。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `go test ./internal/controlplane/ -run 'TestInboundEndpointsAbsentInTestMode' -count=1 -v && go test ./... -count=1`
 Expected: 新用例 PASS；全仓无 FAIL（既有的入站用例**不设** TestMode，不受影响）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/controlplane/http.go internal/controlplane/http_test.go
@@ -2681,14 +2681,14 @@ git commit -m "fix(controlplane): 测试模式下不挂入站通道（D1 可重�
 - Modify: `README.md`（「还没做的」删掉已交付项）
 - Modify: `docs/interfaces.md`（公告板条目加 `state` 字段）
 
-- [ ] **Step 1: 改三处文档（按 spec §12 的映射逐条改）**
+- [x] **Step 1: 改三处文档（按 spec §12 的映射逐条改）**
 
 1. M0.5 spec §1 的 agent 行：把「不开端口、不持久化状态」改为「不开端口；持久状态只有 `TENON_AGENT_STATE_DIR` 下的 `pending/`、`archived/` 与 `processed.jsonl`」。
 2. README「还没做的」：删掉「agent 侧的挂起/恢复」「前端页面（P3 未做）」中的**前者**（后者保留，P3 未做）。
 3. `docs/interfaces.md` §4.7：公告板条目字段补 `state`（`awaiting_approval` / `done` / `rejected` / `expired` / `stale`），并注明「过滤是页面的事，协议层返回全部未过期条目」。
 4. **README 的已知缺口必须写明审计形状偏离**：挂起/恢复的计划级审计 `stepId=null`、无 `action`/`inputHash`，**不满足 `audit-event.schema.json` 的完整 required 集**；宿主当前只校验 `auditId` 与 `stage`，加严校验会让挂起路径全线失败。这是评审选定的 A 案（语义最诚实），不是疏漏。
 
-- [ ] **Step 2: 全量回归**
+- [x] **Step 2: 全量回归**
 
 ```bash
 go test ./... -count=1
@@ -2700,7 +2700,7 @@ go build ./...
 
 Expected: 五项全绿。
 
-- [ ] **Step 3: 冒烟（手工，记入验收清单）**
+- [x] **Step 3: 冒烟（手工，记入验收清单）**
 
 ```bash
 # 起 host（TEST_MODE 关掉）+ inventory + procurement + agent
@@ -2713,7 +2713,9 @@ TENON_RESULT_FILE=out/agent-result.jsonl go run ./cmd/agent
 
 期望：`out/agent-state/pending/` 出现一份 json；`GET /tenon/pending` 能查到；投一条 confirm 后 `archived/` 出现 `done`，inventory 数量真的变了，`GET /tenon/audit?planId=…` 的 result 段 `approvedBy=user:bob`。
 
-- [ ] **Step 4: Commit**
+**证据**：`out/agent-state/pending/archived/pln_smoke1.json`（`state=done`，inventory 侧审计 1 条；宿主审计 4 条、`prevHash` 链连续、step 级 `approvedBy=user:bob`）。
+
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs README.md
