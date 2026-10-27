@@ -86,20 +86,23 @@ agent ActionMeta{Title, SummaryTemplate, RequiredArgs}
 
 ---
 
-## 4. 策略覆盖（只补 skill 域内动作）
+## 4. 策略覆盖（**执行期更正：平台策略不改**）
 
-| 规则 | match | when | outcome | 理由 |
-|---|---|---|---|---|
-| `pol-inventory-deduct-auto-small`（新增） | inventory / `DeductStock` | `arg.qty <= 10` | `auto` | 小量扣减是日常操作；现在没有任何规则覆盖它 → 默认 deny |
-| `pol-inventory-deduct-approve`（保留） | inventory / `DeductStock` | `arg.qty > 10` | `approve`（warehouse_manager） | 高风险仍需人批 |
-| `pol-inventory-release-approve`（新增） | inventory / `ReleaseStock` | 恒真 | `approve`（warehouse_manager） | 补偿动作必须留痕并经人 |
-| `pol-procurement-create-approve`（改造） | procurement / `CreatePurchaseRequest` | **恒真**（删掉 `origin=request` 限制） | `approve`（procurement_manager） | 事件来源同样要能采购；否则 D1 的 A 轮必被拒 |
-| `pol-quote-create-deny`（新增） | quote / `CreateStandardPartQuote` | 恒真 | `deny` | 触发器动作不该由 agent 调；显式 deny 比「未覆盖」可诊断 |
-| `pol-inventory-getstock-auto`、`pol-quote-getquote-auto`（保留） | — | 恒真 | `auto` | 只读 |
+**本节初版有事实错误，已作废。** 初版声称「procurement 的规则只匹配 `origin=request`，所以 D1 的 A 轮（event 来源）采购必被拒」，并据此要改三条平台规则。核实后：
 
-> 仍然保持「**未覆盖即 deny**」：上面是补齐业务域，不是加兜底。新增动作仍然必须显式声明规则。
+| 初版说法 | 事实 | 证据 |
+|---|---|---|
+| event 来源采购无覆盖 | ✅ **有覆盖**：业务级规则 [`skills/quote-to-fulfillment/approval.json`](../../../skills/quote-to-fulfillment/approval.json) 按 qty 覆盖（≤5 auto / >5 approve） | `TestDevBusinessRulesTakeEffect` 断言「事件驱动大额要批 → decidedBy=biz-purchase-approve-large」 |
+| `plat-request-needs-human` 该去掉 origin 限制 | ❌ 它是**「对话发起一律人批」的守卫**（priority 1000），不是采购规则 | 同一用例断言 request 来源 qty=3 与 qty=12 的决胜规则都必须是它 |
+| 小量扣减应改 auto | ❌ 这是**产品决策**，且当前语义是刻意 deny | `TestLoadDevConfigFiles` 断言 `DeductStock qty=3 → deny`，注释「未登记的动作仍然 deny」 |
+| quote 动作应显式 deny | ⚠️ 未登记本来就 deny；加规则只改 `decidedBy` 可读性，不增加安全性 | `policy.Evaluate` 的 fail-closed 语义 |
 
-**一处改名要说清**：原 `plat-request-needs-human` 改名为 `pol-procurement-create-approve`（因为它不再只匹配 request，旧名会撒谎）。**历史审计里的旧 `policyId` 不改写**——审计是不可变记录，改名不回溯；对账时按「当时的策略文件 + 审计里的 policyId」解释。
+**最终决定（2026-10-27，产品所有者）**：**平台策略一条不改。**
+
+- 事件来源采购：由业务级规则覆盖，平台无需介入；
+- 对话发起：`plat-request-needs-human` 继续保证「一律人批」，这是安全语义，不放宽；
+- **小量扣减（`qty ≤ 10`）保持 deny → 转人工**：这是有意为之的 fail-closed，记入 README 的已知行为，不在本轮改；
+- quote 触发器动作：保持「未登记即 deny」，不加显式规则（YAGNI：`decidedBy` 可读性由 §4 末尾的 `detail` 可观测解决）。
 
 **可观测**：策略结论为 `deny`/`approve` 而转人工时，`RunResult.Detail` 里追加计划动作清单（例：`计划动作=[inventory.ReleaseStock]`），并同样写进 `TENON_RESULT_FILE` 的结果行。目的只有一个：下次被拒时不用猜。
 

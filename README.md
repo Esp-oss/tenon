@@ -246,6 +246,8 @@ docker compose -f compose.m0.yaml config --quiet
 
 dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`tenon.request` 帧**至今没有 schema**（只在 prose 与 CHANGELOG 里）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、撤销与补偿（`ReleaseStock` 未接）、`amend`（JSON Patch 改 step 后再批）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
 
+> **对话发起的小量扣减（`qty ≤ 10`）会转人工**：平台策略没有登记该区间（fail-closed 的必然结果），业务员说「扣 5 件」时会挂起给仓管批。随时可以加一条 `pol-inventory-deduct-auto-small` 改成自动，但那是一次产品语义变更，需单独决定。
+
 > 页面已交付（`TENON_UI_DIR=ui`，无构建链静态页）：白话来自身份化模板，技术信息在折叠区。**可回归的验收**：`powershell -NoProfile -File scripts/verify-ui.ps1`——它起 stub 全链路、造一张待批卡，再用 Edge(CDP) 断言「卡面只有人话、技术信息默认收起、非审批人没有批准按钮」，并落两张截图到 `out/ui-verify/`。
 
 > **审批人角色只有一条来路**：`tenon.confirm` 帧里的 `roles` **由宿主写入**（取提交者 token 的 `claims.roles`，先删客户端自报再写）。agent 侧不读登录身份、不做兜底——它若读自己的登录角色，等于用服务账号的身份给人授权。也因此：**策略必须真的给出 `approvers`**，否则 `requiredRoles` 为空、`rolesIntersect` 对空集 fail-closed，会出现"板上有卡、谁点都 403"。这是 fail-closed 的必然结果，不是 bug。

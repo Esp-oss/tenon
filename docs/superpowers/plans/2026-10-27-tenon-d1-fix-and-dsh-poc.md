@@ -486,9 +486,30 @@ git commit -m "feat(agent): prompt 渲染动作标题与必填字段（requiredA
 
 ---
 
-## Task A5: 策略覆盖（dev 策略 + 用真实配置文件回归）
+## Task A5: 策略——**不改**平台配置（记录决定）
 
-**Files:**
+> **执行期更正（2026-10-27）：本任务初版作废。** 初版要改三条平台规则，核实后是误判：
+>
+> 1. **event 来源的采购本来就有覆盖**——业务级规则 `skills/quote-to-fulfillment/approval.json` 按 qty 覆盖（≤5 auto / >5 approve），`TestDevBusinessRulesTakeEffect` 断言「事件驱动大额要批 → decidedBy=**biz-purchase-approve-large**」。所以 **D1 的 A 轮不缺策略覆盖**。
+> 2. **`plat-request-needs-human` 不是采购规则，是「对话发起一律人批」的守卫**（priority 1000）。同一用例断言 request 来源 qty=3 与 qty=12 的决胜规则都必须是它；删掉它的 origin 限制 = **放宽安全语义**。
+> 3. **小量扣减（qty ≤ 10）保持 deny** 是产品所有者 2026-10-27 的决定：有意为之的 fail-closed，不改成 auto。
+> 4. quote 触发器动作保持「未登记即 deny」，不加显式规则（YAGNI：可读性由 A6 的 `detail` 解决）。
+>
+> **实际执行（替代初版）**：
+>
+> - [x] Step 1: 改写 spec 的 §4，把三条规则改成「一条不改」并附证据——**已完成**
+> - [ ] Step 2: README 的「还没做的」补一条已知行为（文本见下）
+> - [ ] Step 3: commit `docs: 更正策略覆盖的误判（平台策略不改；小量扣减转人工是有意为之）`
+>
+> Step 2 要追加到 README「还没做的」的文本：
+>
+> ```markdown
+> **对话发起的小量扣减（`qty ≤ 10`）会转人工**：平台策略没有登记该区间（fail-closed 的必然结果），业务员说「扣 5 件」时会挂起给仓管批。随时可以加一条 `pol-inventory-deduct-auto-small` 改成自动，但那是一次产品语义变更，需单独决定。
+> ```
+>
+> 初版内容（三条规则 + 读真实配置文件的用例）留在下面仅作历史参考，**不要按它执行**。
+
+**Files（初版，已作废）:**
 - Modify: `config/policies.dev.json`
 - Test: `internal/controlplane/policies_dev_test.go`（新建）
 
