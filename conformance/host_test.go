@@ -187,6 +187,9 @@ func TestHostModeMakesC4AndC5Pass(t *testing.T) {
 	}
 	pass, fail, skip := rep.Counts()
 	t.Logf("宿主模式 pass=%d fail=%d skip=%d", pass, fail, skip)
+	// 证据是报告要交付的内容，打进测试日志便于人工复核判据是否真的成立。
+	t.Logf("C4 证据：%s", strings.Join(evidenceOf(rep, "C4"), "\n           "))
+	t.Logf("C5 证据：%s", strings.Join(evidenceOf(rep, "C5"), "\n           "))
 }
 
 // ---------- 无宿主地址：C4/C5 必须仍是 SKIP（防回归）----------

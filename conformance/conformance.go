@@ -553,11 +553,17 @@ func checkAuditTrail(ctx context.Context, client *http.Client, host string) Resu
 	auditID := "aud_conformance_" + tag
 	planID := "pln_conformance_" + tag
 
-	// inputHash 用真实摘要而不是常量：审计记录若拿假值也能通过，用例就只证明了
-	// 「字段存在」，证明不了宿主原样保存了调用方的摘要。
+	// inputHash / outputHash 用真实摘要而不是常量：审计记录若拿假值也能通过，用例就只
+	// 证明了「字段存在」，证明不了宿主原样保存了调用方的摘要。
+	//
+	// 两段的公共字段形状按 audit-event.schema.json：actor 的键是 type 不是 kind；
+	// decision（outcome/policyId/grantId/approvedBy）与 result（status/outputHash/
+	// errorClass）都是封闭对象，缺键与给 null 在哈希链里是不同的字节，所以这里写全。
 	args := []byte(`{"sku":"STD-1001","qty":2,"referenceNo":"CONF-1"}`)
+	output := []byte(`{"onHand":98}`)
 	common := fmt.Sprintf(`"auditId":%q,"planId":%q,"stepId":"s1","action":"inventory.DeductStock",`+
-		`"actor":{"kind":"agent","id":"ag_conformance"},"decision":{"outcome":"auto"},`+
+		`"actor":{"type":"agent","id":"ag_conformance","onBehalfOf":"user:alice"},`+
+		`"decision":{"outcome":"auto","policyId":"pol.conformance.auto","grantId":null,"approvedBy":null},`+
 		`"inputHash":%q,"idempotencyKey":"tenon:%s/s1"`,
 		auditID, planID, hashScheme+sha256Hex(args), planID)
 	segments := []struct {
@@ -566,7 +572,9 @@ func checkAuditTrail(ctx context.Context, client *http.Client, host string) Resu
 		extra string
 	}{
 		{stageDispatched, "第一段（stage=dispatched）", ""},
-		{stageResult, "第二段（stage=result）", `,"result":{"status":"succeeded"}`},
+		{stageResult, "第二段（stage=result）", fmt.Sprintf(
+			`,"result":{"status":"ok","outputHash":%q,"errorClass":null}`,
+			hashScheme+sha256Hex(output))},
 	}
 	for _, seg := range segments {
 		body := []byte(fmt.Sprintf(`{%s,"stage":%q%s}`, common, seg.stage, seg.extra))
@@ -581,7 +589,7 @@ func checkAuditTrail(ctx context.Context, client *http.Client, host string) Resu
 			res.Detail = fmt.Sprintf("%s审计写入返回 %d（期望 200）：%s", seg.label, status, clip(raw))
 			return res
 		}
-		res.Evidence = append(res.Evidence, fmt.Sprintf("%s 写入 %d（auditId=%s）", seg.label, status, auditID))
+		res.Evidence = append(res.Evidence, fmt.Sprintf("%s写入 %d（auditId=%s）", seg.label, status, auditID))
 	}
 
 	// 查回来：按 planId 过滤，是 interfaces.md §4.3 给出的查询形态。
@@ -757,6 +765,11 @@ func checkPolicyFailClosed(ctx context.Context, client *http.Client, host string
 		}
 		res.Evidence = append(res.Evidence, fmt.Sprintf("%s → 200 outcome=deny decidedBy=%v reasons=%v",
 			p.label, ev.DecidedBy, ev.Reasons))
+		// 「无命中默认拒绝」出现与否要按实际响应统计，而不是按探针的期望统计：
+		// 汇总数字若只数期望值，证据就会自说自话。
+		if hasString(ev.Reasons, reasonNoMatch) {
+			withReason = append(withReason, p.label)
+		}
 		if p.mustReason != "" {
 			if !hasString(ev.Reasons, p.mustReason) {
 				res.Status = Fail
@@ -764,11 +777,10 @@ func checkPolicyFailClosed(ctx context.Context, client *http.Client, host string
 					p.label, p.mustReason, ev.Reasons)
 				return res
 			}
-			withReason = append(withReason, p.label)
 		}
 	}
-	res.Evidence = append(res.Evidence, fmt.Sprintf("%d/%d 个探针 outcome=deny；%s 出现在 %d 个探针的 reasons 里（%s）",
-		len(probes), len(probes), reasonNoMatch, len(withReason), strings.Join(withReason, "、")))
+	res.Evidence = append(res.Evidence, fmt.Sprintf("%d 个探针全部 outcome=deny；%s 出现在 %d 个探针的 reasons 里（%s）",
+		len(probes), reasonNoMatch, len(withReason), strings.Join(withReason, "、")))
 	res.Status = Pass
 	return res
 }
