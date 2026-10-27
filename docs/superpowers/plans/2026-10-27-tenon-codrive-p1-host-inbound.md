@@ -515,6 +515,177 @@ git commit -m "feat(controlplane): 入站队列落盘实现（jsonlQueue，含�
 
 ---
 
+## Task 2b: 序号高位水位（Task 2 复核后追加）
+
+**为什么追加**：Task 2 的实现用「文件里最大的 `seq`」恢复游标。若整份文件损坏（只剩半行、或全被截断），恢复出的 `seq` 退回 0，之后 `Push` 从 1 重新分配——**持有旧游标的客户端会永远看不到新帧**（`Since(after=5)` 把所有 `Seq<=5` 滤掉），而日志里没有任何异常。这正是「丢了没人知道，业务员以为提过」的失败模式。
+
+**Files:**
+- Modify: `internal/controlplane/jsonlqueue.go`
+- Modify: `internal/controlplane/jsonlqueue_test.go`
+
+- [ ] **Step 1: 写失败测试**
+
+```go
+// 整份文件损坏时，序号不能退回 0：否则持旧游标的客户端会漏掉以后所有帧。
+func TestJSONLQueueCorruptFileKeepsSequence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbound.jsonl")
+	q, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("打开失败：%v", err)
+	}
+	q.Push(json.RawMessage(`{"n":1}`))
+	q.Push(json.RawMessage(`{"n":2}`))
+	if err := q.Close(); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+
+	// 把主文件整体写坏：模拟磁盘损坏/被截断。
+	if err := os.WriteFile(path, []byte(`{"seq":9,"fra`), 0o600); err != nil {
+		t.Fatalf("写坏文件失败：%v", err)
+	}
+
+	again, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("重开失败：%v", err)
+	}
+	defer again.Close()
+	if got := again.Highest(); got != 2 {
+		t.Fatalf("水位应由 meta 恢复为 2，得到 %d", got)
+	}
+	if seq := again.Push(json.RawMessage(`{"n":3}`)); seq != 3 {
+		t.Fatalf("坏文件后新帧序号应为 3，得到 %d", seq)
+	}
+}
+
+// meta 文件是水位的水位：它必须真的被写下来。
+func TestJSONLQueueWritesMeta(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbound.jsonl")
+	q, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("打开失败：%v", err)
+	}
+	defer q.Close()
+	q.Push(json.RawMessage(`{"n":1}`))
+	raw, err := os.ReadFile(path + ".meta")
+	if err != nil {
+		t.Fatalf("meta 未写出：%v", err)
+	}
+	if !strings.Contains(string(raw), `"seq":1`) {
+		t.Fatalf("meta 内容不对：%s", raw)
+	}
+}
+```
+
+测试文件 import 补 `"strings"`。
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `go test ./internal/controlplane/ -run 'TestJSONLQueueCorruptFileKeepsSequence|TestJSONLQueueWritesMeta' -count=1`
+Expected: 第一个用例 `水位应由 meta 恢复为 2，得到 0`；第二个 `meta 未写出`
+
+- [ ] **Step 3: 改 `jsonlqueue.go`**
+
+结构体补一个字段：
+
+```go
+	// metaPath 存序号高位水位。它不存帧内容，只在主文件损坏时兜底序号，
+	// 避免游标退回 0 导致持旧游标的客户端永久漏帧。
+	metaPath string
+```
+
+`newJSONLQueue` 里构造完 `q` 之后、`q.load()` 之前补 `q.metaPath = path + ".meta"`；`load()` 末尾（`return sc.Err()` 之前）改为：
+
+```go
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	q.loadMeta()
+	return nil
+```
+
+新增两个方法：
+
+```go
+// loadMeta 读回水位。失败只告警不回退：主文件里仍可能有一份更大的 seq。
+func (q *jsonlQueue) loadMeta() {
+	raw, err := os.ReadFile(q.metaPath)
+	if err != nil {
+		return // 没有 meta 是正常情况（首次运行）
+	}
+	var meta struct {
+		Seq int64 `json:"seq"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		log.Printf("controlplane: 入站队列水位文件不可解析，忽略：%v", err)
+		return
+	}
+	if meta.Seq > q.seq {
+		q.seq = meta.Seq
+	}
+}
+
+// saveMeta 落水位。先写临时文件再改名：半个 meta 比没有 meta 更坏。
+func (q *jsonlQueue) saveMeta() {
+	tmp := q.metaPath + ".tmp"
+	raw, err := json.Marshal(map[string]int64{"seq": q.seq})
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
+		log.Printf("controlplane: 写入站队列水位失败：%v", err)
+		return
+	}
+	if err := os.Rename(tmp, q.metaPath); err != nil {
+		log.Printf("controlplane: 提交入站队列水位失败：%v", err)
+	}
+}
+```
+
+`Push()` 里在 `q.rewrite()` 成功之后加一行 `q.saveMeta()`：
+
+```go
+	if err := q.rewrite(); err != nil {
+		q.broken = err
+	} else {
+		q.saveMeta()
+	}
+```
+
+`rewrite()` 的错误路径补上临时文件清理（三处 `return err` 前加 `_ = os.Remove(tmp)`，`f.Close()` 之后同样处理）：
+
+```go
+		tmp := q.path + ".tmp" // 已在函数开头
+		// 任何失败路径都清掉半成品，避免下次启动把 .tmp 误当数据
+		defer func() {
+			if _, statErr := os.Stat(tmp); statErr == nil {
+				_ = os.Remove(tmp)
+			}
+		}()
+```
+
+> 注意：成功路径在 `os.Rename` 之后 `.tmp` 已不存在，`defer` 里的 `Stat` 会失败、自然跳过，不会误删。
+
+- [ ] **Step 4: 跑测试至全绿**
+
+Run: `go test ./internal/controlplane/ -run 'TestJSONLQueue' -count=1 -v`
+Expected: 6 个用例全 PASS（原有 4 个 + 新增 2 个）
+
+- [ ] **Step 5: 全包回归**
+
+Run: `go test ./internal/controlplane/... -count=1 && gofmt -l internal/controlplane/`
+Expected: 五个包全 ok；gofmt 无输出
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/controlplane/jsonlqueue.go internal/controlplane/jsonlqueue_test.go
+git commit -m "fix(controlplane): 入站队列序号水位独立落盘（主文件损坏时不回绕）"
+```
+
+**明确不改的**：`Push` 仍做全量 rewrite。改成 append 看似更快，但文件末尾若留半行（崩溃），append 会把新帧拼在坏行后面产出**一条更坏的行**，新帧静默丢失；而全量 rewrite 顺带把坏行治好。这条理由要写进代码注释，别让后人"优化"回去。
+
+---
+
 ## Task 3: dev 身份（`config/users.dev.json` + token 签发/校验 + `POST /tenon/session`）
 
 **Files:**
