@@ -39,7 +39,9 @@ func SelectSkills(skills []Skill, text, viewModule string, limit int) []Skill {
 			picks = append(picks, scored{skill: s, hits: hits})
 		}
 	}
-	sort.Slice(picks, func(i, j int) bool {
+	// SliceStable：名字与命中数全同的两份 skill 也要顺序稳定，否则截断会切掉任意一份。
+	// 这个函数的全部价值就是确定性，用非稳定排序等于把一半价值让掉。
+	sort.SliceStable(picks, func(i, j int) bool {
 		if picks[i].hits != picks[j].hits {
 			return picks[i].hits > picks[j].hits
 		}

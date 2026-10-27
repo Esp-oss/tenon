@@ -1323,11 +1323,13 @@ git commit -m "feat(agent): host 入站客户端（登录/单飞重登/poll/ack/
 
 ## Task 5: skill 确定性粗筛
 
+**状态：✅ 已完成（commit `c439cf5`；确定性补丁在 `sort.SliceStable`）**
+
 **Files:**
 - Create: `internal/agent/skillselect.go`
 - Test: `internal/agent/skillselect_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 package agent
@@ -1369,12 +1371,12 @@ func TestSelectSkillsEmptyWhenNoMatch(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestSelectSkills' -count=1`
 Expected: `undefined: SelectSkills`
 
-- [ ] **Step 3: 实现 `skillselect.go`**
+- [x] **Step 3: 实现 `skillselect.go`**
 
 ```go
 package agent
@@ -1437,12 +1439,12 @@ func SelectSkills(skills []Skill, text, viewModule string, limit int) []Skill {
 
 > `Skill` 现在只有 `Name` / `Subscribes` / `Body` 三个字段（`planner.go:375`）。若字段名不同，按实际改名——**不要新增字段**。
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestSelectSkills' -count=1 -v`
 Expected: 3 个用例全 PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/skillselect.go internal/agent/skillselect_test.go
@@ -2300,6 +2302,14 @@ func (h hostAuditProbe) Has(ctx context.Context, auditID string) (bool, error) {
 `HostClient.base` 是小写字段，同包可直接读；若确实需要外部访问，加 `BaseURL() string`，**不要**把字段导出。
 
 6. **自检的导出包装与日志**：`selfCheck` 是小写、返回未导出类型 `selfCheckReport`。Task 10 加个导出包装 `SelfCheck(...) (selfCheckReport, error)` 即可（调用方用 `rep.Kept` 这类导出字段，不需要命名类型）。日志行**必须包含 `Corrupt`**——坏文件唯一的告警出口。
+
+7. **`SelectSkills` 接进 `Run` 的三条（Task 5 复核后追加）**
+
+   (i) **`PlanInput.Request`（Task 6）与 `RunInput.Request`（Task 7）必须同时存在**：`Run` 内按 `runInput.Request != nil` 分流——request 回合用 `SelectSkills` 算候选集，事件回合仍走 `Skills.TextFor(event.Type)`。只改一处会得到一个永远不成立的分支。
+
+   (ii) **别用 `SkillStore.TextFor` 渲染候选集**：它只渲染**非空 Body**。只靠 `Subscribes` 命中的 skill（Body 为空）会被选中却渲染成空串 → `userPrompt` 写「（本次没有匹配的 skill 正文）」——**选了 N 份却告诉模型没有**。需要新写 `TextForSelected(selected []Skill) string`，与 `TextFor` 同一格式，但空 Body 渲染成「（无正文，仅按订阅命中）」，绝不渲染空串。
+
+   (iii) **`deps.Skills.Len() == 0` 要单独打日志**：`SelectSkills` 不返回 error，区分不出「压根没加载 skill」与「加载了但没命中」；`LoadSkills` 的注释本就要求把 0 份打出来。另两条写进 `skillselect.go` 注释：`limit <= 0` 会被静默改成 2（传 0 当"不限"只会拿 2 份）；`knownModuleNames` 必须全小写、新模块要记得加行，否则表现为"没有匹配"的静默降级。
 
 
 
