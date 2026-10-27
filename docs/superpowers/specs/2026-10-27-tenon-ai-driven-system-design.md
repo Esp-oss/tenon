@@ -151,7 +151,11 @@ flowchart TB
 { "module": "inventory", "type": "SKU", "id": "STD-1001" }
 ```
 
-字符串简写形式：`inventory:SKU/STD-1001`。用于 `Event.subject`、`Plan.expectedDiff[].entity`、`Intent.target`、`Audit.effects.entities`。**对账两侧必须使用同一寻址，否则无法比对。**
+字符串简写形式：`inventory:SKU/STD-1001`。
+
+`Event.subject`、`Plan.expectedDiff[].entity`、`Intent.target`、`Audit.effects.entities` 这四处都接受**两种形式**（类型记为 `EntityRefLike = EntityRef | EntityRefString`）。本文档示例里 `Event.subject`/`Intent.target` 用对象形式、`expectedDiff`/`effects.entities` 用字符串形式，二者都合法。
+
+**但对账前必须先规范化**：比较两侧前统一转成对象形式（`module`/`type`/`id` 三段），否则字符串里的转义差异会导致假不一致。
 
 - `causationId`：指向上一跳的 `eventId` 或 `auditId`；无上一跳时为 `null`。（**协议不定义 Command 契约**，不存在 `cmd_*`。）
 - `correlationId`：`cor:<业务键>`，如 `cor:quote/Q-2026-0417`。
@@ -202,6 +206,7 @@ flowchart TB
     "scope": "module",
     "duplicateBehavior": "return_first_result"
   },
+  "preconditions": ["stock.onHand >= qty"],
   "compensation": {
     "action": "inventory.ReleaseStock",
     "argMap": { "sku": "$in.sku", "qty": "$in.qty", "referenceNo": "$in.referenceNo" }
@@ -380,7 +385,7 @@ POST /tenon/grants:evaluate
 ```
 POST /tenon/policies:evaluate
 { "plan": { ... } }
-→ 200 { "outcome": "auto", "decidedBy": [], "reasons": ["NO_POLICY_MATCH_DEFAULT_DENY"] }
+→ 200 { "outcome": "deny", "decidedBy": [], "reasons": ["NO_POLICY_MATCH_DEFAULT_DENY"] }
 → 200 { "outcome": "approve", "decidedBy": ["pol-stock-deduct"], "approvers": ["role:warehouse_manager"] }
 ```
 
@@ -408,7 +413,7 @@ POST /tenon/policies:evaluate
 
 字段约束：
 - `stage ∈ {dispatched, result}`。**`dispatched` 必须先写成功，才允许执行**；写失败 → 拒绝执行。
-- 同一次调用产生两条记录（`auditId` 相同、`stage` 不同），`prevHash` 串联成链。
+- 同一次调用产生两条记录（`auditId` 相同、`stage` 不同），`prevHash` 串联成链。**链首记录的 `prevHash` 为 `null`**。
 - `result.status ∈ {ok, error, partially_failed, unknown}`。`unknown` 表示崩溃恢复后结果未定，需按 `idempotencyKey` 向模块回查。
 - `decision.outcome ∈ {auto, approve, deny}`；**`decision.policyId` 存是哪条策略批的**（与 outcome 分离，不撞名）。
 - `effects` 承载业务单据量，v2 用量看板的聚合来源。**看板仍需新增聚合查询，但不需要改 schema**。
