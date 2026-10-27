@@ -1,0 +1,84 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASIP 设计图 · design-3-robustness</title><style>
+:root{color-scheme:dark}
+body{margin:0;background:#0b1120;color:#e2e8f0;font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 24px 64px}
+h2{font-size:21px;line-height:1.3;margin:0 0 6px;color:#f1f5f9}
+h3{font-size:15px;margin:22px 0 6px;color:#cbd5e1}
+.subtitle{color:#94a3b8;font-size:13px;margin:0 0 16px}
+code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.92em;color:#7dd3fc}
+.options{display:flex;flex-direction:column;gap:14px}
+.option{display:flex;gap:14px;background:#111827;border:1px solid #1f2937;border-radius:10px;padding:16px}
+.option:hover{border-color:#334155}
+.letter{font-weight:700;color:#38bdf8;font-size:18px;flex:0 0 22px}
+.content{flex:1;min-width:0}
+.pros-cons{display:flex;gap:16px;font-size:12px}
+.pros{flex:1;border-left:3px solid #22c55e;padding-left:10px}
+.cons{flex:1;border-left:3px solid #f59e0b;padding-left:10px}
+.pros h4,.cons h4{margin:0 0 4px;font-size:11px;color:#94a3b8;font-weight:600}
+.pros ul,.cons ul{margin:0;padding-left:16px;color:#cbd5e1;line-height:1.6}
+table{border-collapse:collapse;width:100%}
+th{text-align:left;font-weight:600;color:#94a3b8;border-bottom:1px solid #334155}
+th,td{padding:6px 8px 6px 0;vertical-align:top}
+pre{overflow-x:auto}
+.nav{font-size:12px;color:#64748b;margin-bottom:20px}
+.nav a{color:#7dd3fc;text-decoration:none;margin-right:12px}
+</style></head>
+<body><div class="wrap"><div class="nav"><a href="architecture-approaches.html">架构方案对比</a><a href="design-1-layers.html">1 分层与契约</a><a href="design-2-slice.html">2 纵切面时序</a><a href="design-3-robustness.html">3 健壮性</a></div><h2>健壮性：8 道闸 + 一条 fail-closed 原则</h2>
+<p class="subtitle">健壮性不是"写得小心"，是每个组件缺失/失败时都有<b style="color:#e2e8f0">预先定义好的降级行为</b>。右下角那张降级表比任何代码都重要。</p>
+
+<div style="display:flex;gap:16px;margin-top:12px;align-items:flex-start">
+  <div style="flex:1.15">
+    <table style="width:100%;border-collapse:collapse;font-size:11.5px">
+      <tr style="color:#94a3b8;text-align:left;border-bottom:1px solid #334155"><th style="padding:5px 6px 5px 0">#</th><th style="padding:5px 6px 5px 0">机制</th><th style="padding:5px 0">硬约束</th></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 6px 6px 0;color:#64748b">1</td><td style="padding:6px 6px 6px 0;color:#e2e8f0">幂等</td><td style="padding:6px 0;color:#cbd5e1">写 action 必须声明 keyFields；<code>Idempotency-Key</code> 重复必须返回首次结果，<b>绝不重复副作用</b></td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 6px 6px 0;color:#64748b">2</td><td style="padding:6px 6px 6px 0;color:#e2e8f0">saga 补偿</td><td style="padding:6px 0;color:#cbd5e1"><code>reversible=false</code> 的 action <b>不许出现在多步 plan 的非末位</b>（否则无法回滚）</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 6px 6px 0;color:#64748b">3</td><td style="padding:6px 6px 6px 0;color:#e2e8f0">超时 + 熔断</td><td style="padding:6px 0;color:#cbd5e1">每 action 声明 timeout；模块连错 N 次即熔断，能力发现里标 unavailable，<b>不许对着坏模块狂重试</b></td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 6px 6px 0;color:#64748b">4</td><td style="padding:6px 6px 6px 0;color:#e2e8f0">对账</td><td style="padding:6px 0;color:#cbd5e1">日切比对「审计里的声称 diff」vs「模块终态」；差异即<b>冻结该 agent 写权限</b>并告警</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 6px 6px 0;color:#64748b">5</td><td style="padding:6px 6px 6px 0;color:#e2e8f0">审计不可变</td><td style="padding:6px 0;color:#cbd5e1">append-only + <code>prevHash</code> 哈希链，可验证未被篡改；大对象只存 inputHash</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 6px 6px 0;color:#64748b">6</td><td style="padding:6px 6px 6px 0;color:#e2e8f0">双层授权</td><td style="padding:6px 0;color:#cbd5e1">控制平面拒一次 + <b>模块侧再拒一次</b>；webhook HMAC + 时间戳防重放</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 6px 6px 0;color:#64748b">7</td><td style="padding:6px 6px 6px 0;color:#e2e8f0">版本演进</td><td style="padding:6px 0;color:#cbd5e1">只增不删；未知字段必须忽略；一致性测试进 CI 做门禁</td></tr>
+      <tr><td style="padding:6px 6px 6px 0;color:#64748b">8</td><td style="padding:6px 6px 6px 0;color:#e2e8f0">降级</td><td style="padding:6px 0;color:#cbd5e1">见右表 —— <b style="color:#f87171">全部 fail-closed</b></td></tr>
+    </table>
+  </div>
+
+  <div style="flex:1;background:#0f172a;border:1px solid #7f1d1d;border-radius:8px;padding:12px">
+    <div style="color:#fca5a5;font-weight:600;font-size:12px;margin-bottom:8px">组件缺失时的行为（fail-closed）</div>
+    <table style="width:100%;border-collapse:collapse;font-size:11px">
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:5px 6px 5px 0;color:#cbd5e1">没有前端 SDK</td><td style="padding:5px 0;color:#86efac">丢 Intent 帧，业务正确</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:5px 6px 5px 0;color:#cbd5e1">没有 dry-run</td><td style="padding:5px 0;color:#fbbf24">标 unverified → 强制审批</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:5px 6px 5px 0;color:#cbd5e1">策略服务不可用</td><td style="padding:5px 0;color:#f87171">默认 <b>deny</b>（不是 auto）</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:5px 6px 5px 0;color:#cbd5e1">没有 LLM</td><td style="padding:5px 0;color:#fbbf24">事件积压可重放，不丢</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:5px 6px 5px 0;color:#cbd5e1">模块超时/熔断</td><td style="padding:5px 0;color:#fbbf24">从能力清单摘掉</td></tr>
+      <tr style="border-bottom:1px solid #1e293b"><td style="padding:5px 6px 5px 0;color:#cbd5e1">事件重复投递</td><td style="padding:5px 0;color:#86efac">幂等键吸收</td></tr>
+      <tr><td style="padding:5px 6px 5px 0;color:#cbd5e1">审计写失败</td><td style="padding:5px 0;color:#f87171"><b>先写审计再执行</b>（WAL 风格）</td></tr>
+    </table>
+  </div>
+</div>
+
+<h3 style="margin-top:24px">兼容性矩阵</h3>
+<table style="width:100%;border-collapse:collapse;font-size:11.5px;margin-top:8px">
+  <tr style="color:#94a3b8;text-align:left;border-bottom:1px solid #334155"><th style="padding:5px 8px 5px 0">对象</th><th style="padding:5px 8px 5px 0">怎么接</th><th style="padding:5px 0">降级</th></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">任意语言后端</td><td style="padding:6px 8px 6px 0;color:#cbd5e1">HTTP/JSON + JSON Schema，6 端点</td><td style="padding:6px 0;color:#94a3b8">无 SDK 手写端点</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">已有 MCP 服务</td><td style="padding:6px 8px 6px 0;color:#cbd5e1">包装成模块：tool → action</td><td style="padding:6px 0;color:#fbbf24">缺 risk 注解 → 默认高风险 + 审批</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">无 API 的老系统</td><td style="padding:6px 8px 6px 0;color:#cbd5e1">写适配器（<b style="color:#e2e8f0">不做 UI 自动化</b>）</td><td style="padding:6px 0;color:#f87171">写操作退回人工</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">任意前端</td><td style="padding:6px 8px 6px 0;color:#cbd5e1">WS 三帧；REST 轮询可降级</td><td style="padding:6px 0;color:#86efac">纯对话 + IM 通知</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">消息中间件</td><td style="padding:6px 8px 6px 0;color:#cbd5e1">事件信封与 broker 解耦，Kafka/NATS/Redis 适配器</td><td style="padding:6px 0;color:#86efac">HTTP webhook 轮询</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">A2A / 语音助手</td><td style="padding:6px 8px 6px 0;color:#cbd5e1">v2 适配层：Agent Card → manifest；语音 → 意图帧</td><td style="padding:6px 0;color:#94a3b8">v1 不承诺</td></tr>
+  <tr><td style="padding:6px 8px 6px 0;color:#e2e8f0">dsh 版本</td><td style="padding:6px 8px 6px 0;color:#cbd5e1">peerDeps 范围 + 豁免机制（dsh 已有）</td><td style="padding:6px 0;color:#86efac">协议本身不依赖 dsh 类型</td></tr>
+</table>
+
+<h3 style="margin-top:24px">可行性结论与风险登记</h3>
+<p style="color:#cbd5e1;font-size:12.5px;margin:8px 0"><b style="color:#86efac">结论：技术可行。</b>关键原语在 dsh 里都有现成对应（skill / jobs / token-meter / otel / session 持久化 / approval / permission / MCP 客户端 / api gateway / client UI 插件），真正要自研的是<b style="color:#e2e8f0">协议契约 + 治理平面 + 一致性套件</b>，量级 4–6 人周可到 v1。<b style="color:#fbbf24">最大的风险不是技术，是退化成规则引擎。</b></p>
+
+<table style="width:100%;border-collapse:collapse;font-size:11.5px">
+  <tr style="color:#94a3b8;text-align:left;border-bottom:1px solid #334155"><th style="padding:5px 8px 5px 0">风险</th><th style="padding:5px 8px 5px 0">影响</th><th style="padding:5px 0">缓解</th></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">R1 退化成规则引擎</td><td style="padding:6px 8px 6px 0;color:#f87171">高</td><td style="padding:6px 0;color:#cbd5e1">反模式判据 + demo 里<b>零胶水代码</b>，CI 检查有没有 handler 注册</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">R2 协议过抽象变空泛标准</td><td style="padding:6px 8px 6px 0;color:#f87171">高</td><td style="padding:6px 0;color:#cbd5e1">只服务一个纵切面；每条规范必须有一致性测试用例，否则删掉</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">R3 真实系统没有补偿接口</td><td style="padding:6px 8px 6px 0;color:#fbbf24">中</td><td style="padding:6px 0;color:#cbd5e1">risk.reversible 声明 + 不可逆强制审批 + dry-run 必读</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">R4 审计不可信（agent 自证）</td><td style="padding:6px 8px 6px 0;color:#fbbf24">中</td><td style="padding:6px 0;color:#cbd5e1">模块侧独立记录 + 日切对账 + 哈希链</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:6px 8px 6px 0;color:#e2e8f0">R5 共驾帧落地成本高</td><td style="padding:6px 8px 6px 0;color:#fbbf24">中</td><td style="padding:6px 0;color:#cbd5e1">先只做 demo 页 + SDK hook，未接入降级为纯对话</td></tr>
+  <tr><td style="padding:6px 8px 6px 0;color:#e2e8f0">R6 绑定 dsh 版本</td><td style="padding:6px 8px 6px 0;color:#94a3b8">低</td><td style="padding:6px 0;color:#cbd5e1">协议层不 import dsh，只在 adapter 包依赖</td></tr>
+</table>
+</div></body></html>

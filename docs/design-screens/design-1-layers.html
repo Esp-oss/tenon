@@ -1,0 +1,106 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASIP 设计图 · design-1-layers</title><style>
+:root{color-scheme:dark}
+body{margin:0;background:#0b1120;color:#e2e8f0;font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 24px 64px}
+h2{font-size:21px;line-height:1.3;margin:0 0 6px;color:#f1f5f9}
+h3{font-size:15px;margin:22px 0 6px;color:#cbd5e1}
+.subtitle{color:#94a3b8;font-size:13px;margin:0 0 16px}
+code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.92em;color:#7dd3fc}
+.options{display:flex;flex-direction:column;gap:14px}
+.option{display:flex;gap:14px;background:#111827;border:1px solid #1f2937;border-radius:10px;padding:16px}
+.option:hover{border-color:#334155}
+.letter{font-weight:700;color:#38bdf8;font-size:18px;flex:0 0 22px}
+.content{flex:1;min-width:0}
+.pros-cons{display:flex;gap:16px;font-size:12px}
+.pros{flex:1;border-left:3px solid #22c55e;padding-left:10px}
+.cons{flex:1;border-left:3px solid #f59e0b;padding-left:10px}
+.pros h4,.cons h4{margin:0 0 4px;font-size:11px;color:#94a3b8;font-weight:600}
+.pros ul,.cons ul{margin:0;padding-left:16px;color:#cbd5e1;line-height:1.6}
+table{border-collapse:collapse;width:100%}
+th{text-align:left;font-weight:600;color:#94a3b8;border-bottom:1px solid #334155}
+th,td{padding:6px 8px 6px 0;vertical-align:top}
+pre{overflow-x:auto}
+.nav{font-size:12px;color:#64748b;margin-bottom:20px}
+.nav a{color:#7dd3fc;text-decoration:none;margin-right:12px}
+</style></head>
+<body><div class="wrap"><div class="nav"><a href="architecture-approaches.html">架构方案对比</a><a href="design-1-layers.html">1 分层与契约</a><a href="design-2-slice.html">2 纵切面时序</a><a href="design-3-robustness.html">3 健壮性</a></div><h2>分层与边界：协议只承诺「线格式 + 执行语义」</h2>
+<p class="subtitle">四层横向分层 + 一条横切控制平面。左边是「谁在动」，中间是「线格式」，底部是「语义保证」。</p>
+
+<div style="margin:14px 0 20px">
+
+  <div style="display:flex;gap:10px;align-items:stretch;margin-bottom:6px">
+    <div style="flex:0 0 118px;font:600 11px/1.3 ui-monospace,monospace;color:#94a3b8;padding-top:14px;text-align:right">入口 / 前端</div>
+    <div style="flex:1;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px 14px">
+      <div style="color:#e2e8f0;font-weight:600;font-size:13px">人机共驾界面（可选增强）</div>
+      <div style="color:#94a3b8;font-size:11.5px;margin-top:4px;line-height:1.5">业务页面 + 共驾 SDK · 消费 <code style="color:#7dd3fc">Intent</code> 帧（打开/聚焦/预填/高亮 diff）· 生产 <code style="color:#7dd3fc">Context</code> 与 <code style="color:#7dd3fc">Confirm</code> 帧<br>没接前端的场景下 Intent 帧直接丢弃，<strong style="color:#e2e8f0">不影响正确性</strong></div>
+    </div>
+  </div>
+
+  <div style="text-align:center;color:#475569;font:11px/1.4 ui-monospace,monospace;margin:2px 0">▲ Context / Confirm（人→agent）　　▼ Intent（agent→人）</div>
+
+  <div style="display:flex;gap:10px;align-items:stretch;margin-bottom:6px">
+    <div style="flex:0 0 118px;font:600 11px/1.3 ui-monospace,monospace;color:#94a3b8;padding-top:14px;text-align:right">Agent 运行时</div>
+    <div style="flex:1;background:#0c4a6e;border:1px solid #0ea5e9;border-radius:8px;padding:12px 14px">
+      <div style="color:#e0f2fe;font-weight:600;font-size:13px">dsh（参考实现#1）· 事件→回合→技能→规划→闸门</div>
+      <div style="color:#7dd3fc;font-size:11.5px;margin-top:4px;line-height:1.5">能力发现 <code>describe/actions</code> · 加载业务 skill · 产出 <code>Plan</code>（DAG + 预期 diff）· 经策略闸门后执行</div>
+    </div>
+  </div>
+
+  <div style="text-align:center;color:#475569;font:11px/1.4 ui-monospace,monospace;margin:2px 0">▲ Plan / Audit　　▼ Action 调用（结构化参数，严格 schema 校验）</div>
+
+  <div style="display:flex;gap:10px;align-items:stretch;margin-bottom:6px">
+    <div style="flex:0 0 118px;font:600 11px/1.3 ui-monospace,monospace;color:#94a3b8;padding-top:14px;text-align:right">业务模块</div>
+    <div style="flex:1;background:#14532d;border:1px solid #22c55e;border-radius:8px;padding:12px 14px">
+      <div style="color:#dcfce7;font-weight:600;font-size:13px">可插拔模块（任意语言 / 任意框架）</div>
+      <div style="color:#86efac;font-size:11.5px;margin-top:4px;line-height:1.5">暴露 <code>actions[]</code>（含 risk / 幂等键 / 前置条件 / 补偿）与 <code>events[]</code>；<strong style="color:#dcfce7">自己校验前置条件</strong>，agent 不可绕过</div>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:10px;align-items:stretch;margin-bottom:6px">
+    <div style="flex:0 0 118px;font:600 11px/1.3 ui-monospace,monospace;color:#94a3b8;padding-top:14px;text-align:right">L1 传输</div>
+    <div style="flex:1;background:#1c1917;border:1px solid #57534e;border-radius:8px;padding:10px 14px;display:flex;gap:8px;flex-wrap:wrap">
+      <span style="background:#292524;color:#d6d3d1;font:11px/1 ui-monospace,monospace;padding:6px 9px;border-radius:5px">HTTP/JSON + Webhook 签名</span>
+      <span style="background:#292524;color:#d6d3d1;font:11px/1 ui-monospace,monospace;padding:6px 9px;border-radius:5px">MCP（双向：当客户端也当服务端）</span>
+      <span style="background:#292524;color:#d6d3d1;font:11px/1 ui-monospace,monospace;padding:6px 9px;border-radius:5px">事件信封（不绑 broker）</span>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:10px;align-items:stretch;margin-top:10px">
+    <div style="flex:0 0 118px;font:600 11px/1.3 ui-monospace,monospace;color:#a78bfa;padding-top:12px;text-align:right">横切 · L3+L4</div>
+    <div style="flex:1;background:#2e1065;border:1px solid #a855f7;border-radius:8px;padding:12px 14px">
+      <div style="color:#ede9fe;font-weight:600;font-size:13px">执行语义 + 控制平面（不依赖任何运行时）</div>
+      <div style="color:#c4b5fd;font-size:11.5px;margin-top:4px;line-height:1.5">L3：幂等键 · dry-run · 重试/超时 · saga 补偿 · 审计写入　　L4：模块注册 · 授权矩阵 · 策略分级 · 审批 · 审计查询 · skill 仓库</div>
+    </div>
+  </div>
+
+</div>
+
+<h3 style="margin-top:22px">协议内核：8 类契约（其余全部在协议外）</h3>
+
+<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:8px">
+  <tr style="color:#94a3b8;text-align:left;border-bottom:1px solid #334155">
+    <th style="padding:6px 8px 6px 0">契约</th><th style="padding:6px 8px 6px 0">方向</th><th style="padding:6px 0">不可让步的内容</th>
+  </tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Module Manifest</td><td style="padding:7px 8px 7px 0;color:#94a3b8">模块→系统</td><td style="padding:7px 0;color:#cbd5e1">发现自己：模块 id/版本、actions[]、events[]、支持的协议版本。<code style="color:#7dd3fc">/.well-known/asip</code></td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Action</td><td style="padding:7px 8px 7px 0;color:#94a3b8">agent→模块</td><td style="padding:7px 0;color:#cbd5e1">inputSchema / outputSchema / risk{level,reversible,money} / idempotency{keyFields} / preconditions / compensation</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Domain Event</td><td style="padding:7px 8px 7px 0;color:#94a3b8">模块→agent</td><td style="padding:7px 0;color:#cbd5e1">信封（id/type/subject/occurredAt/causation/correlation）+ 至少一次投递 + 可重放</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Plan</td><td style="padding:7px 8px 7px 0;color:#94a3b8">agent→系统</td><td style="padding:7px 0;color:#cbd5e1">DAG steps + expectedDiff（dry-run 结果）+ 每步幂等键，<strong style="color:#e2e8f0">可被人读懂、可被策略评估、可回放</strong></td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Intent / Context / Confirm</td><td style="padding:7px 8px 7px 0;color:#94a3b8">双向</td><td style="padding:7px 0;color:#cbd5e1">共驾三帧；声明式（open/focus/prefill/highlight/propose），<strong style="color:#e2e8f0">不含 DOM 选择器</strong></td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Grant</td><td style="padding:7px 8px 7px 0;color:#94a3b8">控制平面</td><td style="padding:7px 0;color:#cbd5e1">agent 身份 × 模块 × action 白名单 + 配额；越权必须被<strong style="color:#e2e8f0">模块侧</strong>也拒一次</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Policy</td><td style="padding:7px 8px 7px 0;color:#94a3b8">控制平面</td><td style="padding:7px 0;color:#cbd5e1"><code>risk+context → auto | approve | deny</code>；策略不可被 agent 读取改写，只能被请求评估</td></tr>
+  <tr><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">Audit Event</td><td style="padding:7px 8px 7px 0;color:#94a3b8">系统→存储</td><td style="padding:7px 0;color:#cbd5e1">append-only、不可变、含 inputHash/结果/令牌用量/审批人；<strong style="color:#e2e8f0">模块侧也独立记一份</strong>（对账用）</td></tr>
+</table>
+
+<div style="display:flex;gap:12px;margin-top:18px">
+  <div style="flex:1;background:#0f172a;border-left:3px solid #22c55e;padding:10px 14px;border-radius:4px">
+    <div style="color:#86efac;font-weight:600;font-size:12px">协议内（必须写死）</div>
+    <div style="color:#94a3b8;font-size:11.5px;line-height:1.6;margin-top:4px">JSON 线格式 · 状态机 · 幂等/补偿语义 · 审计必产生 · 版本协商 · 错误码</div>
+  </div>
+  <div style="flex:1;background:#0f172a;border-left:3px solid #f59e0b;padding:10px 14px;border-radius:4px">
+    <div style="color:#fbbf24;font-weight:600;font-size:12px">协议外（永不规定）</div>
+    <div style="color:#94a3b8;font-size:11.5px;line-height:1.6;margin-top:4px">数据库 · 消息中间件 · 鉴权实现 · 前端框架 · 部署形态 · LLM 供应商 · agent 内部规划算法</div>
+  </div>
+</div>
+</div></body></html>

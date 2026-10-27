@@ -1,0 +1,99 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASIP 设计图 · design-2-slice</title><style>
+:root{color-scheme:dark}
+body{margin:0;background:#0b1120;color:#e2e8f0;font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 24px 64px}
+h2{font-size:21px;line-height:1.3;margin:0 0 6px;color:#f1f5f9}
+h3{font-size:15px;margin:22px 0 6px;color:#cbd5e1}
+.subtitle{color:#94a3b8;font-size:13px;margin:0 0 16px}
+code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.92em;color:#7dd3fc}
+.options{display:flex;flex-direction:column;gap:14px}
+.option{display:flex;gap:14px;background:#111827;border:1px solid #1f2937;border-radius:10px;padding:16px}
+.option:hover{border-color:#334155}
+.letter{font-weight:700;color:#38bdf8;font-size:18px;flex:0 0 22px}
+.content{flex:1;min-width:0}
+.pros-cons{display:flex;gap:16px;font-size:12px}
+.pros{flex:1;border-left:3px solid #22c55e;padding-left:10px}
+.cons{flex:1;border-left:3px solid #f59e0b;padding-left:10px}
+.pros h4,.cons h4{margin:0 0 4px;font-size:11px;color:#94a3b8;font-weight:600}
+.pros ul,.cons ul{margin:0;padding-left:16px;color:#cbd5e1;line-height:1.6}
+table{border-collapse:collapse;width:100%}
+th{text-align:left;font-weight:600;color:#94a3b8;border-bottom:1px solid #334155}
+th,td{padding:6px 8px 6px 0;vertical-align:top}
+pre{overflow-x:auto}
+.nav{font-size:12px;color:#64748b;margin-bottom:20px}
+.nav a{color:#7dd3fc;text-decoration:none;margin-right:12px}
+</style></head>
+<body><div class="wrap"><div class="nav"><a href="architecture-approaches.html">架构方案对比</a><a href="design-1-layers.html">1 分层与契约</a><a href="design-2-slice.html">2 纵切面时序</a><a href="design-3-robustness.html">3 健壮性</a></div><h2>纵切面：报价完成 → 扣库存，13 步里 4 个闸门</h2>
+<p class="subtitle">配色：<span style="color:#4ade80">绿=业务模块</span> · <span style="color:#38bdf8">蓝=agent</span> · <span style="color:#c084fc">紫=控制平面/闸门</span> · <span style="color:#fbbf24">橙=人</span>。注意 T2：agent 收到的不是「要执行的动作」，而是「一个事实 + 一个回合」。</p>
+
+<div style="font-size:12.5px;line-height:1.5">
+
+<div style="border-left:3px solid #4ade80;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T0 报价</b>　业务员在页面完成标准件报价（quote-module 内部事务）</div>
+
+<div style="border-left:3px solid #4ade80;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T1 出事件</b>　<code>quote.completed</code> 经 outbox 投递（至少一次 · 可重放 · 带 causation/correlation）</div>
+
+<div style="border-left:3px solid #38bdf8;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T2 开回合</b>　agent 收到事实，<b style="color:#7dd3fc">不是执行 handler</b>：渲染上下文 = 事件 + 该领域 skill 索引 + 可用能力摘要</div>
+
+<div style="border-left:3px solid #38bdf8;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T3 取知识</b>　加载 skill <code>quote-to-fulfillment@1.2</code>：标准件报价完成后须核库存并预留/扣减</div>
+
+<div style="border-left:3px solid #38bdf8;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T4 能力发现</b>　<code>/.well-known/asip</code> 拿到 inventory-module 的 action 清单，<b style="color:#7dd3fc">只为要用的 action 拉完整 schema</b>（省上下文）</div>
+
+<div style="border-left:3px solid #c084fc;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T5 规划</b>　产出 Plan DAG：<code>GetStock</code> → <code>DeductStock(idemKey, compensation=ReleaseStock)</code>，附 <code>expectedDiff: onHand 120→108</code></div>
+
+<div style="border-left:3px solid #4ade80;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T6 dry-run</b>　模块 :dry-run 返回真实预演（无副作用）；模块未实现则 Plan 标注 <code>unverified</code>，自动升级为需审批</div>
+
+<div style="border-left:3px solid #c084fc;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T7 闸门①策略</b>　<code>policy.evaluate(plan)</code> → auto / approve / deny。金额或数量超阈值、或 <code>reversible=false</code> → 转人工</div>
+
+<div style="border-left:3px solid #c084fc;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T8 闸门②授权</b>　grant 矩阵：该 agent 身份是否有 <code>inventory.DeductStock</code> 权限（模块侧还会再拒一次）</div>
+
+<div style="border-left:3px solid #4ade80;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T9-10 幂等执行</b>　按拓扑序执行，每步带幂等键；<b style="color:#86efac">模块自校验前置条件</b>（够不够减是它说了算）→ 落地 → 模块独立写自己的审计 → 发 <code>stock.deducted</code></div>
+
+<div style="border-left:3px solid #c084fc;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T11 审计</b>　写不可变审计事件：planId / stepId / 审批人 / inputHash / 结果 / 令牌用量</div>
+
+<div style="border-left:3px solid #fbbf24;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T12 共驾</b>　Intent 帧 → 前端：<code>open(quote#Q-123)</code> + <code>highlight(库存 −12 · 可撤销)</code>；人点「撤销」→ 生成补偿 Plan 再走一遍闸门</div>
+
+<div style="border-left:3px solid #c084fc;padding:8px 12px;margin:6px 0;background:#0f172a"><b style="color:#e2e8f0">T13 对账</b>　审计里的「声称 diff」vs 模块终态，日切比对；不一致即告警</div>
+
+</div>
+
+<h3 style="margin-top:24px">失败路径才是重点：错误分类决定 agent 能不能自救</h3>
+<p class="subtitle">规范必须定义错误分类，否则"AI 驱动"会退化成"抛异常给人"。</p>
+
+<table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:6px">
+  <tr style="color:#94a3b8;text-align:left;border-bottom:1px solid #334155">
+    <th style="padding:6px 8px 6px 0">错误类</th><th style="padding:6px 8px 6px 0">例子</th><th style="padding:6px 8px 6px 0">agent 该做什么</th><th style="padding:6px 0">可否重试</th>
+  </tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#7dd3fc;font-family:ui-monospace">retryable</td><td style="padding:7px 8px 7px 0;color:#cbd5e1">网络抖动 / 限流 / 超时</td><td style="padding:7px 8px 7px 0;color:#cbd5e1">按退避策略自动重试，幂等键不变</td><td style="padding:7px 0;color:#4ade80">是</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#fbbf24;font-family:ui-monospace">business_rejection</td><td style="padding:7px 8px 7px 0;color:#cbd5e1">库存不足 / 单据状态变了</td><td style="padding:7px 8px 7px 0;color:#cbd5e1"><b style="color:#e2e8f0">重新规划</b>：改预留、拆单、通知采购；拿不准就问人</td><td style="padding:7px 0;color:#f87171">否</td></tr>
+  <tr style="border-bottom:1px solid #1e293b"><td style="padding:7px 8px 7px 0;color:#a855f7;font-family:ui-monospace">policy_denied</td><td style="padding:7px 8px 7px 0;color:#cbd5e1">超授权 / 超阈值 / 策略拒绝</td><td style="padding:7px 8px 7px 0;color:#cbd5e1">终止并转人工，<b style="color:#e2e8f0">不得换条路绕过</b></td><td style="padding:7px 0;color:#f87171">否</td></tr>
+  <tr><td style="padding:7px 8px 7px 0;color:#f87171;font-family:ui-monospace">contract_violation</td><td style="padding:7px 8px 7px 0;color:#cbd5e1">schema 不符 / 未知 action</td><td style="padding:7px 8px 7px 0;color:#cbd5e1">进死信队列 + 审计告警，这是接入方或协议 bug</td><td style="padding:7px 0;color:#f87171">否</td></tr>
+</table>
+
+<h3 style="margin-top:24px">模块要接进来，最少只做这些</h3>
+<div style="display:flex;gap:12px;margin-top:8px">
+  <div style="flex:1;background:#0f172a;border:1px solid #22c55e;border-radius:8px;padding:12px">
+    <div style="color:#86efac;font-weight:600;font-size:12px">HTTP 侧车（任意语言 · 6 个端点）</div>
+    <pre style="font:10.5px/1.6 ui-monospace,monospace;color:#cbd5e1;margin:8px 0 0;white-space:pre-wrap">GET  /.well-known/asip            → manifest
+GET  /asip/actions/{id}           → schema + risk
+POST /asip/actions/{id}           → 执行（Idempotency-Key）
+POST /asip/actions/{id}:dry-run   → 预演（可选但强烈建议）
+POST /asip/events                 → agent 收事件（Webhook 签名）
+GET  /asip/events?since=cursor    → 补课/重放</pre>
+  </div>
+  <div style="flex:1;background:#0f172a;border:1px solid #0ea5e9;border-radius:8px;padding:12px">
+    <div style="color:#7dd3fc;font-weight:600;font-size:12px">dsh 原生（TS · 参考实现#1）</div>
+    <pre style="font:10.5px/1.6 ui-monospace,monospace;color:#cbd5e1;margin:8px 0 0;white-space:pre-wrap">export const mod = defineModule({
+  id: 'inventory',
+  actions: [deductStock, releaseStock],
+  events:  ['stock.deducted'],
+})
+ctx.plugin(asipModuleHost, mod)
+// 自动挂成 dsh tool + 事件订阅 + 审计
+// HMR 热插拔，不重启</pre>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:14px">前端同理由：共驾 SDK 只认三帧（Intent / Context / Confirm），走 WebSocket，REST 轮询可降级。React / Vue / 原生 / 甚至终端界面都能接。</p>
+</div></body></html>

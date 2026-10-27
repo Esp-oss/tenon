@@ -1,0 +1,120 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ASIP 设计图 · architecture-approaches</title><style>
+:root{color-scheme:dark}
+body{margin:0;background:#0b1120;color:#e2e8f0;font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1000px;margin:0 auto;padding:32px 24px 64px}
+h2{font-size:21px;line-height:1.3;margin:0 0 6px;color:#f1f5f9}
+h3{font-size:15px;margin:22px 0 6px;color:#cbd5e1}
+.subtitle{color:#94a3b8;font-size:13px;margin:0 0 16px}
+code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.92em;color:#7dd3fc}
+.options{display:flex;flex-direction:column;gap:14px}
+.option{display:flex;gap:14px;background:#111827;border:1px solid #1f2937;border-radius:10px;padding:16px}
+.option:hover{border-color:#334155}
+.letter{font-weight:700;color:#38bdf8;font-size:18px;flex:0 0 22px}
+.content{flex:1;min-width:0}
+.pros-cons{display:flex;gap:16px;font-size:12px}
+.pros{flex:1;border-left:3px solid #22c55e;padding-left:10px}
+.cons{flex:1;border-left:3px solid #f59e0b;padding-left:10px}
+.pros h4,.cons h4{margin:0 0 4px;font-size:11px;color:#94a3b8;font-weight:600}
+.pros ul,.cons ul{margin:0;padding-left:16px;color:#cbd5e1;line-height:1.6}
+table{border-collapse:collapse;width:100%}
+th{text-align:left;font-weight:600;color:#94a3b8;border-bottom:1px solid #334155}
+th,td{padding:6px 8px 6px 0;vertical-align:top}
+pre{overflow-x:auto}
+.nav{font-size:12px;color:#64748b;margin-bottom:20px}
+.nav a{color:#7dd3fc;text-decoration:none;margin-right:12px}
+</style></head>
+<body><div class="wrap"><div class="nav"><a href="architecture-approaches.html">架构方案对比</a><a href="design-1-layers.html">1 分层与契约</a><a href="design-2-slice.html">2 纵切面时序</a><a href="design-3-robustness.html">3 健壮性</a></div><h2>三条候选架构：协议住在哪一层？</h2>
+<p class="subtitle">三条都满足「模块可插拔 + AI 驱动」，差别在**协议与运行时的绑定关系**——这决定了兼容性和健壮性的上限。点击选一条。</p>
+
+<div class="options">
+
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>协议网关中心（Gateway-centric）</h3>
+      <pre style="font-size:10.5px;line-height:1.35;overflow-x:auto;background:#0d1117;color:#c9d1d9;padding:10px;border-radius:6px;margin:8px 0">
+ [业务事件]   [HTTP/Webhook]   [MCP]
+     ↘             ↓            ↙
+   ┌────────────────────────────────┐
+   │  Protocol Gateway  (语言无关)   │  ← 独立部署的进程
+   │  registry · 授权矩阵 · 策略      │
+   │  approval · audit · 幂等/对账    │
+   └───────────────┬────────────────┘
+                   │ 结构化 tool 调用
+          ┌────────▼────────┐
+          │  dsh Agent 内核  │
+          └────────┬────────┘
+                   │ HTTP
+        ┌──────────▼──────────┐
+        │ 业务模块（任意语言）  │
+        └─────────────────────┘
+      </pre>
+      <p><strong>协议住在网关里</strong>：模块只认网关，网关把能力喂给 agent。治理与协议同址，天然可独立部署、可被非 dsh 的 agent 复用。</p>
+      <div class="pros-cons" style="margin-top:6px">
+        <div class="pros"><h4>换来</h4><ul><li>协议边界最清晰，非 TS 系统只对接一个 HTTP 面</li><li>治理可脱离 dsh 独立演进</li></ul></div>
+        <div class="cons"><h4>代价</h4><ul><li>多一跳；网关与 dsh 插件树两套状态</li><li>治理逻辑容易两边都写一半</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>dsh 原生插件树（Everything is a plugin）</h3>
+      <pre style="font-size:10.5px;line-height:1.35;overflow-x:auto;background:#0d1117;color:#c9d1d9;padding:10px;border-radius:6px;margin:8px 0">
+ [业务事件]  [HTTP]  [MCP]     ← 每个入口都是一个 cordis 插件
+     ↘         ↓       ↙
+   ┌──────────────────────────────┐
+   │      cordis 插件树（单进程）   │
+   │  module-adapter  governance   │
+   │  skill           intent-ui     │
+   │  policy          audit         │
+   └───────────────┬──────────────┘
+                   │ sidecar
+        ┌──────────▼──────────┐
+        │ 非 TS 业务系统        │
+        └─────────────────────┘
+      </pre>
+      <p><strong>协议 = 插件间 service 契约</strong>。最贴合「万物即插件」：零胶水、HMR 热插拔、直接复用 dsh 的 skill / token-meter / otel / session 审计。</p>
+      <div class="pros-cons" style="margin-top:6px">
+        <div class="pros"><h4>换来</h4><ul><li>最少的自研代码，最快跑通纵切面</li><li>复用 dsh 全部治理原语</li></ul></div>
+        <div class="cons"><h4>代价</h4><ul><li>规范会渗进 dsh 细节，「别人只按协议接入」变得困难</li><li>单进程心智：dsh 是单点，跨主机扩展弱</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>协议内核 + 多运行时（Spec-core，Recommended）</h3>
+      <pre style="font-size:10.5px;line-height:1.35;overflow-x:auto;background:#0d1117;color:#c9d1d9;padding:10px;border-radius:6px;margin:8px 0">
+ ┌───────────────────────────────────────────────┐
+ │ 协议内核（与运行时无关的契约 + 一致性测试套件）  │
+ │  Action · Event · Intent/Confirm · Audit       │
+ │  Approval · Policy · Idempotency               │
+ └───────────────────────────────────────────────┘
+        ▲              ▲               ▲
+        │实现#1        │实现#2         │实现#3
+ ┌──────┴─────┐ ┌──────┴──────┐ ┌──────┴───────┐
+ │ dsh 原生    │ │ HTTP sidecar │ │ 第三方运行时  │
+ │ cordis 插件 │ │ SDK(任意语言)│ │ 只需过一致性  │
+ └──────┬─────┘ └──────┬──────┘ └──────────────┘
+        └───────┬──────┘
+        业务模块（任意语言/框架）
+
+ 控制平面（registry｜授权矩阵｜策略｜审计｜skill）不依赖任何运行时
+      </pre>
+      <p><strong>协议住在规范里，dsh 只是第一个宿主</strong>。A 与 B 都是它的两个剖面：B = 参考实现#1，A = 参考实现#2 的网关形态。规范每条都配可执行一致性测试。</p>
+      <div class="pros-cons" style="margin-top:6px">
+        <div class="pros"><h4>换来</h4><ul><li>兼容性最高：任何语言/框架只按契约实现即可接入</li><li>健壮性可度量：一致性测试是机械门禁，不靠自觉</li><li>控制平面与数据平面分离，审计/策略不会散落在业务里</li></ul></div>
+        <div class="cons"><h4>代价</h4><ul><li>抽象成本最高，必须先死守「协议内 / 协议外」的边界</li><li>写得松就成了空泛标准 —— 必须用测试套件兜住</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<p class="subtitle" style="margin-top:18px">我的建议：<strong>C 为终态</strong>，落地顺序是 B（先用 dsh 插件跑通「报价→扣库存」纵切面）→ 抽出一致性测试套件 → 补 A 的跨语言网关。这样第一周就有能跑的东西，协议也不会长成 dsh 的方言。</p>
+</div></body></html>
