@@ -20,6 +20,10 @@
 git worktree add ../dsh_for_sys-p1 -b feat/p1-host-inbound
 ```
 
+**已落地（Task 1 完成，commit `de45903`）**：`Queue` 端口与 `memoryQueue` 已在 `internal/controlplane/queue.go`，出站四个调用点已改为导出方法。后续任务在此基础上继续，**不要重复创建 `queue.go`**。
+
+**已知限制（P1 不解决，记录在案）**：`Queue` 是导出接口，但签名里带未导出类型 `queuedFrame`，两个构造函数也未导出——包外无法实现或构造它，只能经 `Config.InboundDir` 间接装配。spec §8 把 Queue 定义为「内部接口」，所以本轮不修；将来要支持从 `cmd/host` 注入自定义队列实现时，需要同时导出行类型与构造函数。
+
 **本计划刻意包含一处受控重构**：把现有 `intentQueue` 提取成 `Queue` 端口的 `memoryQueue` 实现。出站行为**不变**，靠既有的 `TestIntentsRESTRoundTrip` / `TestIntentsRejectsBadFrame` 当安全网。不做这个提取，就要复制约 70 行队列代码，两份迟早漂移。
 
 **一处与 spec 的时序偏差（已获准，记录在案）**：spec §3.11 要求 `policies:evaluate` 的 `triggerEventId` 必填、缺失即 `deny`。但现有 `cmd/agent` 还不发这个字段，P1 若立刻强制会导致整个 agent 停摆（P2 才改 agent）。因此 P1 引入过渡开关：
@@ -134,14 +138,18 @@ func (q *memoryQueue) Since(after int64) ([]queuedFrame, int64, int64) {
 func (q *memoryQueue) Ack(upto int64) int64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	cut := 0
-	for cut < len(q.frames) && q.frames[cut].Seq <= upto {
-		cut++
+	// 裁剪到已分配的最大序号：upto 超过 highest 时不能回一个不存在的序号，
+	// 否则对外契约（acked 永远是真实确认到的位置）会被打破。
+	if upto > q.seq {
+		upto = q.seq
 	}
-	if cut == 0 {
-		return 0
+	kept := make([]queuedFrame, 0, len(q.frames))
+	for _, f := range q.frames {
+		if f.Seq > upto {
+			kept = append(kept, f)
+		}
 	}
-	q.frames = append(q.frames[:0:0], q.frames[cut:]...)
+	q.frames = kept
 	return upto
 }
 
@@ -323,7 +331,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -425,6 +433,8 @@ func (q *jsonlQueue) Push(frame json.RawMessage) int64 {
 	for len(q.frames) > q.capacity {
 		q.frames = q.frames[1:]
 		q.dropped++
+		// 入站丢的是「用户说过的话」，与出站丢界面提示不是一个量级的事：必须留痕（spec §7）。
+		log.Printf("controlplane: 入站队列已满（容量 %d），丢弃最旧一帧，累计 %d", q.capacity, q.dropped)
 	}
 	// 落盘失败不吞：调用方（POST 处理器）应当据此回 500，而不是假装入队成功。
 	if err := q.rewrite(); err != nil {
@@ -451,14 +461,18 @@ func (q *jsonlQueue) Since(after int64) ([]queuedFrame, int64, int64) {
 func (q *jsonlQueue) Ack(upto int64) int64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	cut := 0
-	for cut < len(q.frames) && q.frames[cut].Seq <= upto {
-		cut++
+	// 与 memoryQueue 保持同一契约：裁剪到已分配的最大序号，永远返回真实确认位置。
+	// 两个实现的行为一旦分叉，同一段客户端代码在「落盘/内存」两种配置下就会拿到不同结果。
+	if upto > q.seq {
+		upto = q.seq
 	}
-	if cut == 0 {
-		return 0
+	kept := make([]queuedFrame, 0, len(q.frames))
+	for _, rec := range q.frames {
+		if rec.Seq > upto {
+			kept = append(kept, rec)
+		}
 	}
-	q.frames = append(q.frames[:0:0], q.frames[cut:]...)
+	q.frames = kept
 	if err := q.rewrite(); err != nil {
 		q.broken = err
 	}
@@ -485,7 +499,7 @@ func (q *jsonlQueue) Close() error {
 	broken error
 ```
 
-并删掉文件里未用的 `io` import。
+**两处易漏（Task 1 的 subagent 已提醒）**：① 结构体里必须真的加上 `broken error` 字段，否则 `Push`/`Ack`/`Close` 三处编译不过；② import 必须是上面列的那 7 个——**没有 `io`**（计划早期版本写过，已删），多了 `log`。
 
 - [ ] **Step 4: 跑测试至全绿**
 
@@ -1301,7 +1315,7 @@ func newID(prefix string) string {
 	if strings.TrimSpace(dir) == "" {
 		dir = defaultInboundDir
 	}
-	inboundQueue, err := newJSONLQueue(filepath.Join(dir, "requests.jsonl"), maxIntentFrames)
+	inboundQueue, err := newJSONLQueue(filepath.Join(dir, "requests.jsonl"), maxInboundFrames)
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -1319,6 +1333,9 @@ func newID(prefix string) string {
 ```go
 	// defaultInboundDir 是入站队列与 origin 登记表的缺省目录。
 	defaultInboundDir = "out/inbound"
+	// maxInboundFrames 是入站队列容量。**独立于 maxIntentFrames**：后者是出站内存队列
+	// 的容量语义，给「人说过的话」复用它，会让两件事的理由互相矛盾。
+	maxInboundFrames = 1024
 ```
 
 `ServeHTTP` 增三个 case：
