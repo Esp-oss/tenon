@@ -129,7 +129,7 @@ tools/lint/       C10 反模式扫描器（Go）
 internal/         协议实现对外的全部内核：protocol / spec / module / controlplane / llm / agent / d1
 cmd/              host（控制平面）、agent（AI 运行时）、quote / inventory / procurement（模块）、tenon（工具）
 skills/           业务流程知识：每个子目录一份 SKILL.md（订阅声明 + 业务语义正文）
-packages/         @tenon/core 类型 + dsh 插件（TypeScript，M1 的进程内路径，本轮未接）
+packages/         @tenon/core（协议类型与工具，TS）。dsh 插件的职责边界见 docs/designs/dsh-adapter-boundaries/（占位包已按 ADR-0001 删除）
 demo/mini-erp/    demo 的场景说明与 D1 期望形态
 docs/             设计文档、接口文档与架构图
 ```
