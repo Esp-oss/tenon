@@ -543,9 +543,10 @@ func (r *runner) manifestActions(ctx context.Context, baseURL string) ([]string,
 	}
 	var manifest struct {
 		Actions []struct {
-			ID              string `json:"id"`
-			Title           string `json:"title"`
-			SummaryTemplate string `json:"summaryTemplate"`
+			ID              string   `json:"id"`
+			Title           string   `json:"title"`
+			SummaryTemplate string   `json:"summaryTemplate"`
+			RequiredArgs    []string `json:"requiredArgs"`
 		} `json:"actions"`
 	}
 	if err := json.Unmarshal(raw, &manifest); err != nil {
@@ -559,7 +560,7 @@ func (r *runner) manifestActions(ctx context.Context, baseURL string) ([]string,
 			continue
 		}
 		ids = append(ids, id)
-		meta[id] = ActionMeta{Title: a.Title, SummaryTemplate: a.SummaryTemplate}
+		meta[id] = ActionMeta{Title: a.Title, SummaryTemplate: a.SummaryTemplate, RequiredArgs: a.RequiredArgs}
 	}
 	return ids, meta, nil
 }

@@ -385,3 +385,32 @@ func TestPromptStatesExpectedDiffShape(t *testing.T) {
 		}
 	}
 }
+
+// 规划 prompt 必须给出「这个动作要什么字段」：2026-10-27 真模型就漏了 referenceNo，
+// 预演直接 400。标题也一并给——只给 id 时模型无法判断语义。
+func TestPromptRendersActionTitleAndRequiredArgs(t *testing.T) {
+	in := PlanInput{
+		Event: DomainEvent{EventID: "evt_1", Type: "quote.completed", CorrelationID: "cor:quote/Q-1"},
+		Modules: []ModuleDigest{{
+			ID:      "inventory",
+			Actions: []string{"inventory.DeductStock"},
+			ActionMeta: map[string]ActionMeta{
+				"inventory.DeductStock": {Title: "扣减库存", RequiredArgs: []string{"sku", "qty", "referenceNo"}},
+			},
+		}},
+	}
+	got := userPrompt(in)
+	want := "    - inventory.DeductStock（扣减库存；必填：qty, referenceNo, sku）"
+	if !strings.Contains(got, want) {
+		t.Fatalf("prompt 缺动作元信息，期望包含 %q，实际：\n%s", want, got)
+	}
+
+	// 老模块只有 id（没有 ActionMeta）：仍然只渲染 id，不得出现空的括号。
+	bare := userPrompt(PlanInput{
+		Event:   DomainEvent{EventID: "evt_1", Type: "quote.completed", CorrelationID: "cor:quote/Q-1"},
+		Modules: []ModuleDigest{{ID: "inventory", Actions: []string{"inventory.GetStock"}}},
+	})
+	if !strings.Contains(bare, "    - inventory.GetStock\n") {
+		t.Fatalf("无元信息时应只渲染 id：\n%s", bare)
+	}
+}

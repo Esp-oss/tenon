@@ -144,6 +144,8 @@ type fakeModule struct {
 	Actions  []string
 	// Templates 是 action id → 人话模板；空表示该动作没声明（渲染侧走 R2）。
 	Templates map[string]string
+	// Meta 是 action id → manifest 里的额外键（当前用于 requiredArgs）。
+	Meta map[string]map[string]any
 
 	DryRunStatus  string // 默认 verified
 	DryRunMissing bool   // 声明「不支持预演」：回 404 空体
@@ -180,6 +182,9 @@ func (m *fakeModule) serve(w http.ResponseWriter, r *http.Request) {
 			item := map[string]any{"id": id, "version": "0.1.0", "title": id, "kind": "write"}
 			if tpl, ok := m.Templates[id]; ok {
 				item["summaryTemplate"] = tpl
+			}
+			for k, v := range m.Meta[id] {
+				item[k] = v
 			}
 			actions = append(actions, item)
 		}
@@ -1167,5 +1172,23 @@ func TestBuildPendingRendersPlainLanguage(t *testing.T) {
 	}
 	if got.Summary != got.Labels[0] {
 		t.Fatalf("单步计划的 summary 应等于该步白话：%q", got.Summary)
+	}
+}
+
+// 发现结果必须带上 requiredArgs：它是 prompt 渲染必填字段的唯一来源。
+func TestDiscoverCarriesRequiredArgs(t *testing.T) {
+	mod := newFakeModule(t, "inventory", []string{"inventory.DeductStock"}, new([]string))
+	mod.Meta = map[string]map[string]any{
+		"inventory.DeductStock": {"requiredArgs": []string{"sku", "qty"}},
+	}
+	r := newRunnerForDiscover(t, mod.Server.URL)
+
+	got, err := r.discover(context.Background())
+	if err != nil {
+		t.Fatalf("能力发现失败：%v", err)
+	}
+	meta := got[0].ActionMeta["inventory.DeductStock"]
+	if len(meta.RequiredArgs) != 2 || meta.RequiredArgs[0] != "sku" {
+		t.Fatalf("requiredArgs 没带回来：%+v", meta)
 	}
 }
