@@ -1,6 +1,6 @@
 # M1 切片 1 设计：对话入口（共驾对话框 + 审批落地）
 
-- 状态：**待评审**（已过四轮：初版自查 → 重审更正 3 处错误 → 架构对照补 I7 → 规则来源分层与作用域；变更记录见 §11）
+- 状态：**已定稿**（四轮修订：初版自查 → 重审更正 3 处错误 → 架构对照补 I7 → 规则分层与作用域；变更记录见 §11）
 - 日期：2026-10-27
 - 关系：是 [`2026-10-27-tenon-ai-driven-system-design.md`](2026-10-27-tenon-ai-driven-system-design.md) 的增量；同时是 [`2026-10-27-tenon-m05-host-agent-design.md`](2026-10-27-tenon-m05-host-agent-design.md) §0 非目标里「前端共驾页面」的落地切片，并把该文档 §5「`approve` 一律转人工」这条死路打开。
 - 前置：M0.5 三进程已落地（`cmd/host` 8080 / `cmd/agent` / `cmd/quote` 8083 / `cmd/inventory` 8081 / `cmd/procurement` 8082）。
@@ -106,6 +106,7 @@ flowchart TB
 | I5 | host 公告板可丢、可重建；丢它不影响正确性 | 公告板是 read-model，不是权威状态 |
 | I6 | 单 host、单 agent 实例 | 审计链单写者（`audit.go:94`）、库存是进程内内存 |
 | **I7** | **挂起的两次落盘有序且可校验**：先写 pending（含 `dispatchedAuditId` 占位，fsync）→ 再写 `dispatched` 审计 → 回写 pending 标记「审计已落」；**恢复的前置条件是审计链上能查到该 `dispatchedAuditId`**，查不到则不执行并记 `contract_violation` | 一次挂起有两次落盘（pending 文件 + dispatched 审计），它们没有共同事务。先审计后 pending：崩溃留下「有 dispatched 没 result」的孤儿，对账会当成未完成调用；先 pending 后审计：崩溃后若直接执行，就违反「dispatched 先落盘才允许执行」这条铁律 |
+| **I8** | **`origin` 登记表独立持久化，重启不丢** | 登记表若随内存队列消失，host 重启后未完成的 request 会被判成 `event` → 自动通过，审批被静默绕过。见 §3.11 |
 
 **I7 的三种崩溃位置与恢复行为**
 
@@ -272,10 +273,10 @@ flowchart TB
 
 | 情形 | 行为 |
 |---|---|
-| `approval.json` 解析失败 | 该 skill 的规则**整份丢弃** + host 启动告警；该 skill 涉及的动作落回「无命中 → `deny`」（**不是** `auto`） |
-| 规则引用的 `arg.*` 路径在 inputSchema 里不存在 | 同上（整份丢弃），见 §3.10 |
+| `approval.json` 解析失败 | 该 skill 的规则**整份丢弃** + host 启动告警；**该 skill 的规则全部不生效**，处置只由平台级规则决定；平台级也无命中才 `deny`（**不是** `auto`） |
+| 规则引用的 `arg.*` 路径在 inputSchema 里不存在 | 同上（整份丢弃，处置退到平台级规则），见 §3.10 |
 | 文件不存在 | 不是错误：该 skill 只是没有业务级规则 |
-| 两个 skill 都声明了同一动作的规则 | 进同一规则池，按 `priority` 与 `outcome` 合并（现有语义），不做文件级覆盖 |
+| 两个 skill 都声明了同一动作的规则 | 进同一规则池，按 `outcome` 强弱合并、同 outcome 内按 `priority` 取最优先（现有语义），不做文件级覆盖 |
 
 **改规则的生效方式**：本切片**不做热加载**——改 `approval.json` 需重启 host。理由见 §14（避免为"改一个数字"引入文件监听与部分生效状态）。
 
@@ -335,13 +336,23 @@ flowchart TB
 
 一个字母的笔误就能把「大额要批」变成「大额自动过」。所以路径校验是 fail-closed 的一部分，不是锦上添花。校验失败按 §3.8 的表整份丢弃。
 
+**校验时机：加载期（选定）**
+
+| 选项 | 结论 |
+|---|---|
+| **加载期** | host 启动加载 `approval.json` 时，按 action id 拉 `GET /tenon/actions/{id}` 校验每条 `arg.*` 路径；模块离线 → **该业务规则不生效 + 告警**，处置退到平台级规则。可接受，因为模块离线时它的动作本来也调不到 |
+| 求值期惰性 | 首次调用才暴露错误，可能已经上生产 → 不选 |
+| 不校验、只限制语法 | **不成立**：`{"not":{"all":[{"arg.amout":…}]}}` 同样倒向 `auto`，光禁 `not` 包叶子解决不了 |
+
+补充：`TENON_STRICT_RULES=1` 时改为**启动失败**（CI 与生产推荐），默认是「告警 + 该 skill 规则不生效」。
+
 ### 3.11 来源判定（`origin`）进策略，且不可由 agent 自报
 
 需求：**对话发起的动作一律要人按**（人说的话是*意图*，不是*授权*——他说的"缺的发起采购"，并不等于"开一张 9 件的采购单"）；事件驱动则按金额/风险自动判定。两条轴合并取更严。
 
 实现（`origin` 必须是可信输入，不能是 agent 的一句话）：
 
-1. `POST /tenon/requests` 收到 request 时，host **签发** `requestId` 与合成 `eventId`（`evt_` + ULID），登记 `syntheticEventId → {origin:"request", by, at}`；登记表与入站队列同生命周期、同目录。
+1. `POST /tenon/requests` 收到 request 时，host **签发** `requestId` 与合成 `eventId`（`evt_` + ULID），登记 `syntheticEventId → {origin:"request", by, at}`，**登记表独立持久化**（`requests-index.jsonl`，与队列同目录但**不依赖队列实现**）。若跟着 `TENON_QUEUE=memory` 一起丢，host 重启后未完成的 request 会被判成 `event` → **直接自动通过，审批被绕过**。见不变量 I8。
 2. `GET /tenon/requests/poll` 把这两个 id 随帧返回；agent **必须**沿用，不得自行生成（初版 spec 让 agent 自己造 id，那等于让它决定自己要不要被审）。
 3. `policies:evaluate` 请求增 `planId` + `triggerEventId`（**必填**）。host 查登记表：命中 → `origin="request"`；未命中 → `origin="event"`。
 4. host 把 `origin` 塞进策略求值输入；`PolicyRequest` 与 `policy.schema.json` 增 `origin`（枚举 `request` / `event`）。**agent 传入的任何 origin 字段一律忽略。**
@@ -556,6 +567,8 @@ type Queue interface {
 | 白话渲染 | 模板占位符取值；缺模板退回 title；含数字的 `rationale` 被丢弃；120 字符截断 | ✅ |
 | 请求回合的触发源 | `trigger.eventId` 匹配 `^evt_`；`correlationId` 匹配 `^cor:`（有 view / 无 view 两条路径）；Plan 能通过 `plan.schema.json` 校验；**合成 id 必须来自 host 签发**（agent 自造的 id 不被登记） | ✅ |
 | `origin` 判定 | 登记的合成 id → `request`；未登记 → `event`；**缺 `triggerEventId` → deny**；agent 传入的 origin 被忽略 | ✅ |
+| `origin` 登记表重启（I8） | 重启 host 后，未完成 request 仍判 `request`（不是 `event`）；`TENON_QUEUE=memory` 下同样成立 | ✅ |
+| 规则加载失败降级 | `approval.json` 损坏 → 该 skill 规则不生效、告警；**平台级规则仍生效**；两者都无命中才 deny | ✅ |
 | 业务级规则加载 | `approval.json` 与平台规则同池合并取更严；解析失败 → 整份丢弃且该动作落回 deny（**不是 auto**）；文件不存在不报错 | ✅ |
 | 规则路径校验 | `arg.<不存在>` 在加载期被拒；`not` 包一个笔误路径（`arg.amout`）必须被拒，不得被静默放行成 auto | ✅ |
 | 规则集 golden | 表驱动 `(action, args, risk, origin) → 期望处置`；改阈值后 diff 在 review 里可见 | ✅ |
@@ -616,6 +629,8 @@ type Queue interface {
 | §3.7.1 | 未定义批准人 ≠ 发起人时 grant 按谁算，实现者容易让「主管权限更大」生效 | 写死 **授权仍按发起人评估，批准人不扩大权限**；并区分 `requiredRoles`（能否按按钮）与 grant（这步合不合法） |
 | §4.3 / §4.4 | ① 执行完删 pending 会抹掉完整 plan 的唯一副本；② 初版倾向新增结局态，与 `run.go:74`「三态封闭」冲突；③ 未处理「挂不挂前端会改变 D1 结局」 | ① pending 归档到 `archived/`；② `RunResult` 加 `pendingPlanId` 而非新增态；③ D1 运行时关闭入站通道 |
 | §3.8–§3.11 | 初版把规则全放平台 `config/`，等于每接一个系统就要工程师加规则（"每系统适配"的真正来源）；且未定义「同一数值在不同业务流程阈值不同」怎么表达、`origin` 谁来判定 | 规则分层（平台/业务/模块）+ 流程标识走 `args` 业务字段 + `origin` 由 host 签发登记后判定 + 加载期路径校验 |
+
+**一处必须交代的引擎改动（别被 §3.8 的"零改动"误导）**：§3.8 说的"引擎不需要改动"指的是**业务字段**——`arg.pressure_kpa` 与 `arg.amount` 共存，平台不需要为任何字段做适配。但 §3.11 的 `origin` 是**平台级维度**，它需要一处引擎小改：`parsePath` 的路径前缀从 `arg` / `risk` 扩为 `arg` / `risk` / `origin`（其中 `origin` 为单段路径，不带 `.`），`policy.go:546` 现在是硬编码两个前缀，另需补表驱动测试。这是本切片唯一的策略引擎代码改动。
 
 **三条被改动但未在初版记明的架构性质**（本切片的代价，写在这里以免被当成免费午餐）：
 
