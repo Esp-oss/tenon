@@ -1,9 +1,10 @@
 # M1 切片 1 设计：对话入口（共驾对话框 + 审批落地）
 
-- 状态：**待评审**
+- 状态：**待评审**（已过两轮自查：初版自查 → 重审更正 3 处错误 → 架构对照补充 I7 与 4 处性质级修订；见 §11）
 - 日期：2026-10-27
 - 关系：是 [`2026-10-27-tenon-ai-driven-system-design.md`](2026-10-27-tenon-ai-driven-system-design.md) 的增量；同时是 [`2026-10-27-tenon-m05-host-agent-design.md`](2026-10-27-tenon-m05-host-agent-design.md) §0 非目标里「前端共驾页面」的落地切片，并把该文档 §5「`approve` 一律转人工」这条死路打开。
 - 前置：M0.5 三进程已落地（`cmd/host` 8080 / `cmd/agent` / `cmd/quote` 8083 / `cmd/inventory` 8081 / `cmd/procurement` 8082）。
+- 阅读顺序建议：§1 事实基线（现状怎么坏）→ §2 架构与不变量（I1–I7）→ §3 契约增量 → §11 三张「改了什么」表（含本切片的代价）。
 
 ---
 
@@ -102,6 +103,16 @@ flowchart TB
 | I4 | 恢复执行前必须重跑 G4 前置条件 | 审批窗口内库存可能被别人改（TOCTOU） |
 | I5 | host 公告板可丢、可重建；丢它不影响正确性 | 公告板是 read-model，不是权威状态 |
 | I6 | 单 host、单 agent 实例 | 审计链单写者（`audit.go:94`）、库存是进程内内存 |
+| **I7** | **挂起的两次落盘有序且可校验**：先写 pending（含 `dispatchedAuditId` 占位，fsync）→ 再写 `dispatched` 审计 → 回写 pending 标记「审计已落」；**恢复的前置条件是审计链上能查到该 `dispatchedAuditId`**，查不到则不执行并记 `contract_violation` | 一次挂起有两次落盘（pending 文件 + dispatched 审计），它们没有共同事务。先审计后 pending：崩溃留下「有 dispatched 没 result」的孤儿，对账会当成未完成调用；先 pending 后审计：崩溃后若直接执行，就违反「dispatched 先落盘才允许执行」这条铁律 |
+
+**I7 的三种崩溃位置与恢复行为**
+
+| 崩溃在 | 盘上状态 | 恢复时怎么判 |
+|---|---|---|
+| pending 写完前 | 什么都没有 | 无事可恢复；request 仍在入站队列，重开回合 |
+| pending 写后、dispatched 前 | pending 在，`dispatchedAuditId` 指向的记录不存在 | **不执行**，记 `contract_violation`，pending 移入 `archived/`（标 `stale`），发 Intent 帧说明 |
+| dispatched 后、标记前 | 两者都在，pending 未标「审计已落」 | 校验审计链存在该 id → 补标记 → 正常等审批；若已过期则走 I3 |
+
 
 ---
 
@@ -168,6 +179,8 @@ flowchart TB
 
 约束：host 对 pending **不做任何执行或授权决定**。`GET` 里的 `mine` 只用于页面显示，不构成授权。
 
+**I5 的重建机制（初版只写了「可重建」，没写怎么重建——等于空话）**：`POST /tenon/pending` 是**幂等 upsert**（同 `planId` 覆盖，不追加）；agent 在启动时与**每个 tick**都对现存 pending 重推一次摘要。host 重启丢公告板后，最多一个 tick 周期内自愈。重推是廉价操作（pending 数量是个位数），不设增量协议。
+
 **校验分工（避免两处真相）**：host 在 `POST /tenon/requests` 收 confirm 时做**fail-fast 预检**——用公告板里的摘要查 `requiredRoles` 与 `expiresAt`，明显非法就立刻 `403`/`409` 且不入队，让业务员马上得到反馈；**权威校验仍在 agent 恢复时重做一遍**。host 预检偏严格或偏宽松都安全：宽松则 agent 兜底拒，严格则提前拒；agent 的判定永远是最终的那个。
 
 ### 3.6 审计语义（不新增 stage）
@@ -193,6 +206,22 @@ flowchart TB
 
 > **诚实边界**：这是开发态身份，不是真认证——无口令强度策略、无失败锁定、无 token 吊销、无 SSO。它挡住的是「冒充别人批准」，挡不住「拿到口令的人」。文件名与响应字段都带 `dev`，README 必须原样写这句。
 
+### 3.7.1 三个身份与「批准人不扩大权限」（重审补充）
+
+引入 confirm 之后，一次执行牵涉三个身份，必须分清：
+
+| 身份 | 落在哪 | 作用 |
+|---|---|---|
+| agent 自身 | 审计 `actor.id` | 谁执行的 |
+| 发起人（`onBehalfOf`） | 审计 `actor.onBehalfOf` | 谁要这件事 |
+| 批准人（`approvedBy`） | 审计 `decision.approvedBy` | 谁放行的 |
+
+**规则（fail-closed，必须写死）**：**授权评估仍按发起人做，批准人不扩大权限。** 既有模型是 `effective = agent ∩ 操作人`（D5），操作人 = 发起人；`grants:evaluate` 的输入不变。bob 批准 alice 的 plan，执行仍用 `alice` 的授权交集——若 alice 本来无权做这一步，那么 bob 的批准也只能让它在**授权闸门**处被拒，而不是被放行。批准只解除 `policy=approve` 这一道，不动 grant 那一道。
+
+`requiredRoles`（策略给的审批人）与 grant（授权矩阵）是两套东西：前者决定"谁能按这个按钮"，后者决定"这步允不允许发生"。两者都不满足时先撞哪个不影响结果——都是不执行。
+
+另：`GET /tenon/pending` 的 `mine` 只答"我能不能按"，**不答"这步合不合法"**；页面不得据此推断可执行。
+
 ---
 
 ## 4. 数据流：一次完整往返
@@ -211,7 +240,7 @@ flowchart TB
 | 8 | 仓管(bob) | 登录同一页面 → 待批列表里有这条 → 点「批准」→ `POST /tenon/requests`（`tenon.confirm`, `decision:"approve"`, `by` 由 token 决定） |
 | 9 | agent | tick 取到 confirm → 按 `planId` 匹配 pending → 校验 `bob.roles ∩ requiredRoles ≠ ∅`（否则 `403` + 审计 `policy_denied`，pending 保持） |
 | 10 | agent | **重跑 G4**：再读库存。仍 ≥12 → 继续；已被扣到 7 → 不硬跑 → 重新规划（新 `planId`，`supersedes`）→ 回到第 5 步，重新要审批 |
-| 11 | agent | 执行 `DeductStock`（幂等键）→ 写 `result` 段（`approvedBy:"user:bob"`）→ 删 pending → 发结果 Intent 帧（白话）→ 页面显示「已扣 12 件，已开采购申请 PR-…」 |
+| 11 | agent | 执行 `DeductStock`（幂等键）→ 写 `result` 段（`approvedBy:"user:bob"`）→ pending **移入 `out/pending/archived/`**（不删除，见 §4.3）→ 发结果 Intent 帧（白话）→ 页面显示「已扣 12 件，已开采购申请 PR-…」 |
 
 `CreatePurchaseRequest` 属同一份已批准的 Plan，**不再二次审批**（整份 Plan 一次批准，见 §3.3）。
 
@@ -238,11 +267,53 @@ flowchart TB
 3. 事件块保持原样（请求回合里它渲染合成事件，只含 `eventId/type/correlationId`，不含业务载荷）；
 4. 「同一输入 → 逐字相同 prompt」的性质对文本请求同样成立（`text` 是输入的一部分）。
 
+**请求回合怎么选 skill（初版漏了，这里补）**
+
+现状选 skill 完全靠 `tenon.subscribes` 与**事件类型**匹配（`cmd/agent/main.go:8`：对每个事件按订阅判断要不要开回合）。`tenon.request` 没有事件类型，**这条路径不存在**，必须另立规则，否则 P2 会卡住。
+
+三条出路都不干净：全量塞进 prompt（违背 D15 上下文成本，模块一多就爆）、让模型先选 skill（多一跳 LLM、同输入结果不稳定，与 temperature=0 的可重复性冲突）、请求里带 `skillHint`（把业务知识的选择责任推回页面，与"能力发现"精神相反）。
+
+**选定：确定性粗筛，不花 LLM。**
+
+1. 对每个 skill，取其 frontmatter 的 `tenon.subscribes` 与该 skill 正文里出现的模块名/动作族名（解析规则与 `tools/lint` 一致，不新增语法）；
+2. 用 `context.view.module` 与请求文本里出现的模块名/实体类型做匹配，得到候选 skill 集；
+3. 候选 ≤2 份时全部进 prompt；>2 份时按「模块命中数 → skill 名字典序」取前 2（**顺序确定**，不依赖 map 遍历）；
+4. 候选为空 → 只渲染动作清单并在 prompt 里注明「本次没有匹配的 skill 正文」（`planner.go:299` 已有该分支）。
+
+可测性：同一 `(text, view)` 必得同一 skill 集，可写成表驱动单测。这条规则**不进协议**（它是 agent 的实现细节），但必须写进本 spec，否则实现者会各自发明一套。
+
 ### 4.2 不能污染 D1 的结果文件（重审发现的回归点）
 
 `cmd/agent` 每回合往 `TENON_RESULT_FILE` 追加一行，`internal/d1` 读这个文件判定 A/B 两轮的差异。**请求触发的回合也会追加行，而 `readRoundResult` 取的是文件里最后一条可解析的行**——两类回合混写会让 D1 读到错误的行，把一个「未判定」悄悄变成误判。
 
 处理：`resultLine` 增 `trigger` 字段（`event` | `request`，缺省 `event` 向后兼容）；`internal/d1` 读行时**跳过 `trigger=request` 的行**。回归测试锁住这条：在两次事件回合之间插入一个请求回合，D1 仍读到事件回合的那一行。
+
+---
+
+### 4.3 挂起档案：pending 执行完不删除（重审补充）
+
+审计记录只有 `planId/stepId/action/inputHash`，**不含完整 plan**（既有缺口，`audit-event.schema.json` 无该字段）。所以 pending 文件是「当时到底规划了什么」的唯一完整副本。初版写「执行完删 pending」，等于把那笔业务的计划内容永久抹掉：审计可查、但没人能再说清它当年打算做什么。
+
+落地：
+
+| 项 | 规定 |
+|---|---|
+| 归档位置 | `out/pending/archived/<planId>.json`，补写 `archivedStatus`（`done` / `rejected` / `expired` / `stale`）与 `resultAuditId` |
+| 恢复扫描范围 | 只扫 `out/pending/*.json`（不递归 `archived/`），归档件永不参与恢复 |
+| 保留 | 默认 30 天，`TENON_PENDING_RETENTION_DAYS` 可调；清理是**独立动作**，不影响恢复 |
+| 不做什么 | 不把 plan 塞进审计（那要扩 audit schema，是另一件事）；归档件不是权威状态，删了不影响正确性 |
+
+### 4.4 结局编码：不新增第四结局态（重审补充）
+
+`run.go:74` 明写「Outcome 是一个回合的结局。三态封闭：多一态就要有人解释它该不该转人工」。所以**不给 `Outcome` 加 `needs_human_pending`**，改为：
+
+- `RunResult` 增 `PendingPlanID *string`（`json:"pendingPlanId,omitempty"`）；
+- `needs_human` + `pendingPlanId != nil` = 可被人工推进；`needs_human` + nil = 无通道，纯转人工；
+- 结局态仍三态，D1 的「B 轮转人工」判据一字不改。
+
+**D1 运行时必须关闭入站通道**（`TENON_TEST_MODE=1` 时不挂 `/tenon/requests*` 与 `/tenon/pending`）。理由：D1 的判据是「同一输入 → 同一行为」，若测试环境里挂不挂前端会改变结局（等审批 vs 转人工），主判据就变成环境依赖。这条要写进 `internal/d1` 的注释与 `docs/interfaces.md`。
+
+与 §4.2 的 `trigger` 过滤是两道互补的保险，不是重复：关通道保证 D1 的行为不受前端影响；过滤行保证即使有人在同一个结果文件里混入请求回合，判定也不会读错。
 
 ---
 
@@ -282,7 +353,7 @@ flowchart TB
 | token 缺失 / 过期 / 签名坏 | `401`，**不入队**，页面提示「登录已过期」 |
 | 批准人 roles 不含 `requiredRoles` | host 预检 `403`（不入队）；若摘要已丢导致漏放，agent 恢复时再判 `403` 等价的「不执行」+ 审计 `policy_denied`，pending 保持待批 |
 | confirm 指向不存在 / 已过期的 planId | host 预检 `409`（`EXPIRED_OR_UNKNOWN_PLAN`）；agent 兜底同样拒绝并写审计；两种情形都不执行 |
-| pending 超 15 分钟 | 写 `result`(error/policy_denied) + 删 pending + Intent 帧「已过期，请重新发起」；**不自动执行** |
+| pending 超 15 分钟 | 写 `result`(error/policy_denied) + pending 移入 `out/pending/archived/`（标 `expired`）+ Intent 帧「已过期，请重新发起」；**不自动执行** |
 | 恢复时 G4 不过 | 不硬跑 → 重新规划（新 planId，`supersedes`）→ 重新要审批 |
 | 同一 confirm 重复投递 | 幂等：返回既有结果，副作用一次 |
 | `decision=amend` | `409 NOT_SUPPORTED_THIS_SLICE` |
@@ -339,12 +410,16 @@ type Queue interface {
 |---|---|---|
 | 入站队列 | 表驱动：并发 Push 序号唯一、`poll(after)` 游标、累积 ack 隔离（两队列互不影响）、满则丢最旧、JSONL 重开接回游标 | ✅ 无外部依赖 |
 | 身份 | token 签发/过期/篡改/无 Bearer；`by` 被覆写；`requiredRoles` 不匹配 → 403 | ✅ |
+| 授权不扩大 | 发起人无 grant 的步骤，即使批准人权限更大也必须在 grant 闸门被拒（construct 一个 bob 有 grant、alice 没有的用例） | ✅ |
 | 公告板 | 只读语义；按 roles 过滤；`mine` 标记；不参与任何执行判定 | ✅ |
 | agent 挂起/恢复 | 假 LLM + 假 host + `t.TempDir()`：挂起落 pending → confirm → 执行 → `result.approvedBy` 正确；重复 confirm 幂等；过期不执行；G4 失败触发重规划；`dispatched` 段 approvedBy 恒 null | ✅ 不花 token |
 | 白话渲染 | 模板占位符取值；缺模板退回 title；含数字的 `rationale` 被丢弃；120 字符截断 | ✅ |
 | 请求回合的触发源 | `trigger.eventId` 匹配 `^evt_`；`correlationId` 匹配 `^cor:`（有 view / 无 view 两条路径）；Plan 能通过 `plan.schema.json` 校验 | ✅ |
 | prompt 分流 | 用户原话只出现在「用户请求（这是指令）」块；事件块不含用户文本（防把指令当事实） | ✅ |
 | **D1 结果文件隔离** | 事件回合与请求回合混写后，`internal/d1` 仍只读到 `trigger=event` 的行 | ✅ |
+| **I7 崩溃序** | 注入三种崩溃位置（pending 后 / dispatched 后 / 标记前），恢复行为符合 I7 表：缺 dispatched 记录时不执行并记 `contract_violation` | ✅ |
+| 归档不参与恢复 | `archived/` 里的件不会被扫描执行；清理动作不影响 pending 集合 | ✅ |
+| skill 粗筛 | 同一 `(text, view)` 必得同一 skill 集；候选 >2 时按「模块命中数 → 名称字典序」截断；无候选取空正文分支 | ✅ |
 | 端到端 | 三进程 + 真 LLM，手动脚本（`docs/interfaces.md` 附步骤） | ❌ 默认不跑（花钱、依赖外网） |
 | 回归 | `go test ./...`、`pnpm check`、C1–C10 host 模式不退化 | ✅ |
 
@@ -388,13 +463,28 @@ type Queue interface {
 | §4 | 未提请求回合怎么填 `Plan.trigger` | `PlanTrigger` 要求 `^evt_` 的 `eventId`，**但 schema 注解本就写明「人工发起时使用宿主生成的合成事件 id」** | 补 §4.1：签发 `evt_` 合成 id，不改 schema |
 | 全文 | 未提结果文件 | 请求回合会往 `TENON_RESULT_FILE` 追加行，`internal/d1` 取最后一条可解析行 → 会污染 D1 判定 | 补 §4.2：结果行加 `trigger` 字段，d1 过滤 |
 
+**架构分析补充（第三轮，按现行架构对照后修掉的性质级问题）**
+
+| 位置 | 原文档的漏洞 | 处理 |
+|---|---|---|
+| §2 | 一次挂起有两次落盘（pending + dispatched），没有共同事务；崩溃时会留下孤儿审计，或违反「dispatched 先落盘才允许执行」 | 新增 **I7**：定序 + 恢复前置校验（审计链查不到 `dispatchedAuditId` 即不执行），并给出三种崩溃位置的恢复行为表 |
+| §4.1 | 「读 skill」跳过了「请求没有事件类型 → 没有订阅匹配路径」这个问题，P2 必然卡住 | 补确定性粗筛规则（不花 LLM，同输入同结果） |
+| §3.7.1 | 未定义批准人 ≠ 发起人时 grant 按谁算，实现者容易让「主管权限更大」生效 | 写死 **授权仍按发起人评估，批准人不扩大权限**；并区分 `requiredRoles`（能否按按钮）与 grant（这步合不合法） |
+| §4.3 / §4.4 | ① 执行完删 pending 会抹掉完整 plan 的唯一副本；② 初版倾向新增结局态，与 `run.go:74`「三态封闭」冲突；③ 未处理「挂不挂前端会改变 D1 结局」 | ① pending 归档到 `archived/`；② `RunResult` 加 `pendingPlanId` 而非新增态；③ D1 运行时关闭入站通道 |
+
+**三条被改动但未在初版记明的架构性质**（本切片的代价，写在这里以免被当成免费午餐）：
+
+1. **前端从「可选增强」变成审批路径上的必需环节**：有前端 = 等审批，无前端 = 转人工。用 `pendingPlanId` 区分，且 D1 运行时关闭入站通道来保住主判据的可重复性。
+2. **agent 从无状态变成有状态**（M0.5 §1 原文「不持久化状态」）：多了一份必须与审计链一致的持久状态，见 I7。
+3. **Tenon 从事件驱动单入口变成「事件 + 人」双入口**：`tenon.request` 是指令，而 README 说「订阅事件只决定是否思考，绝不决定做什么」。这条定位变化应在**主设计文档**记一笔，不只留在本切片。
+
 ---
 
 ## 12. 风险与已知缺口
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| pending 成为新的状态机，孤儿文件/重复恢复 | 高 | 启动扫描 + 过期清理；状态迁移落盘后 fsync；幂等键 + `confirmId` 去重 |
+| pending 成为新的状态机，孤儿文件/重复恢复 | 高 | I7 的定序 + 恢复前置校验；启动扫描 + 过期归档；fsync；幂等键 + `confirmId` 去重 |
 | 白话模板质量差，业务员仍看不懂 | 高 | 模板占位符在渲染期校验，失效即回退 `title` + 参数；详情区兜底；三个模块的模板单独 review |
 | dev 登录被误当成真认证 | 中 | 命名带 `dev`；README 与页面均明写边界 |
 | 同源静态页 = host 单点 | 中 | 诚实说明；不做离线态假装 |
@@ -409,6 +499,6 @@ type Queue interface {
 | 阶段 | 内容 | 出口判据 |
 |---|---|---|
 | **P1 host 入站面** | `Queue` 端口 + `jsonlQueue` + 入站 3 端点 + `POST /tenon/session` + 公告板 2 端点 + 静态页路由 | 单测全绿；伪造 token 被拒；两队列 ack 互不干扰 |
-| **P2 agent 挂起/恢复** | 入站消费循环（先入站再事件）+ pending 落盘/过期清理 + 恢复执行 + `approvedBy` 落审计 | 假 LLM 单测覆盖 I1–I4；主路径在无前端时可用 curl 走通 |
-| **P3 白话与界面** | 三个模块补 `title`/`summaryTemplate` + 渲染器 + 单页（登录/对话/待批/详情折叠） | 验收线第 3 步的白话与按钮态检查通过 |
-| **P4 收口** | `interfaces.md` 补 6 端点、`CHANGELOG.md` 0.2.0 段、README 已知缺口、compose 更新（可选 redis） | 文档与实现逐条对得上；`go test ./...` + `pnpm check` 全绿 |
+| **P2 agent 挂起/恢复** | 入站消费循环（先入站再事件）+ **I7 的落盘定序与恢复前置校验** + pending 过期归档 + 恢复执行 + `approvedBy` 落审计 + `pendingPlanId` 出参 + skill 确定性粗筛 | 假 LLM 单测覆盖 I1–I4 与 I7 三种崩溃位置；主路径在无前端时可用 curl 走通 |
+| **P3 白话与界面** | 三个模块补 `summaryTemplate`（`title` 已有，不动）+ 渲染器 + 单页（登录/对话/待批/详情折叠） + 公告板每 tick 幂等重推 | 验收线第 3 步的白话与按钮态检查通过 |
+| **P4 收口** | `interfaces.md` 补 6 端点与「D1 运行时关闭入站」、`CHANGELOG.md` 0.2.0 段、README 已知缺口（含三条性质变化）、compose 更新（可选 redis） | 文档与实现逐条对得上；`go test ./...` + `pnpm check` 全绿 |
