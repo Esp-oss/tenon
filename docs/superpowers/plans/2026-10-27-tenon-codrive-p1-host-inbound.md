@@ -33,6 +33,8 @@ git worktree add ../dsh_for_sys-p1 -b feat/p1-host-inbound
 3. **`bearerClaims` 失败时已经把 401 响应写好了**，调用方只 `return`，**绝对不要再写一次响应**（header 重复写会让响应失效）。
 4. **`New()` 的校验顺序已是契约**：审计路径非空 → 打开审计 → **会话密钥非空** → 策略自检。任何断言"自检错误"的新用例都必须同时给 `SessionSecret`，否则测到的是密钥那条路径。
 5. **`Config.SessionSecret` 零值 = 装配失败**（不是"禁用登录"）；`Config.Users` 零值 = 登录永远 401（不是"跳过鉴权"）。所有 `New()` 调用点都必须给非空密钥。
+6. **`Queue` 接口含 `Broken() error`**（Task 4 复核后追加）：`Push` 只回序号，落盘失败必须另有出口，否则「已接受但没落盘」会被伪装成「已持久化」。`memoryQueue.Broken()` 恒为 nil；`jsonlQueue` 返回第一次失败。`POST /tenon/requests` 据此回 `200 {ok,seq,durable}`，`durable:false` 时打告警——**不回 500**，理由见 spec §3.2（重试会重发用户那句话）。
+7. **入站 ack 必须拒负游标**（`400 INVALID_CURSOR`），与出站 `serveIntentAck` 同校验；否则会回一个负的 `acked`。
 
 **本计划刻意包含一处受控重构**：把现有 `intentQueue` 提取成 `Queue` 端口的 `memoryQueue` 实现。出站行为**不变**，靠既有的 `TestIntentsRESTRoundTrip` / `TestIntentsRejectsBadFrame` 当安全网。不做这个提取，就要复制约 70 行队列代码，两份迟早漂移。
 

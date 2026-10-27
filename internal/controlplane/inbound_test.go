@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -150,6 +151,52 @@ func TestInboundOriginRegistrySurvivesRestart(t *testing.T) {
 	if !s2.originRegistry().IsRequest(evtID) {
 		t.Fatalf("重启后合成事件 id 仍须判定为 request：%q", evtID)
 	}
+}
+
+// 负游标与出站 serveIntentAck 保持同一校验：回 400，而不是回一个负的 acked。
+func TestInboundAckRejectsNegativeUpto(t *testing.T) {
+	_, ts := newInboundServer(t)
+	defer ts.Close()
+	tok := login(t, ts.URL)
+	status, body := postJSONAuth(t, ts.URL+"/tenon/requests/ack", tok, `{"upto":-1}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("负 upto 应 400，得到 %d：%s", status, body)
+	}
+}
+
+// 落盘失败时不能假装持久化：200 但 durable=false，且帧仍能在内存队列里回放。
+func TestInboundReportsNonDurableOnPersistFailure(t *testing.T) {
+	s, ts := newInboundServer(t)
+	defer ts.Close()
+	tok := login(t, ts.URL)
+
+	q, ok := s.inbound.(*jsonlQueue)
+	if !ok {
+		t.Fatalf("入站队列应为 jsonlQueue，得到 %T", s.inbound)
+	}
+	q.mu.Lock()
+	q.failNext = errors.New("注入：磁盘写满")
+	q.mu.Unlock()
+
+	status, body := postJSONAuth(t, ts.URL+"/tenon/requests", tok, `{"type":"tenon.request","text":"x"}`)
+	if status != http.StatusOK {
+		t.Fatalf("落盘失败仍应 200（帧已在内存，由客户端据 durable 决定是否提示），得到 %d：%s", status, body)
+	}
+	if !strings.Contains(body, `"durable":false`) {
+		t.Fatalf("必须明确告知未落盘，得到 %s", body)
+	}
+	if _, pollBody := getJSON(t, ts.URL+"/tenon/requests/poll?after=0"); !strings.Contains(pollBody, `"seq":1`) {
+		t.Fatalf("落盘失败时帧仍应在内存队列里可回放，得到 %s", pollBody)
+	}
+	// Broken 是这条失败的唯一出口（Push 只回序号）：必须能读到。
+	if err := q.Broken(); err == nil {
+		t.Fatalf("Broken 必须暴露落盘失败")
+	}
+	// 清掉注入错误，避免 Cleanup 里的 Close 把同一个注入错误再报一次
+	// （Close 会返回 broken，那条行为另有用例意义，不在这里重复计分）。
+	q.mu.Lock()
+	q.broken = nil
+	q.mu.Unlock()
 }
 
 func TestInboundRejectsUnknownFrameType(t *testing.T) {

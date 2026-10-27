@@ -146,9 +146,11 @@ flowchart TB
 
 | 端点 | 语义 |
 |---|---|
-| `POST /tenon/requests` | 收 `tenon.request` 或 `tenon.confirm` 之一；`200 {ok, seq}` |
+| `POST /tenon/requests` | 收 `tenon.request` 或 `tenon.confirm` 之一；`200 {ok, seq, durable}` |
 | `GET /tenon/requests/poll?after=<seq>` | `{frames:[{seq,frame}], nextCursor, dropped}`；`frame` 里的 `requestId` 与合成 `eventId` 由 host 在入站时签发并覆写（见 §3.11） |
-| `POST /tenon/requests/ack` | `{upto}`（省略 = 确认全部）→ `{ok, acked}` |
+| `POST /tenon/requests/ack` | `{upto}`（省略 = 确认全部；负值 `400 INVALID_CURSOR`，与出站同校验）→ `{ok, acked}` |
+
+**`durable` 字段（实施期补充）**：落盘失败时仍回 `200`，但 `durable:false` 并打告警日志。不回 `500` 是有意的——`500` 会诱导客户端重试，而 `requestId` 由宿主签发，重试等于**把用户那句话再说一遍**，比诚实告知未落盘更坏。帧此时仍在内存队列里，`poll` 拿得到；重启才会丢。
 
 **为什么不复用 `/tenon/intents`**：它的 ack 是累积游标（`ack(upto)`），前端与 agent 两个消费者各自 ack 会互相吞帧。入站与出站是两个方向、两个消费者，必须两条队列。
 

@@ -28,6 +28,10 @@ type jsonlQueue struct {
 	// metaPath 存序号高位水位。它不存帧内容，只在主文件损坏时兜底序号，
 	// 避免游标退回 0 导致持旧游标的客户端永久漏帧。
 	metaPath string
+
+	// failNext 是测试注入：下一次 rewrite 直接返回它。与 audit.Store.failNext 同一手法，
+	// 用来验证「落盘失败时 HTTP 层必须说实话」这条路径，而不必真的把磁盘写满。
+	failNext error
 }
 
 var _ Queue = (*jsonlQueue)(nil)
@@ -129,6 +133,12 @@ func (q *jsonlQueue) rewrite() error {
 			_ = os.Remove(tmp)
 		}
 	}()
+	// 测试注入：让落盘失败可复现，不必真把磁盘写满。
+	if q.failNext != nil {
+		err := q.failNext
+		q.failNext = nil
+		return err
+	}
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("controlplane: 写入站队列失败：%w", err)
@@ -228,6 +238,13 @@ func (q *jsonlQueue) Highest() int64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.seq
+}
+
+// Broken 返回第一次落盘失败。Push 只回序号，这条是「已接受但没落盘」的唯一出口。
+func (q *jsonlQueue) Broken() error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.broken
 }
 
 // Close 暴露第一次落盘失败：队列已不可信时调用方必须知道。

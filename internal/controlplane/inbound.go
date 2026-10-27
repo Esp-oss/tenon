@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -140,7 +141,24 @@ func (s *Server) serveInboundEnqueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	seq := s.inbound.Push(raw)
-	writeJSON(w, http.StatusOK, enqueueResponse{OK: true, Seq: seq})
+	// 落盘失败时不能假装持久化：帧仍在内存队列里（poll 拿得到），但重启会丢。
+	// 这里回 200 而非 500 是有意的——500 会诱导客户端重试，而重试会造出第二条用户请求
+	// （requestId 由宿主签发，重试等于重发），比「热情地告知未落盘」更坏。
+	durable := s.inbound.Broken() == nil
+	if !durable {
+		log.Printf("controlplane: 入站帧已入内存队列但未落盘（seq=%d）——重启会丢，请检查磁盘", seq)
+	}
+	writeJSON(w, http.StatusOK, inboundEnqueueResponse{OK: true, Seq: seq, Durable: durable})
+}
+
+// inboundEnqueueResponse 是 POST /tenon/requests 的响应。
+//
+// 比出站的 enqueueResponse 多一个 durable：出站是内存队列、丢了只是界面提示；
+// 入站承载的是人说过的话，客户端需要能区分「已落盘」与「只在内存里」。
+type inboundEnqueueResponse struct {
+	OK      bool  `json:"ok"`
+	Seq     int64 `json:"seq"`
+	Durable bool  `json:"durable"`
 }
 
 // inboundFrame 不再单独定义类型：规范化后的帧就是 map[string]any（保留原字段 + 宿主签发字段）。
@@ -214,6 +232,12 @@ func (s *Server) serveInboundAck(w http.ResponseWriter, r *http.Request) {
 	}
 	upto := s.inbound.Highest()
 	if req.Upto != nil {
+		// 与出站的 serveIntentAck 保持同一校验：负游标既无意义，也不该回一个负的 acked。
+		if *req.Upto < 0 {
+			writeTenonError(w, *newError(protocol.ClassContractViolation, "INVALID_CURSOR",
+				"upto 不允许为负"))
+			return
+		}
 		upto = *req.Upto
 	}
 	writeJSON(w, http.StatusOK, ackResponse{OK: true, Acked: s.inbound.Ack(upto)})

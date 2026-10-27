@@ -22,6 +22,9 @@ type Queue interface {
 	Since(after int64) (frames []queuedFrame, next int64, dropped int64)
 	Ack(upto int64) int64
 	Highest() int64
+	// Broken 返回第一次落盘失败。Push 只回序号，落盘错误必须另有出口，
+	// 否则「已接受但没落盘」会被伪装成「已持久化」。
+	Broken() error
 	Close() error
 }
 
@@ -35,6 +38,9 @@ type memoryQueue struct {
 }
 
 var _ Queue = (*memoryQueue)(nil)
+
+// Broken 对内存实现恒为 nil：它没有落盘这一步。
+func (q *memoryQueue) Broken() error { return nil }
 
 // newMemoryQueue 构造队列；capacity 非正时退回 maxIntentFrames。
 func newMemoryQueue(capacity int) *memoryQueue {
