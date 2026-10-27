@@ -62,12 +62,14 @@
 
 | 进程 | 关键变量 |
 |---|---|
-| 三个模块 | `TENON_TEST_MODE=1`（挂 `POST /tenon/admin/reset`，两轮输入才可比）、`PORT`、`TENON_MODULE_ID` |
+| 三个模块 | `TENON_TEST_MODE=1`（挂 `POST /tenon/admin/reset`，两轮输入才可比）、`PORT`、`TENON_MODULE_ID`、**`TENON_HMAC_SECRET_FILE`**（必需：模块 `/readyz` 会检查 `hmac_secret` 与 `audit_file`，缺一项永远不就绪——见 `internal/module` 的 `serveReady`） |
 | host | `TENON_TEST_MODE=1`（挂 `POST /tenon/admin/modules`，D1 用它摘模块）、**`TENON_STRICT_RULES=1`**（业务规则没加载即启动失败，见下）、`TENON_MODULES=quote=…,inventory=…,procurement=…`、`TENON_USERS_FILE=config/users.dev.json`、`TENON_SESSION_SECRET`、`TENON_SKILLS_DIR=skills`、`TENON_POLICY_FILE=config/policies.dev.json`、`TENON_GRANT_FILE=config/grants.dev.json`、`TENON_INBOUND_DIR=out/d1/inbound` |
 | agent | `TENON_HOST_URL=http://127.0.0.1:8080`、`TENON_AGENT_ID=ag_fulfillment`、`TENON_ON_BEHALF_OF=user:alice`、`TENON_ONCE=1`（**由外层循环反复拉起**）、`TENON_RESULT_FILE=out/d1/agent-result.jsonl`、`TENON_AGENT_STATE_DIR=out/d1/agent-state`、`TENON_AGENT_USER=agent`、`TENON_AGENT_PASSWORD=agent-dev`、`TENON_LLM_API_KEY_FILE=docker/secrets/llm.key`、`TENON_LLM_MODEL=deepseek-v4-pro` |
 | d1 | `tenon d1 run --host … --quote … --inventory … --procurement … --agent-result out/d1/agent-result.jsonl --report out/d1/report.json` |
 
 **模型选择**：`deepseek-v4-pro`（规划质量优先，一次判定总共两次调用，成本可忽略）。脚本里写成可覆盖的缺省值，`deepseek-flash` 作为回退。
+
+**运行环境的一处硬约束（实测）**：本机只有 Windows PowerShell 5.1，脚本必须存成**带 UTF-8 BOM 的 .ps1**，否则中文串会被按系统代码页解码并报 `string is missing the terminator`；调用方式是 `powershell -NoProfile -File scripts/d1-e2e.ps1`。
 
 **凭据注入**：只走 `TENON_LLM_API_KEY_FILE=docker/secrets/llm.key`（`docker/secrets/` 已在 `.gitignore`）。key 不进命令行、不进日志、不进仓库。
 
