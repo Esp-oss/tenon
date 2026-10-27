@@ -12,8 +12,6 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
 
-  conformance: {}
-
   packages/dsh-plugin-governance:
     dependencies:
       '@deepseek-ai/cordis':
@@ -41,8 +39,6 @@ importers:
   packages/sidecar-http: {}
 
   packages/tenon-core: {}
-
-  packages/tenon-lint: {}
 
 packages:
 
