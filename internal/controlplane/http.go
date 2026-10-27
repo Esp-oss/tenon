@@ -167,6 +167,8 @@ type Server struct {
 	// requireTrigger 为 true 时缺 triggerEventId 直接 deny（TENON_REQUIRE_TRIGGER=1）。
 	// 从 Config.RequireTrigger 装配，装配后不可变。
 	requireTrigger bool
+	// pending 是待批公告板：只读 read-model，agent 推、前端看。刻意不落盘（可重建）。
+	pending *pendingBoard
 }
 
 // New 装配控制平面。审计日志打不开或策略规则自检不过都会返回错误：宿主不该带着
@@ -193,6 +195,8 @@ func New(cfg Config) (*Server, error) {
 		grantCount:  len(cfg.Grants),
 		// 过渡开关：默认 false，缺 triggerEventId 视为事件驱动（现有 agent 可用）。
 		requireTrigger: cfg.RequireTrigger,
+		// 公告板是纯内存 read-model：可丢、可重建，重建靠 agent 每 tick 的幂等 upsert。
+		pending: newPendingBoard(),
 	}
 	for _, entry := range cfg.Modules {
 		s.modules.Upsert(entry)
@@ -287,6 +291,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveInboundPoll(w, r)
 	case "/tenon/requests/ack":
 		s.serveInboundAck(w, r)
+	case "/tenon/pending":
+		// 待批公告板：agent 推摘要、前端按角色取列表（只读 read-model）。
+		s.servePending(w, r)
 	case "/tenon/admin/modules":
 		if !s.testMode {
 			// 非测试模式回 404 而不是 403：403 等于承认「这里本来有个测试面」。

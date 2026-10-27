@@ -3,6 +3,7 @@ package controlplane
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -207,4 +208,20 @@ func TestInboundRejectsUnknownFrameType(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("未知帧类型应 400，得到 %d", status)
 	}
+}
+
+func getJSONAuth(t *testing.T, url, token string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("请求失败：%v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取响应失败：%v", err)
+	}
+	return resp.StatusCode, string(raw)
 }
