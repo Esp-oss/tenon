@@ -35,29 +35,28 @@
 
 ## 3. 未知字段（决策二：生产严、消费宽）
 
-### 撞到的矛盾
+> **执行期更正（2026-10-27，重要）**：本节初版声称「schema 的 `additionalProperties: false` 与 §3.2『未知字段必须忽略』是规范矛盾」。**这个判断是错的**——
+>
+> [`versioning.md`](../../../spec/0.1/versioning.md) §3.2 **第二段已经写清楚**：「schema 里的 `additionalProperties: false` 是**给生产方自检**的封闭声明，与消费方的容忍义务不冲突」，并且点名了反例用例 C3。是我没读全就下了结论。
+>
+> 真正的缺口只有一个，且在**实现侧**：**Go host 目前按 schema 拒绝接收报文**（2026-10-27 加 `requiredArgs` 时的 `additional properties 'requiredArgs' not allowed` 就是现场），这违反 §3.2。规范文本不需要改。
 
-- 三份 schema 里共 14 处 `additionalProperties: false`；
-- 但 [`versioning.md`](../../../spec/0.1/versioning.md) §3.2 要求「**未知字段必须忽略**」——这是「0.1 消费方能处理 0.2 报文」的前提。
-
-若接收侧照 schema 严格拒绝，**加一个字段就是破坏性变更**，与「只增不删」自相矛盾。2026-10-27 加 `requiredArgs` 时，Go 的 `additional properties 'requiredArgs' not allowed` 就是这条矛盾的现场。
-
-### 裁决
+### 结论（与 §3.2 一致，非新裁决）
 
 **`additionalProperties: false` 约束写入方，§3.2 约束读取方。** 同一份 schema 编译**两个视图**：
 
 | 视图 | ajv 配置 | 用途 | 多余字段的处理 |
 |---|---|---|---|
-| `lenient`（接收侧） | `removeAdditional: 'all'` | 宿主/适配器校验收到的报文 | **剥离并放行** |
+| `lenient`（接收侧） | `removeAdditional: true` | 宿主/适配器校验收到的报文 | 封闭对象**剥离**、开放对象原样放行；两种都**不报错** |
 | `strict`（一致性侧） | `removeAdditional: false` | conformance 套件校验**自产**报文 | 视为错误 |
 
 两者共享同一批 `addSchema`，**不存在第二份真源**。
 
 > **执行期更正（2026-10-27）**：初版让一致性视图开 ajv 的 `strict: true`（schema lint）。实测**三处误伤**——`action#/allOf/0/then` 的 `required` 不在本分支 `properties`（`strictRequired`）、`action#/properties/inputSchema` 的 union type、`audit-event#/allOf/0/if/properties/decision` 缺 `type: object`。这些都是**合法 JSON Schema**，lint 检查的是「schema 该怎么写」而不是「实例合不合法」，而本仓库 schema 已由 Go 校验器与 `validate-spec.mjs` 把关。因此两个视图**都关 lint**（`strict: false`），唯一差别是 `removeAdditional`——严格性只体现在实例上。
 
-**附带动作（文档）**：给 `versioning.md` §3.2 补一句「`additionalProperties: false` 约束的是写入方；读取方必须按本节忽略未知字段」。不补的话，下一个人还会踩同一个坑。
+**附带动作（撤销）**：初版计划「给 `versioning.md` §3.2 补一句澄清」——**不需要**，§3.2 已经写了（见上方更正）。规范文本一字不改。
 
-**已知缺口（本轮只记不改）**：Go host 现在按 schema 拒绝接收报文，与 §3.2 不一致；记入 README「还没做的」。
+**已知缺口（本轮只记不改）**：Go host 现在按 schema 拒绝接收报文，违反 §3.2「消费方必须忽略未知字段」；记入 README「还没做的」。
 
 ## 4. API（决策三：每类一个函数 + 动态入口）
 

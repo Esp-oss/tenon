@@ -250,6 +250,8 @@ dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、�
 
 > **对话发起的小量扣减（`qty ≤ 10`）会转人工**：平台策略没有登记该区间（fail-closed 的必然结果），业务员说「扣 5 件」时会挂起给仓管批。随时可以加一条 `pol-inventory-deduct-auto-small` 改成自动，但那是一次产品语义变更，需单独决定。
 
+> **Go host 的接收侧与 `versioning.md` §3.2 不一致**：§3.2 要求「消费方遇到未知字段必须忽略并继续」，但 `internal/spec` 的校验入口按 `additionalProperties: false` 直接拒绝（2026-10-27 加 `requiredArgs` 时，`additional properties 'requiredArgs' not allowed` 就是现场）。TS 侧（`@tenon/core` 的 `src/validate`）已按「接收侧宽松、一致性侧严格」双视图实现；**Go 侧待对齐**，修它要动校验入口并评估既有用例，需单独评估。
+
 > 页面已交付（`TENON_UI_DIR=ui`，无构建链静态页）：白话来自身份化模板，技术信息在折叠区。**可回归的验收**：`powershell -NoProfile -File scripts/verify-ui.ps1`——它起 stub 全链路、造一张待批卡，再用 Edge(CDP) 断言「卡面只有人话、技术信息默认收起、非审批人没有批准按钮」，并落两张截图到 `out/ui-verify/`。
 
 > **审批人角色只有一条来路**：`tenon.confirm` 帧里的 `roles` **由宿主写入**（取提交者 token 的 `claims.roles`，先删客户端自报再写）。agent 侧不读登录身份、不做兜底——它若读自己的登录角色，等于用服务账号的身份给人授权。也因此：**策略必须真的给出 `approvers`**，否则 `requiredRoles` 为空、`rolesIntersect` 对空集 fail-closed，会出现"板上有卡、谁点都 403"。这是 fail-closed 的必然结果，不是 bug。
