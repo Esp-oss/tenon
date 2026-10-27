@@ -361,9 +361,6 @@ func run(ctx context.Context) error {
 	if cfg.resultFile != "" {
 		log.Printf("agent: 每回合向 %s 追加一行结果（供 D1 取 A/B 两轮的动作序列）", cfg.resultFile)
 	}
-	// 已知缺口必须在启动时就说一次：它会让所有 approve 确定性 403（见 approverRoles）。
-	log.Printf("agent: 已知缺口 —— 入站 confirm 帧不带经过验证的审批人角色，" +
-		"approve 会在审批人校验处 fail-closed 拒绝（reject 不受影响）；补法见 approverRoles 的注释")
 
 	for {
 		rounds, pollErr := p.pollOnce(ctx)
@@ -989,13 +986,23 @@ func (p *poller) skipClaimedRequest(ctx context.Context, requestID string) error
 }
 
 // handleConfirm 处理一条确认帧：恢复执行，成功后推终态覆盖。
+//
+// 审批人角色只从**帧里的 roles** 取：那一份是宿主用提交者 token 的 claims.Roles 覆写过的
+// （见 internal/controlplane 的 normalizeInboundFrame——它先删掉客户端自报的 roles 再写入）。
+// 这里不读 agent 自己的登录 claims：那是服务账号的 role:agent，拿它当审批人角色就是
+// 权限混淆（一份要求 role:agent 的计划会对任何人放行）。帧里没有 roles 就是空集，
+// Resume 的 rolesIntersect 对空集 fail-closed → approve 403，reject 不受影响。
+//
+// **别再给这句话加兜底**（原来的 approverRoles 就是这么没的）：读登录 claims、给默认角色、
+// 信客户端自报的 roles，三条路都是把人批过的事实降级成「谁都能批」。
 func (p *poller) handleConfirm(ctx context.Context, raw []byte) error {
 	var cf struct {
-		ConfirmID string `json:"confirmId"`
-		PlanID    string `json:"planId"`
-		Decision  string `json:"decision"`
-		By        string `json:"by"`
-		At        string `json:"at"`
+		ConfirmID string   `json:"confirmId"`
+		PlanID    string   `json:"planId"`
+		Decision  string   `json:"decision"`
+		By        string   `json:"by"`
+		Roles     []string `json:"roles"`
+		At        string   `json:"at"`
 	}
 	if err := json.Unmarshal(raw, &cf); err != nil {
 		return fmt.Errorf("tenon.confirm 不是合法 JSON：%w", err)
@@ -1005,7 +1012,7 @@ func (p *poller) handleConfirm(ctx context.Context, raw []byte) error {
 		PlanID:    cf.PlanID,
 		Decision:  cf.Decision,
 		By:        cf.By,
-		Roles:     p.approverRoles(cf.By),
+		Roles:     cf.Roles,
 		At:        cf.At,
 	})
 	if err != nil {
@@ -1027,30 +1034,6 @@ func (p *poller) handleConfirm(ctx context.Context, raw []byte) error {
 		log.Printf("agent: planId %s 的终态覆盖（%s）推送失败（归档不回滚，重放时再推是幂等 upsert）：%v",
 			archived.PlanID, archived.State, perr)
 	}
-	return nil
-}
-
-// approverRoles 回答「这条 confirm 的审批人有哪些角色」。
-//
-// **本切片没有这条通道（已知缺口，必须在宿主侧补）**：
-//   - 宿主在入站入队时用 token 的 sub 覆写了 by（身份可信），但**没有把该 token 的
-//     roles 写进帧**；帧里若出现 roles，那是客户端自报的——信它等于让人自己给自己
-//     发审批权限；
-//   - HostClient 也没有导出 claims：session 响应里的 roles 是**登录者自己**的
-//     （agent 用服务账号登录，拿到的是 role:agent）。把它当审批人的角色用，
-//     就是权限混淆——一份要求 role:agent 的计划会对任何人放行。
-//
-// 所以这里返回 nil：Resume 的 rolesIntersect 对空集 fail-closed，approve 会被
-// **确定性拒绝**（403）并立刻 ack——不静默放行，也不每 tick 空转。reject 不看角色，
-// 仍能正常终结（终态覆盖走的就是这条路）。
-//
-// 补法（宿主侧两行 + 这里三行）：normalizeInboundFrame 对 tenon.confirm 追加
-// raw["roles"] = claims.Roles（同时**删掉**客户端自带的 roles），然后在这里读帧里的
-// roles 传给 Resume。在宿主补齐之前不要提前去读帧里的 roles。
-func (p *poller) approverRoles(by string) []string {
-	log.Printf("agent: 警告 —— 无法取得审批人 %s 的角色（入站帧不带经过验证的 roles，见 approverRoles 注释）："+
-		"本条 confirm 的审批人校验按 fail-closed 处理（approve 一律 403，reject 不受影响）",
-		firstNonEmpty(strings.TrimSpace(by), "-"))
 	return nil
 }
 

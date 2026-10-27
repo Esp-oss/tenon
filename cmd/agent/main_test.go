@@ -216,11 +216,12 @@ func (l *countingLLM) Calls() int {
 // 由用例自己决定下一次 poll 该看到哪些帧。
 type fakeInboundHost struct {
 	*httptest.Server
-	mu     sync.Mutex
-	frames []agent.QueuedFrame
-	seq    int64
-	acks   []int64
-	pushes []map[string]any
+	mu      sync.Mutex
+	frames  []agent.QueuedFrame
+	seq     int64
+	acks    []int64
+	pushes  []map[string]any
+	actions []string
 }
 
 func newFakeInboundHost(t *testing.T) *fakeInboundHost {
@@ -250,6 +251,14 @@ func (h *fakeInboundHost) pushesSeen() []map[string]any {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]map[string]any(nil), h.pushes...)
+}
+
+// actionsSeen 是模块执行端点收到的调用路径：用例据此证明「批了真的执行了」，
+// 而不是只看归档状态（归档只说明恢复流程走完了）。
+func (h *fakeInboundHost) actionsSeen() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.actions...)
 }
 
 func writeTestJSON(w http.ResponseWriter, v any) {
@@ -285,6 +294,13 @@ func (h *fakeInboundHost) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		h.mu.Lock()
 		h.acks = append(h.acks, body.Upto)
+		h.mu.Unlock()
+		writeTestJSON(w, map[string]any{"ok": true})
+
+	case "/tenon/actions/inventory.GetStock", "/tenon/actions/inventory.DeductStock":
+		// 模块执行端点：恢复路径真的会走到这里（2xx 即 verdictOK，响应体形状无要求）。
+		h.mu.Lock()
+		h.actions = append(h.actions, r.URL.Path)
 		h.mu.Unlock()
 		writeTestJSON(w, map[string]any{"ok": true})
 
@@ -649,4 +665,157 @@ func TestNilStateStoreSkipsSelfCheck(t *testing.T) {
 	if strings.Join(p.Steps(), ",") != strings.Join(want, ",") {
 		t.Fatalf("其余三段必须照跑：want=%v got=%v", want, p.Steps())
 	}
+}
+
+// ---------- tenon.confirm 的审批人角色来自帧 ----------
+
+// seedApprovalPending 造一份「等人批」的 pending：计划一步，要求 requiredRoles 里的角色。
+//
+// dispatchedAuditId / auditSettled 必须齐（与真实挂起同形）：缺了它们，同一 tick 里的
+// 自检会把它当成「审计缺失」归档成 stale——那是另一个用例的事实，会盖掉这里的断言。
+func seedApprovalPending(t *testing.T, env *inboundEnv, planID string, required []string) {
+	t.Helper()
+	p := agent.Pending{
+		PlanID:         planID,
+		State:          agent.StateAwaitingApproval,
+		TriggerEventID: "evt_roles0001",
+		Subject:        json.RawMessage(`"sku:StockItem/STD-1002"`),
+		Origin:         "request",
+		By:             "user:alice",
+		Plan: agent.Plan{
+			PlanID:  planID,
+			Trigger: agent.PlanTrigger{EventID: "evt_roles0001", CorrelationID: "user:alice"},
+			Steps: []agent.PlanStep{{
+				StepID: "s1",
+				Action: "inventory.GetStock",
+				Args:   json.RawMessage(`{"sku":"STD-1002"}`),
+				Kind:   "read",
+			}},
+		},
+		Summary:           "查一下 STD-1002 的库存",
+		RequiredRoles:     required,
+		AuditSettled:      true,
+		DispatchedAuditID: "aud_" + planID,
+		CreatedAt:         "2026-10-27T09:00:00Z",
+		ExpiresAt:         "2099-01-01T00:00:00Z",
+	}
+	if err := env.store.Save(p); err != nil {
+		t.Fatalf("准备 pending 失败：%v", err)
+	}
+}
+
+// assertApproveDenied 断言「角色校验 fail-closed」：没归档、pending 原样还在、一步都没执行。
+// 确定性拒绝（403）必须 ack 掉——重放一万次还是同一个结论。
+func (e *inboundEnv) assertApproveDenied(planID string) {
+	e.t.Helper()
+	if _, err := e.store.LoadArchived(planID); err == nil {
+		e.t.Fatal("角色不匹配时不能归档：一旦离开 pending，换个有权限的人也批不了")
+	}
+	pending, ok, err := e.store.Load(planID)
+	if err != nil || !ok {
+		e.t.Fatalf("角色不匹配不该动 pending：ok=%v err=%v", ok, err)
+	}
+	if pending.State != agent.StateAwaitingApproval {
+		e.t.Fatalf("pending 必须留在待批状态，得到 %q", pending.State)
+	}
+	if actions := e.host.actionsSeen(); len(actions) != 0 {
+		e.t.Fatalf("403 时一步都不许执行，得到 %v", actions)
+	}
+	if acks := e.host.acksSeen(); len(acks) != 1 {
+		e.t.Fatalf("确定性拒绝（403）必须 ack 掉，得到 %v", acks)
+	}
+}
+
+// 宿主把提交者 token 的角色写进帧之后，approve 必须真的执行：帧里的 roles 是 agent
+// 唯一的审批人角色来源（既不是登录身份，也不是客户端自报）。
+func TestConfirmRolesFromFrame(t *testing.T) {
+	env := newInboundEnv(t)
+	seedApprovalPending(t, env, "pln_roles1", []string{"role:warehouse_manager"})
+	env.host.pushFrame(`{"type":"tenon.confirm","confirmId":"cfm_roles1","planId":"pln_roles1",
+		"decision":"approve","patch":null,"by":"user:bob","roles":["role:warehouse_manager"],
+		"at":"2026-10-27T09:00:00Z"}`)
+
+	p := env.poller()
+	env.tick(p)
+
+	archived, err := env.store.LoadArchived("pln_roles1")
+	if err != nil {
+		t.Fatalf("approve 执行完必须归档（帧里的角色没有生效）：%v", err)
+	}
+	if archived.State != agent.StateDone {
+		t.Fatalf("归档状态应当是 done，得到 %q", archived.State)
+	}
+	actions := env.host.actionsSeen()
+	if len(actions) != 1 || !strings.HasSuffix(actions[0], "/tenon/actions/inventory.GetStock") {
+		t.Fatalf("角色校验通过后必须真的执行那一步，得到 %v", actions)
+	}
+	if acks := env.host.acksSeen(); len(acks) != 1 {
+		t.Fatalf("处理完毕应当 ack，得到 %v", acks)
+	}
+	pushes := env.host.pushesSeen()
+	if len(pushes) == 0 || pushes[len(pushes)-1]["state"] != "done" {
+		t.Fatalf("终态覆盖应推 done（板上那张卡才会落地），得到 %v", pushes)
+	}
+}
+
+// 客户端自报的角色不能变成审批权限：agent 只认帧里的 roles 这一个字段。
+//
+// 宿主已经先把自报的角色删掉（见 internal/controlplane 的 TestConfirmFrameRoles），
+// 这里守的是 agent 侧**没有第二条准入通道**：不看登录 claims（服务账号自己是
+// role:agent）、不看别的帧字段、缺角色时不给默认角色。
+func TestConfirmClientRolesIgnored(t *testing.T) {
+	t.Run("帧里只有提交者自己的低权限角色", func(t *testing.T) {
+		env := newInboundEnv(t)
+		seedApprovalPending(t, env, "pln_clerk1", []string{"role:warehouse_manager"})
+		// 这帧的 roles 已经是宿主按 token 换出来的 role:clerk；另外再塞两处「看起来像
+		// 角色」的字段，agent 一个都不许读（读了就等于把客户端自报又捡回来）。
+		env.host.pushFrame(`{"type":"tenon.confirm","confirmId":"cfm_clerk1","planId":"pln_clerk1",
+			"decision":"approve","patch":null,"by":"user:alice","roles":["role:clerk"],
+			"claims":{"roles":["role:warehouse_manager"]},
+			"approverRoles":["role:warehouse_manager"],"at":"2026-10-27T09:00:00Z"}`)
+
+		p := env.poller()
+		env.tick(p)
+
+		env.assertApproveDenied("pln_clerk1")
+	})
+
+	t.Run("帧里没有 roles", func(t *testing.T) {
+		env := newInboundEnv(t)
+		seedApprovalPending(t, env, "pln_noroles1", []string{"role:warehouse_manager"})
+		// 缺 roles 就是空集：不得回落到登录身份。假宿主的 /tenon/session 明确回了
+		// role:agent——若有人把「登录者的角色」当审批人角色用，这里就会放行。
+		env.host.pushFrame(`{"type":"tenon.confirm","confirmId":"cfm_noroles1","planId":"pln_noroles1",
+			"decision":"approve","patch":null,"by":"user:alice","at":"2026-10-27T09:00:00Z"}`)
+
+		p := env.poller()
+		env.tick(p)
+
+		env.assertApproveDenied("pln_noroles1")
+	})
+
+	t.Run("其它自报字段既不授予也不剥夺", func(t *testing.T) {
+		env := newInboundEnv(t)
+		seedApprovalPending(t, env, "pln_junk1", []string{"role:warehouse_manager"})
+		// 帧里的 roles 才是唯一来源：夹带的字段既不能额外授予（上面那条用例）、
+		// 也不能把 token 换来的角色「取交集」掉——合并/裁剪都是另一种准入语义。
+		env.host.pushFrame(`{"type":"tenon.confirm","confirmId":"cfm_junk1","planId":"pln_junk1",
+			"decision":"approve","patch":null,"by":"user:bob","roles":["role:warehouse_manager"],
+			"claims":{"roles":["role:clerk"]},"approverRoles":["role:clerk"],
+			"at":"2026-10-27T09:00:00Z"}`)
+
+		p := env.poller()
+		env.tick(p)
+
+		archived, err := env.store.LoadArchived("pln_junk1")
+		if err != nil {
+			t.Fatalf("帧里的 roles 必须生效（夹带字段不许裁掉它）：%v", err)
+		}
+		if archived.State != agent.StateDone {
+			t.Fatalf("归档状态应当是 done，得到 %q", archived.State)
+		}
+		if actions := env.host.actionsSeen(); len(actions) != 1 {
+			t.Fatalf("角色生效后必须真的执行那一步，得到 %v", actions)
+		}
+	})
 }
