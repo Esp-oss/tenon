@@ -174,7 +174,7 @@ confirm 到达后按固定顺序：
    - 已收紧为 deny → 不执行；写计划级 result 段（`status:error, errorClass:policy_denied`，**`approvedBy` 仍记审批人**——他确实批了，是策略在恢复时拒绝的）→ 归档 `stale`。
 6. **终态归档**：`done` / `rejected` / `expired` / `stale` 一律移入 `archived/`，**并推一条 `state` 为终态的公告板覆盖**（见 §3.4）——否则已执行的单会在公告板上挂到过期为止，审批人看到一张早已完成的卡。
 
-**不重写 dispatched 段**：I2 要求 `dispatched.approvedBy` 恒为 `null`，所以恢复只补 result 段。
+**不重写 dispatched 段**：I2 要求**挂起时写的计划级** `dispatched.approvedBy` 恒为 `null`（那一刻确实没人批），所以恢复只补 result 段。**注意主语**：恢复执行时每步仍会写自己的 step 级 `dispatched`/`result` 两段，那两条的 `approvedBy` 是审批人——那是"这一步在谁的批准下执行"，与 I2 不冲突（实现更正：审计合规修复 `24e5a47`）。
 
 ---
 
@@ -249,7 +249,7 @@ confirm 到达后按固定顺序：
 | 不变量 | 机制 |
 |---|---|
 | I1 同一 `confirmId` 只一次副作用 | 状态迁移 + 原幂等键重放（模块幂等表吸收） |
-| I2 `dispatched.approvedBy` 恒 null | 恢复时不重写 dispatched，只补 result |
+| I2 挂起时写的计划级 `dispatched.approvedBy` 恒 null | 恢复时不重写那条 dispatched，只补 result；step 级两段的 `approvedBy` 记审批人 |
 | I3 过期绝不执行 | confirm 处理与启动自检两处都判 `expiresAt` |
 | I4 恢复前重跑 G4 | 固定顺序：审批人 → 过期 → G4 → policy/grant → 执行 |
 | I5 公告板可丢可重建 | 每 tick 幂等 upsert |

@@ -331,8 +331,13 @@ GET /tenon/modules
 
 ```json
 { "type": "tenon.confirm", "confirmId": "cfm_01J...", "planId": "pln_01JB...",
-  "decision": "approve", "patch": null, "by": "user:alice", "at": "2026-10-27T09:16:00Z" }
+  "decision": "approve", "patch": null, "by": "user:alice", "at": "2026-10-27T09:16:00Z",
+  "roles": ["role:warehouse_manager"] }
 ```
+
+> **`roles` 由宿主写入，客户端自报无效**：agent 侧判定"这个人能不能批"时用的是这个字段，所以它必须是**宿主验证过的 token 角色**。入队前宿主会先删掉帧里原有的 `roles`、再写入提交者 token 的 `claims.roles`（`internal/controlplane/inbound.go` 的 `normalizeInboundFrame`）。缺 token 仍 401；token 无角色则写入空数组——**不补默认角色**，agent 侧对空集 fail-closed（403）。
+>
+> **请求回合的业务链锚点**：`tenon.request` 帧里没有 `correlationId` 字段，agent 用宿主签发的 `requestId` 派生 `cor:request/<requestId>`（满足 `common.schema.json` 的 `^cor:\S+$`）。事件回合仍沿用事件自带的 `correlationId`。
 
 REST 三端点的报文：
 

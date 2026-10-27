@@ -182,6 +182,14 @@
         "at": {
           "description": "做出决定的时刻，带时区偏移。",
           "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/Iso8601Timestamp"
+        },
+        "roles": {
+          "description": "决定者经过验证的角色集（宿主写入，非客户端自报）。入队前宿主先删除帧内原有的 roles、再写入提交者 token 的 claims.roles；token 无角色时写入空数组，不补默认角色。agent 侧用它判定「这个人能不能批」，对空集 fail-closed。",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^role:[^\\s]+$"
+          }
         }
       },
       "allOf": [

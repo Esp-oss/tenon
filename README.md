@@ -212,9 +212,11 @@ docker compose -f compose.m0.yaml config --quiet
 
 ### 还没做的
 
-dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、**agent 侧的挂起/恢复**（不消费入站队列、不读 `confirm`，所以审批通过也恢复不了执行）、**前端页面**（`GET /` 只是路由，`TENON_UI_DIR` 不配就回 503）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
+dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、**前端页面**（`GET /` 只是路由，`TENON_UI_DIR` 不配就回 503；对话入口有后端、没有界面）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、撤销与补偿（`ReleaseStock` 未接）、`amend`（JSON Patch 改 step 后再批）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
 
-> **审计形状的一处已知偏离（加严校验时会撞上）**：挂起与恢复的审计是**计划级**——`stepId=null`、没有 `action` / `inputHash`（人工批准的对象是整份 plan，不是某一步）。宿主当前的 `POST /tenon/audit` 只校验 `auditId` 非空与 `stage ∈ {dispatched, result}`，所以这些记录能落盘；但它们**不满足** `audit-event.schema.json` 的完整 required 集。也就是说：**审计链里存在非标准记录**。哪天宿主把校验加严到 schema 完整，挂起路径会全线失败——这是刻意接受的取舍（P2 设计 §4），不是疏漏。
+> **审批人角色只有一条来路**：`tenon.confirm` 帧里的 `roles` **由宿主写入**（取提交者 token 的 `claims.roles`，先删客户端自报再写）。agent 侧不读登录身份、不做兜底——它若读自己的登录角色，等于用服务账号的身份给人授权。也因此：**策略必须真的给出 `approvers`**，否则 `requiredRoles` 为空、`rolesIntersect` 对空集 fail-closed，会出现"板上有卡、谁点都 403"。这是 fail-closed 的必然结果，不是 bug。
+
+> **审计形状的一处已知偏离（加严校验时会撞上）**：**挂起那一刻**写的计划级 `dispatched`（`stepId=null`、无 `action` / `inputHash`）与恢复收尾的计划级 `result`，**不满足** `audit-event.schema.json` 的完整 required 集——人工批准的对象是整份 plan，不是某一步。宿主当前的 `POST /tenon/audit` 只校验 `auditId` 非空与 `stage ∈ {dispatched, result}`，所以这些记录能落盘。恢复执行的 **step 级**两段（`stepId` 非空）是 schema 完整的，且带 `decision.approvedBy`；`effects.entities` 已统一写 `[]`（不是 `null`）。哪天宿主把校验加严到 schema 完整，**计划级那两条会全线失败**——这是刻意接受的取舍（P2 设计 §4），不是疏漏。
 
 里程碑：
 
@@ -222,7 +224,8 @@ dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、�
 |---|---|---|
 | M0 | schema + conformance C1–C3/C8/C9/C10 + lint + `inventory` / `procurement` 两个侧车 | 模块侧用例全绿 |
 | **M0.5（已完成）** | `host` + `agent` + `quote` + 协议扩展三处（写审计 / 注册表 / 发件箱） | C4/C5 判 PASS（**已达成**）；D1 需真 LLM 跑一次 A/B（**未跑**，接线已就位） |
-| **M1 切片 1（已完成）** | host 入站面：落盘入站队列 / dev 身份 / `origin` 进策略 / 业务级规则 / 待批公告板 / 同源静态页 | 入站与策略侧用例全绿；**链路未通**——agent 侧（P2）与页面（P3）未做 |
+| **M1 切片 1（已完成）** | host 入站面：落盘入站队列 / dev 身份 / `origin` 进策略 / 业务级规则 / 待批公告板 / 同源静态页 | 入站与策略侧用例全绿 |
+| **M1 切片 2（已完成）** | agent 侧：消费入站队列 / 挂起落盘（I7 三次写）/ 审批人角色通道 / 恢复执行 / 去重账本 / 公告板终态 | 端到端真跑通：投一句话 → 挂起 → bob 批准 → 真扣库存 → 归档 done；缺界面（P3） |
 | M1（剩余） | agent 挂起/恢复 + `pendingPlanId` + 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 | 高风险路径必须人工；对账能发现篡改 |
 | M2 | HTTP 侧车 SDK + MCP 双向 + 非 TS 示例 | 非 TS 模块跑通全套用例 |
 | M3 | skill 仓库 + 轨迹蒸馏 + 发布审计/回滚 | 新流程只改 skill 即可上线 |
