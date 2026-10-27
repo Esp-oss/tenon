@@ -1137,3 +1137,35 @@ func TestDiscoverCarriesActionMeta(t *testing.T) {
 		t.Fatalf("Title 也要带走（R2 兜底要用）")
 	}
 }
+
+// 挂起时渲染一次并落盘：labels 是白话、details 是技术原文、summary 是白话拼接。
+//
+// 注意 runner.modules 是 map[string]string（模块 → 基地址），**不携带**模板；
+// 发现结果（[]ModuleDigest）只在 run() 里以局部变量 digest 存在，所以元信息
+// 是以参数传进 buildPending 的，不挂在 runner 上。
+func TestBuildPendingRendersPlainLanguage(t *testing.T) {
+	meta := map[string]ActionMeta{
+		"inventory.DeductStock": {Title: "扣减库存", SummaryTemplate: "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）"},
+	}
+	r := &runner{
+		deps:  Deps{OnBehalfOf: "user:alice"},
+		event: DomainEvent{Subject: json.RawMessage(`"inventory:SKU/STD-1002"`)},
+	}
+	plan := Plan{PlanID: "pln_1", Trigger: PlanTrigger{EventID: "evt_1"}, Steps: []PlanStep{{
+		StepID: "s1", Action: "inventory.DeductStock", Kind: "write",
+		Args: json.RawMessage(`{"sku":"STD-1002","qty":3,"referenceNo":"Q-2026-0417"}`),
+	}}}
+	got, err := r.buildPending(plan, policyEvaluation{Approvers: []string{"role:warehouse_manager"}}, meta)
+	if err != nil {
+		t.Fatalf("buildPending 失败：%v", err)
+	}
+	if want := "扣减 STD-1002 库存 3 件（单据 Q-2026-0417）"; got.Labels[0] != want {
+		t.Fatalf("label = %q，期望 %q", got.Labels[0], want)
+	}
+	if len(got.Details) != 1 || !strings.Contains(got.Details[0], "inventory.DeductStock") {
+		t.Fatalf("details 必须带 action id：%v", got.Details)
+	}
+	if got.Summary != got.Labels[0] {
+		t.Fatalf("单步计划的 summary 应等于该步白话：%q", got.Summary)
+	}
+}

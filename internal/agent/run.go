@@ -360,7 +360,9 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 				Detail: fmt.Sprintf("策略闸门要求审批（outcome=%s decidedBy=%v），但没有挂起通道（Deps.State 为空）：转人工",
 					policy.Outcome, policy.DecidedBy)}, ""
 		}
-		pending, err := r.buildPending(plan, policy)
+		// 元信息取本轮规划用的同一份发现结果（PlanInput.Modules 已带 ActionMeta）：
+		// 渲染与规划看的是同一张能力清单，不会出现「计划里的动作渲染不出模板」。
+		pending, err := r.buildPending(plan, policy, actorMeta(in.Modules))
 		if err != nil {
 			return RunResult{Outcome: OutcomeNeedsHuman, Detail: err.Error()}, ""
 		}
@@ -414,7 +416,7 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 //
 // requestId 可为 null（事件回合）：spec §6.3 要求「等审批」只有一条实现路径，不分来源，
 // 所以事件回合也挂起，只是 origin=event。
-func (r *runner) buildPending(plan Plan, policy policyEvaluation) (Pending, error) {
+func (r *runner) buildPending(plan Plan, policy policyEvaluation, meta map[string]ActionMeta) (Pending, error) {
 	// 挂起前必须确认「谁能批」：rolesIntersect 对空集 fail-closed，requiredRoles 为空的
 	// approve 计划**谁点都是 403**。挂上去只会得到一张永远批不掉的卡——它占着公告板、
 	// 占着一个审批窗口，而审批人点下去只换来一次 403。这不是可恢复状态（换个人批也一样），
@@ -425,10 +427,7 @@ func (r *runner) buildPending(plan Plan, policy policyEvaluation) (Pending, erro
 		return Pending{}, fmt.Errorf(
 			"策略要求审批但没有给审批人角色（requiredRoles 为空，谁批都会 403）：不挂起，转人工")
 	}
-	labels, err := renderLabels(plan)
-	if err != nil {
-		return Pending{}, fmt.Errorf("渲染白话失败：%w", err)
-	}
+	labels, details := renderSteps(plan, meta)
 	now := time.Now().UTC()
 	var reqID *string
 	if r.request != nil && r.request.RequestID != "" {
@@ -448,6 +447,7 @@ func (r *runner) buildPending(plan Plan, policy policyEvaluation) (Pending, erro
 		By:             r.deps.OnBehalfOf,
 		Plan:           plan,
 		Labels:         labels,
+		Details:        details,
 		Summary:        strings.Join(labels, "；"),
 		RequiredRoles:  policy.Approvers,
 		CreatedAt:      now.Format(time.RFC3339),
@@ -456,6 +456,20 @@ func (r *runner) buildPending(plan Plan, policy policyEvaluation) (Pending, erro
 		// 丢了它，恢复执行的审计 effects.entities 与 Intent 帧 actions 就退化成空数组。
 		Subject: r.event.Subject,
 	}, nil
+}
+
+// actorMeta 把本轮发现结果压平成 action id → 元信息，供渲染器按 step 查。
+//
+// 模块间 action id 全局唯一（module.action 的格式），所以不需要再带模块维度；
+// 同一 id 重复出现只可能来自注册表脏数据，后者覆盖前者不影响渲染的可读性。
+func actorMeta(modules []ModuleDigest) map[string]ActionMeta {
+	out := make(map[string]ActionMeta)
+	for _, m := range modules {
+		for id, meta := range m.ActionMeta {
+			out[id] = meta
+		}
+	}
+	return out
 }
 
 // hasApproverRole 判断策略是否真的给了审批人角色（空白条目不算）。
