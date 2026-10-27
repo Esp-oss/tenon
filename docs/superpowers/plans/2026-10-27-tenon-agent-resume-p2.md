@@ -2248,7 +2248,7 @@ git commit -m "feat(agent): 公告板重推与终态覆盖"
 - Modify: `internal/controlplane/pending.go`（`pendingItem` 加字段 + 缺省值）
 - Test: `internal/controlplane/pending_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // 公告板条目必须带回 state：它是"待批"与"刚刚处理完"的唯一区分。
@@ -2263,7 +2263,7 @@ func TestPendingBoardDefaultsStateToAwaiting(t *testing.T) {}
 
 （用例骨架实现者补全，沿用 `pending_test.go` 现有的 `newTestServer` / token 夹具；`expiresAt` 用远期常量。）
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
 
 ```go
 type pendingItem struct {
@@ -2276,14 +2276,14 @@ type pendingItem struct {
 
 在 upsert 里补缺省：`if item.State == "" { item.State = "awaiting_approval" }`；`List` 仍按 `expiresAt` 剔除过期条目（不变）。
 
-- [ ] **Step 3: 跑测试**
+- [x] **Step 3: 跑测试**
 
 ```bash
 go test ./internal/controlplane/ -run 'TestPendingBoard' -count=1 -v
 go test ./... -count=1
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add internal/controlplane/pending.go internal/controlplane/pending_test.go
@@ -2298,7 +2298,7 @@ git commit -m "feat(controlplane): 公告板条目带回 state（终态覆盖否
 
 **Task 9 复核后追加的四条（比正文更权威）**
 
-1. **终态覆盖必须有生产调用点**：`finishTerminal` 未导出、`Resume` 无凭证。选**方案 (b)**：`Resume` 把终态（`*Pending` + `PendingState`）作为返回值给 poller，由 poller 用它的 `HostClient` 推（`board.go` 加一个导出包装 `PushTerminal(ctx, client, p, state) error`）。
+1. **终态覆盖必须有生产调用点**：`finishTerminal` 未导出、`Resume` 无凭证。**最终选法（比初版的方案 (b) 更省）**：`board.go` 加导出包装 `PushTerminal(ctx, client *HostClient, p Pending, state PendingState) error`；poller 在 `Resume` 成功返回后用 `store.LoadArchived(planId)` 取归档件再推。**`Resume` 签名一个字不用改**——调用方本来就知道 `planId`；重放时归档件已在，再推一次是幂等 upsert。**推失败绝不能回滚归档**（回滚会让同一 confirm 被重放执行第二次），错误只记日志。
 2. **挂起前校验 `approvers` 非空**：`rolesIntersect` 对空集 fail-closed，`requiredRoles` 为空的 approve 计划**谁点都是 403**。在 `buildPending`/挂起处判空 → 不挂起、走 `needs_human` 且 Detail 写明"策略要求审批但没给审批人角色"。
 3. **`resumeError.Retryable` 要能被调用方判断**：加 `agent.IsRetryable(err) bool`；确定性拒绝（角色不匹配/过期/未知 planId/已归档非 done/未知处置）立即 ack，可重试才留到下一 tick。
 4. **合成事件 id 必须确定性**：`evt_req_<requestId>`，**不要用 `newID()`**（时间基会让同一 request 在重启/重放后 triggerEventId 漂移，审计对账对不上）。
