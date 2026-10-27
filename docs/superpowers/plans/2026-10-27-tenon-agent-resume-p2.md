@@ -731,12 +731,7 @@ func TestSelfCheckSettlesAuditWhenPresent(t *testing.T) {
 		t.Fatalf("标记未补上：%+v ok=%v", got, ok)
 	}
 }
-
-var _ = errors.New
-var _ = filepath.Join
 ```
-
-> 删掉文件末尾两行占位 `var _`（写测试时若 import 未用到会编译失败，实现落地后按实际 import 清理）。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -1874,7 +1869,7 @@ func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutc
 		client:      deps.HTTP,
 	}
 	if r.client == nil {
-		r.client = defaultHTTPClient()
+		r.client = &http.Client{Timeout: 10 * time.Second}
 	}
 	// 闸门：策略（恢复时重跑，收紧即生效）与授权。
 	policy, err := r.evaluatePolicies(ctx, p.Plan)
