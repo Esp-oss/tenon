@@ -93,6 +93,12 @@ func (s *Server) servePending(w http.ResponseWriter, r *http.Request) {
 			writeTenonError(w, *perr)
 			return
 		}
+		// 写公告板只允许 agent：普通用户若能写，就能给审批人塞一张伪造的待批卡片。
+		if !claims.hasRole(roleAgent) {
+			writeTenonErrorStatus(w, http.StatusForbidden,
+				*newError(protocol.ClassPolicyDenied, "FORBIDDEN_ROLE", "写公告板只允许 agent 服务账号"))
+			return
+		}
 		body, perr := readBody(r)
 		if perr != nil {
 			writeTenonError(w, *perr)

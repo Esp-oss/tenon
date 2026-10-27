@@ -38,6 +38,17 @@ func login(t *testing.T, base string) string {
 	return got.Token
 }
 
+// agentToken 签一枚 agent 服务账号的 token：入站队列的消费侧（poll/ack）与公告板的
+// 写入侧都要求 role:agent，普通用户 token 会被 403。
+func agentToken(t *testing.T) string {
+	t.Helper()
+	tok, err := SignToken([]byte("secret"), "agent:test", []string{roleAgent}, time.Now().UTC(), time.Hour)
+	if err != nil {
+		t.Fatalf("签发 agent token 失败：%v", err)
+	}
+	return tok
+}
+
 func postJSONAuth(t *testing.T, url, token, body string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
@@ -76,7 +87,7 @@ func TestInboundOverwritesByAndMintsSyntheticID(t *testing.T) {
 		t.Fatalf("入队失败 %d：%s", status, body)
 	}
 
-	_, pollBody := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", tok)
+	_, pollBody := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", agentToken(t))
 	var got struct {
 		Frames []struct {
 			Seq   int64           `json:"seq"`
@@ -129,7 +140,7 @@ func TestInboundOriginRegistrySurvivesRestart(t *testing.T) {
 		t.Fatalf("入队失败 %d：%s", status, body)
 	}
 	var evtID string
-	_, pollBody := getJSONAuth(t, ts1.URL+"/tenon/requests/poll?after=0", tok)
+	_, pollBody := getJSONAuth(t, ts1.URL+"/tenon/requests/poll?after=0", agentToken(t))
 	var poll struct {
 		Frames []struct {
 			Frame json.RawMessage `json:"frame"`
@@ -158,8 +169,8 @@ func TestInboundOriginRegistrySurvivesRestart(t *testing.T) {
 func TestInboundAckRejectsNegativeUpto(t *testing.T) {
 	_, ts := newInboundServer(t)
 	defer ts.Close()
-	tok := login(t, ts.URL)
-	status, body := postJSONAuth(t, ts.URL+"/tenon/requests/ack", tok, `{"upto":-1}`)
+	// ack 要求 role:agent：先用用户 token 会被 403 挡在参数校验之前。
+	status, body := postJSONAuth(t, ts.URL+"/tenon/requests/ack", agentToken(t), `{"upto":-1}`)
 	if status != http.StatusBadRequest {
 		t.Fatalf("负 upto 应 400，得到 %d：%s", status, body)
 	}
@@ -186,7 +197,7 @@ func TestInboundReportsNonDurableOnPersistFailure(t *testing.T) {
 	if !strings.Contains(body, `"durable":false`) {
 		t.Fatalf("必须明确告知未落盘，得到 %s", body)
 	}
-	if _, pollBody := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", tok); !strings.Contains(pollBody, `"seq":1`) {
+	if _, pollBody := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", agentToken(t)); !strings.Contains(pollBody, `"seq":1`) {
 		t.Fatalf("落盘失败时帧仍应在内存队列里可回放，得到 %s", pollBody)
 	}
 	// Broken 是这条失败的唯一出口（Push 只回序号）：必须能读到。
@@ -252,4 +263,58 @@ func getJSONAuth(t *testing.T, url, token string) (int, string) {
 		t.Fatalf("读取响应失败：%v", err)
 	}
 	return resp.StatusCode, string(raw)
+}
+
+// 普通用户 token 不能消费入站队列：poll 读得到别人说过的话，ack 能吞掉未处理的请求。
+func TestInboundRejectsUserTokenOnConsumerEndpoints(t *testing.T) {
+	_, ts := newInboundServer(t)
+	defer ts.Close()
+	userTok := login(t, ts.URL)
+
+	if status, _ := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", userTok); status != http.StatusForbidden {
+		t.Fatalf("用户 token poll 应 403，得到 %d", status)
+	}
+	if status, _ := postJSONAuth(t, ts.URL+"/tenon/requests/ack", userTok, `{"upto":1}`); status != http.StatusForbidden {
+		t.Fatalf("用户 token ack 应 403，得到 %d", status)
+	}
+	if status, _ := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", agentToken(t)); status != http.StatusOK {
+		t.Fatalf("agent token poll 应 200，得到 %d", status)
+	}
+}
+
+// TENON_REQUIRE_TRIGGER=1 时缺 triggerEventId 必须 200 + deny + MISSING_TRIGGER：
+// 处置与其它策略结论同形，消费方不该为它加 4xx 重试逻辑。
+func TestPoliciesEvaluateMissingTriggerDenies(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(t, Config{
+		AuditPath:      dir + "/audit.jsonl",
+		SessionSecret:  []byte("secret"),
+		InboundDir:     dir + "/inbound",
+		RequireTrigger: true,
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	status, raw := postJSON(t, ts.URL+"/tenon/policies:evaluate",
+		`{"plan":{"planId":"pln_1","steps":[{"stepId":"s1","action":"inventory.GetStock","args":{"sku":"X"}}]}}`)
+	if status != http.StatusOK {
+		t.Fatalf("缺 triggerEventId 应 200（处置走 body），得到 %d：%s", status, raw)
+	}
+	var got struct {
+		Outcome   string   `json:"outcome"`
+		Reasons   []string `json:"reasons"`
+		DecidedBy []string `json:"decidedBy"`
+	}
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("响应坏：%v", err)
+	}
+	if got.Outcome != "deny" {
+		t.Fatalf("应为 deny，得到 %q（%s）", got.Outcome, raw)
+	}
+	if len(got.Reasons) != 1 || got.Reasons[0] != "MISSING_TRIGGER" {
+		t.Fatalf("reasons 应为 [MISSING_TRIGGER]，得到 %v", got.Reasons)
+	}
+	if len(got.DecidedBy) != 0 {
+		t.Fatalf("decidedBy 应为空数组，得到 %v", got.DecidedBy)
+	}
 }

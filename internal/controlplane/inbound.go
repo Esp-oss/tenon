@@ -204,7 +204,14 @@ func (s *Server) serveInboundPoll(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodGet)
 		return
 	}
-	if _, ok := s.bearerClaims(w, r); !ok {
+	// 消费侧只允许 agent：普通用户 token 能读队列就读得到别人说过的话。
+	claims, ok := s.bearerClaims(w, r)
+	if !ok {
+		return
+	}
+	if !claims.hasRole(roleAgent) {
+		writeTenonErrorStatus(w, http.StatusForbidden,
+			*newError(protocol.ClassPolicyDenied, "FORBIDDEN_ROLE", "入站队列只允许 agent 服务账号消费"))
 		return
 	}
 	after, perr := parseAfter(r.URL.Query().Get("after"))
@@ -225,7 +232,14 @@ func (s *Server) serveInboundAck(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	if _, ok := s.bearerClaims(w, r); !ok {
+	// 只允许 agent：ack 一推进，未被处理的用户请求就再也回放不出来（拒绝服务）。
+	claims, ok := s.bearerClaims(w, r)
+	if !ok {
+		return
+	}
+	if !claims.hasRole(roleAgent) {
+		writeTenonErrorStatus(w, http.StatusForbidden,
+			*newError(protocol.ClassPolicyDenied, "FORBIDDEN_ROLE", "入站队列只允许 agent 服务账号确认"))
 		return
 	}
 	if perr := preflight(r); perr != nil {

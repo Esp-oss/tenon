@@ -22,12 +22,17 @@ func TestPendingBoardUpsertAndRoleFilter(t *testing.T) {
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
 
-	agentTok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", nil, time.Now().UTC(), time.Hour)
+	agentTok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", []string{roleAgent}, time.Now().UTC(), time.Hour)
 	body := `{"planId":"pln_1","requestId":"req_1","by":"user:alice",
 	          "summary":"扣 12 件、开 1 张采购单","items":[{"label":"从标准件仓扣掉 12 件"}],
 	          "requiredRoles":["role:warehouse_manager"],"expiresAt":"2026-10-27T09:15:00Z"}`
 	if status, resp := postJSONAuth(t, ts.URL+"/tenon/pending", agentTok, body); status != http.StatusOK {
 		t.Fatalf("推摘要失败 %d：%s", status, resp)
+	}
+	// 写公告板只允许 agent：普通用户 token 若能写，就能给审批人塞伪造卡片。
+	clerkTok, _ := SignToken([]byte("secret"), "user:alice", []string{"role:warehouse_clerk"}, time.Now().UTC(), time.Hour)
+	if status, resp := postJSONAuth(t, ts.URL+"/tenon/pending", clerkTok, body); status != http.StatusForbidden {
+		t.Fatalf("用户 token 写公告板应 403，得到 %d：%s", status, resp)
 	}
 	// 幂等 upsert：同 planId 再推一次不应变成两条。
 	postJSONAuth(t, ts.URL+"/tenon/pending", agentTok, body)
@@ -73,7 +78,7 @@ func TestPendingBoardPrunesExpiredItems(t *testing.T) {
 	})
 	ts := httptest.NewServer(s.Handler())
 	defer ts.Close()
-	tok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", nil, time.Now().UTC(), time.Hour)
+	tok, _ := SignToken([]byte("secret"), "agent:ag_fulfillment", []string{roleAgent}, time.Now().UTC(), time.Hour)
 
 	past := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
 	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)

@@ -29,6 +29,21 @@ type Claims struct {
 	Exp     int64    `json:"exp"`
 }
 
+// roleAgent 是 agent 服务账号的角色。入站队列的消费侧（poll/ack）与公告板的写入侧
+// 只允许它调用：普通用户 token 若能 ack，就能把还没处理的用户请求直接吞掉；若能写
+// 公告板，就能给审批人塞一张伪造的待批卡片（真正的 plan 在 agent 盘上，卡片却由他写）。
+const roleAgent = "role:agent"
+
+// hasRole 判断 claims 是否带某个角色。
+func (c Claims) hasRole(role string) bool {
+	for _, r := range c.Roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
 // 错误值：调用方（HTTP 处理器）据此决定 401 还是 500。
 var (
 	ErrTokenInvalid = errors.New("token 无效")

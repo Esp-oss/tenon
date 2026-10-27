@@ -208,6 +208,7 @@ flowchart TB
 - token = `base64url(payload).base64url(HMAC-SHA256(payload, TENON_SESSION_SECRET))`，`payload = {sub, roles, exp}`，有效期 8 小时。无状态、不引存储。
 - **三个入站端点全部要求 `Authorization: Bearer <token>`**（`POST /tenon/requests`、`GET /tenon/requests/poll`、`POST /tenon/requests/ack`）；缺失/过期/签名坏 → `401` 且**不入队**。鉴权先于 `Content-Type` 预检：未认证的调用不该拿到「你 Content-Type 不对」这种端点细节。
 - **两类调用方**：前端用**用户账号**（`alice`/`bob`）；agent 是服务，用**服务账号**（dev 账号表里 `agent` → `role:agent`）。所以 poll/ack 也必须鉴权——`poll` 会把别人说过的话摊开，`ack` 能把还没被处理的用户请求直接吞掉（游标一推进就再也回放不出来，这是拒绝服务而不只是越权）。
+- **光有 token 不够，消费侧要求 `role:agent`**：`GET /tenon/requests/poll`、`POST /tenon/requests/ack`、`POST /tenon/pending`（公告板写入）只接受服务账号，用户 token 一律 `403 FORBIDDEN_ROLE`。理由：用户 token 若能 ack 就能吞掉别人的请求；若能写公告板，就能给审批人塞一张伪造的待批卡片（真正的 plan 在 agent 盘上，卡片却由他写）。`POST /tenon/requests`（说话/批准）仍接受用户 token——那正是业务员要做的事。
 - 宿主解析出 `by` 后**覆写**帧里的 `by`。
 
 > **诚实边界**：这是开发态身份，不是真认证——无口令强度策略、无失败锁定、无 token 吊销、无 SSO。它挡住的是「冒充别人批准」，挡不住「拿到口令的人」。文件名与响应字段都带 `dev`，README 必须原样写这句。
