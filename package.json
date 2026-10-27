@@ -1,0 +1,20 @@
+{
+  "name": "tenon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tenon（榫卯）—— 让 AI 直接操作业务系统的可插拔协议",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "validate": "node scripts/validate-spec.mjs",
+    "typecheck": "tsc -p packages/tenon-core/tsconfig.json --noEmit",
+    "check": "pnpm run validate && pnpm run typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
