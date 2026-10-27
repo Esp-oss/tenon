@@ -295,9 +295,15 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 			Detail: "策略评估不可用（fail-closed，不做任何写）：" + err.Error()}, ""
 	}
 	if policy.Outcome == outcomeDeny {
-		return RunResult{Outcome: OutcomeNeedsHuman,
-			Detail: fmt.Sprintf("策略闸门拒绝：outcome=%s decidedBy=%v reasons=%v（转人工，不换路绕过）",
-				policy.Outcome, policy.DecidedBy, policy.Reasons)}, ""
+		// 把计划动作写进 detail：只写「被拒绝」而不写「谁被拒」，排障只能靠猜
+		// （2026-10-27 的真实教训：结果行里 动作=[]，不知道是哪个动作触发了 deny）。
+		detail := fmt.Sprintf("策略闸门拒绝：outcome=%s decidedBy=%v reasons=%v",
+			policy.Outcome, policy.DecidedBy, policy.Reasons)
+		if note := planActionsNote(plan); note != "" {
+			detail += " " + note
+		}
+		detail += "（转人工，不换路绕过）"
+		return RunResult{Outcome: OutcomeNeedsHuman, Detail: detail}, ""
 	}
 	// policy.schema.json 是封闭枚举，但宿主的响应不受本包控制：除 auto/approve 之外的
 	// 任何取值（含空串）都按「没放行」处理——不猜它是不是 approve，也不让它掉进执行。
@@ -459,7 +465,6 @@ func (r *runner) buildPending(plan Plan, policy policyEvaluation, meta map[strin
 }
 
 // actorMeta 把本轮发现结果压平成 action id → 元信息，供渲染器按 step 查。
-//
 // 模块间 action id 全局唯一（module.action 的格式），所以不需要再带模块维度；
 // 同一 id 重复出现只可能来自注册表脏数据，后者覆盖前者不影响渲染的可读性。
 func actorMeta(modules []ModuleDigest) map[string]ActionMeta {
@@ -470,6 +475,21 @@ func actorMeta(modules []ModuleDigest) map[string]ActionMeta {
 		}
 	}
 	return out
+}
+
+// planActionsNote 把计划里的动作按步骤顺序列出来，供拒绝/失败时写进 detail。
+// 用 step 顺序而不是排序：排障时要能对上计划原文。
+// 空计划返回空串——「计划为空」与「计划里全是未覆盖动作」是两种不同的失败，
+// 不要在 detail 里留一句「计划动作=[]」把它们混成一种。
+func planActionsNote(plan Plan) string {
+	if len(plan.Steps) == 0 {
+		return ""
+	}
+	actions := make([]string, 0, len(plan.Steps))
+	for _, step := range plan.Steps {
+		actions = append(actions, step.Action)
+	}
+	return "计划动作=[" + strings.Join(actions, ", ") + "]"
 }
 
 // hasApproverRole 判断策略是否真的给了审批人角色（空白条目不算）。

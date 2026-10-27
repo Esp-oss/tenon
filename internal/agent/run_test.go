@@ -396,6 +396,11 @@ func TestPolicyDeniedGoesNeedsHumanWithoutWorkaround(t *testing.T) {
 	if !strings.Contains(res.Detail, "NO_POLICY_MATCH_DEFAULT_DENY") {
 		t.Fatalf("结局必须带上理由码，实际：%s", res.Detail)
 	}
+	// 同一条 detail 还要说清「是哪个动作被拒」：否则排障只能猜
+	// （2026-10-27 的真实教训——结果行里 动作=[]，没人知道是谁触发了 deny）。
+	if !strings.Contains(res.Detail, "计划动作=[inventory.DeductStock]") {
+		t.Fatalf("detail 必须列出被拒的计划动作，实际：%s", res.Detail)
+	}
 }
 
 // approve 命中、但**没有挂起通道**（Deps.State 为 nil）→ 仍转人工，且不带 pendingPlanId。
@@ -1190,5 +1195,23 @@ func TestDiscoverCarriesRequiredArgs(t *testing.T) {
 	meta := got[0].ActionMeta["inventory.DeductStock"]
 	if len(meta.RequiredArgs) != 2 || meta.RequiredArgs[0] != "sku" {
 		t.Fatalf("requiredArgs 没带回来：%+v", meta)
+	}
+}
+
+// 被拒时必须能看出「是哪个动作被拒」：否则排障只能猜（2026-10-27 那次真实发生：
+// 结果行里 动作=[]，谁也不知道是哪个动作触发了 NO_POLICY_MATCH_DEFAULT_DENY）。
+func TestPolicyDenyDetailListsPlannedActions(t *testing.T) {
+	plan := Plan{PlanID: "pln_1", Steps: []PlanStep{
+		{StepID: "s1", Action: "inventory.ReleaseStock", Kind: "write"},
+		{StepID: "s2", Action: "inventory.GetStock", Kind: "read"},
+	}}
+	got := planActionsNote(plan)
+	if got != "计划动作=[inventory.ReleaseStock, inventory.GetStock]" {
+		t.Fatalf("计划动作描述不符：%q", got)
+	}
+
+	// 空计划不该产出「计划动作=[]」这种噪音：审批人都看不懂它在说什么。
+	if empty := planActionsNote(Plan{}); empty != "" {
+		t.Fatalf("空计划应返回空串，得到 %q", empty)
 	}
 }
