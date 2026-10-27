@@ -108,6 +108,37 @@ func TestJSONLQueueIgnoresTruncatedTail(t *testing.T) {
 	}
 }
 
+// 主文件被删、但 .meta 还在（运维只清了队列文件）：水位仍须从 meta 恢复，
+// 否则序号回绕，持旧游标的客户端会永久漏帧。
+func TestJSONLQueueKeepsSequenceWhenMainFileRemoved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbound.jsonl")
+	q, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("打开失败：%v", err)
+	}
+	q.Push(json.RawMessage(`{"n":1}`))
+	q.Push(json.RawMessage(`{"n":2}`))
+	if err := q.Close(); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("删除主文件失败：%v", err)
+	}
+
+	again, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("重开失败：%v", err)
+	}
+	defer again.Close()
+	if got := again.Highest(); got != 2 {
+		t.Fatalf("主文件缺席时水位应仍为 2，得到 %d", got)
+	}
+	if seq := again.Push(json.RawMessage(`{"n":3}`)); seq != 3 {
+		t.Fatalf("新帧序号应为 3，得到 %d", seq)
+	}
+}
+
 // 整份文件损坏时，序号不能退回 0：否则持旧游标的客户端会漏掉以后所有帧。
 func TestJSONLQueueCorruptFileKeepsSequence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inbound.jsonl")

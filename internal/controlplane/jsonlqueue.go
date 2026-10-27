@@ -52,6 +52,9 @@ func newJSONLQueue(path string, capacity int) (*jsonlQueue, error) {
 func (q *jsonlQueue) load() error {
 	f, err := os.Open(q.path)
 	if os.IsNotExist(err) {
+		// 主文件不在、但 meta 可能在（运维手工清了队列文件）：水位仍要从 meta 恢复，
+		// 否则序号回绕，持旧游标的客户端会永久漏帧。
+		q.loadMeta()
 		return nil
 	}
 	if err != nil {

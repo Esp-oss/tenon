@@ -24,6 +24,8 @@ git worktree add ../dsh_for_sys-p1 -b feat/p1-host-inbound
 
 **已知限制（P1 不解决，记录在案）**：`Queue` 是导出接口，但签名里带未导出类型 `queuedFrame`，两个构造函数也未导出——包外无法实现或构造它，只能经 `Config.InboundDir` 间接装配。spec §8 把 Queue 定义为「内部接口」，所以本轮不修；将来要支持从 `cmd/host` 注入自定义队列实现时，需要同时导出行类型与构造函数。
 
+**运维约定（必须写进 Task 9 的启动说明）**：重置入站队列要**同时删** `requests.jsonl` 与 `requests.jsonl.meta`。只删前者时水位会从 meta 续上（序号不回 1），看起来像"队列清空了但客户端还有旧游标"。反过来说，这也是刻意设计：单删主文件时序号仍单调，不会让持旧游标的客户端漏帧。
+
 **本计划刻意包含一处受控重构**：把现有 `intentQueue` 提取成 `Queue` 端口的 `memoryQueue` 实现。出站行为**不变**，靠既有的 `TestIntentsRESTRoundTrip` / `TestIntentsRejectsBadFrame` 当安全网。不做这个提取，就要复制约 70 行队列代码，两份迟早漂移。
 
 **一处与 spec 的时序偏差（已获准，记录在案）**：spec §3.11 要求 `policies:evaluate` 的 `triggerEventId` 必填、缺失即 `deny`。但现有 `cmd/agent` 还不发这个字段，P1 若立刻强制会导致整个 agent 停摆（P2 才改 agent）。因此 P1 引入过渡开关：
@@ -683,6 +685,8 @@ git commit -m "fix(controlplane): 入站队列序号水位独立落盘（主文�
 ```
 
 **明确不改的**：`Push` 仍做全量 rewrite。改成 append 看似更快，但文件末尾若留半行（崩溃），append 会把新帧拼在坏行后面产出**一条更坏的行**，新帧静默丢失；而全量 rewrite 顺带把坏行治好。这条理由要写进代码注释，别让后人"优化"回去。
+
+**复核追加（已随实现落地）**：Task 2b 的执行者发现 `load()` 在 `os.IsNotExist` 处**早退**，绕过了 `loadMeta()`——主文件被删、`.meta` 尚在时序号仍会回绕。已补一行 `q.loadMeta()` 与用例 `TestJSONLQueueKeepsSequenceWhenMainFileRemoved`（断言主文件缺席时 `Highest()` 仍为 2、下一帧为 3）。至此「坏文件」与「文件被删」两条路径都由 meta 兜底。
 
 ---
 
