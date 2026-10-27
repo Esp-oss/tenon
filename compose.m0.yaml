@@ -117,6 +117,9 @@ services:
       TENON_MODULE_ID: "quote"
       TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
       TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-quote.jsonl"
+      # 仅测试拓扑：挂载 POST /tenon/admin/reset（D1 的 A/B 两轮靠它造同一输入）。
+      # 生产必须删掉——它会把幂等记账与两张事件表一起抹掉。
+      TENON_TEST_MODE: "1"
     secrets:
       - tenon_hmac
     volumes:
@@ -143,6 +146,8 @@ services:
       TENON_MODULE_ID: "inventory"
       TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
       TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-inventory.jsonl"
+      # 仅测试拓扑：见 quote 段的说明，生产必须删掉。
+      TENON_TEST_MODE: "1"
     secrets:
       - tenon_hmac
     volumes:
@@ -169,6 +174,8 @@ services:
       TENON_MODULE_ID: "procurement"
       TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
       TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-procurement.jsonl"
+      # 仅测试拓扑：见 quote 段的说明。D1 的 B 轮就是先 reset 再把它摘掉。
+      TENON_TEST_MODE: "1"
     secrets:
       - tenon_hmac
     volumes:

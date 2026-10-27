@@ -405,7 +405,7 @@ printf '%s' '<LLM API key>' > docker/secrets/llm.key
 | `GET /healthz` | 始终 | 进程存活 | **不检查依赖**。依赖挂了也返回 200，否则编排会误杀 |
 | `GET /readyz` | 始终 | 可以开始接协议请求 | 模块：`hmac_secret` + `audit_file`；宿主：`audit_file` + `policy_engine`。任一不满足 → **503** |
 | `POST /tenon/admin/modules` | 宿主 `TENON_TEST_MODE=1` | 登记/摘除模块：`{id, baseURL?, enabled?}`，返回最新注册表 | 关闭时回 **404**（不是 403——403 等于承认这里本来有个测试面） |
-| `POST /tenon/admin/reset` | 模块 `Module.TestMode` 为真 | 抹掉幂等表、收件箱、发件箱与两套游标，再调业务 `Reset()`；返回 `{"reset":true}` | 关闭时该路径**不在路由表里**，请求得到与「不存在」同形的 404 |
+| `POST /tenon/admin/reset` | 模块 `TENON_TEST_MODE=1`（`Module.TestMode`） | 抹掉幂等表、收件箱、发件箱与两套游标，再调业务 `Reset()`；返回 `{"reset":true}` | 关闭时该路径**不在路由表里**，请求得到与「不存在」同形的 404 |
 
 `admin/modules` 的开关语义（容易踩）：
 
@@ -413,7 +413,7 @@ printf '%s' '<LLM API key>' > docker/secrets/llm.key
 - 先 `Upsert`（新条目一律 `enabled:true`）再 `SetEnabled(false)`，因此「登记同时禁用」可以一次请求表达完。
 - 只给 `enabled` 而模块未登记 → 404 `MODULE_NOT_FOUND`（开关只能作用于已登记的模块，注册只能走 `Upsert`）。
 
-**已知的接线缺口：** `POST /tenon/admin/reset` 目前只能由 `Module.TestMode` 字段打开，而**没有任何 `cmd/*` 从环境变量读它**——即使在模块容器上设 `TENON_TEST_MODE=1`，该端点仍回 404（10:59 实测）。所以 `compose.m0.yaml` 的模块段**没有**声明这个变量，`§9` 缺口 8 记录此事。
+**接线方式：** 模块的 `POST /tenon/admin/reset` 由 `Module.TestMode` 字段控制，三个模块进程都用 `TENON_TEST_MODE=1` 打开它（`cmd/quote`、`cmd/inventory`、`cmd/procurement` 各自读一次，精确匹配 `"1"`）。两侧都实测过：设 `1` → 200 `{"reset":true}`，设 `0`（或不设）→ 与「路径不存在」同形的 404。**这个端点会抹掉幂等记账与两张事件表**，所以 `compose.m0.yaml` 只在测试拓扑里声明它。
 
 这两类端点都**不进协议、不进一致性套件**，可以自由改名——但 compose 的 `healthcheck` 要同步改。
 
@@ -437,8 +437,8 @@ printf '%s' '<LLM API key>' > docker/secrets/llm.key
 5. **`tokenUsage` 只能写 `{in:0,out:0}`。** `internal/llm` 不解析 `usage` 字段，agent 的审计记录里这两项是常量零。它不是「用量为零」，而是「没有采集」——按数值做成本统计会得出错误结论。
 6. **审计记录不保证 schema 完整。** 宿主 `POST /tenon/audit` 只校验 `auditId` 与 `stage`，`trigger` / `effects` / `decision` 等字段缺失也照原样落盘并计入哈希链。agent 侧已补齐必填字段（`trigger`/`inputHash`/`idempotencyKey`/`tokenUsage`），但**宿主不强制**：任何第三方写入者都可以落一条缺字段的记录，C4 的「链连续」不等于「记录合法」。
 7. **没有 Go AST 检查「agent 不得硬编码 action」。** C10 的 lint 只覆盖 TS/JS（`.ts/.tsx/.js/.jsx/.mjs/.cjs`）与 skill 正文的 `模块.动作` 形式；Go 写的 agent 靠「只使用 manifest 动态发现的 action id」这条纪律，外加差异测试兜底。这是设计文档 §8 已列的风险，不是遗漏。
-8. **测试态端点没有环境变量接线。** 模块的 `POST /tenon/admin/reset` 由 `Module.TestMode` 字段控制，而没有任何 `cmd/*` 从环境变量读它 → 在已发布二进制里该端点**不可达**（10:59 实测：设了 `TENON_TEST_MODE=1` 仍 404）。宿主侧 `POST /tenon/admin/modules` 的 `TENON_TEST_MODE` 是**真的**（只认 `"1"`）。直接后果：差异测试的 `resetModules` 必然在这一步失败（它自己会把原因写成「模块是否以测试态启动？」），A/B 两轮拿不到一致起点。
-9. **差异测试未在真 LLM 上验证。** `tenon d1 run` 与 `internal/d1` 已实现（A 轮全模块在场 → B 轮摘掉 procurement，比对两轮规划出的动作序列），但本轮**没有跑过真模型的 A/B**，而且即便跑也会卡在缺口 8（模块 reset 不可达，两轮拿不到一致起点）。所以 D1 的结论是**未判定**，不是「通过」也不是「失败」——`conformance` 里的 D1 仍是 SKIP。
+8. **模块侧的测试态开关没有启动期警告。** 宿主开 `TENON_TEST_MODE=1` 会打一行警告，模块不会；忘记删这个变量的环境里 `POST /tenon/admin/reset` 会安静地可用，而它抹掉的正是幂等记账与两张事件表（生产误开 = 丢账）。另外模块侧只认精确的 `"1"`：写成 `true` 静默不生效，排查时容易误判成「端点坏了」。
+9. **差异测试未在真 LLM 上验证。** `tenon d1 run` 与 `internal/d1` 已实现（A 轮全模块在场 → B 轮摘掉 procurement，比对两轮规划出的动作序列），前置接线也都到位（宿主与模块的测试面、agent 的 `TENON_RESULT_FILE` 都能用），但本轮**没有用真凭据跑过 A/B 两轮**。所以 D1 的结论是**未判定**，不是「通过」也不是「失败」——`conformance` 里的 D1 仍是 SKIP。
 10. **`agent` 的观测产物只有结果文件。** 每回合一行（`outcome`/`planId`/规划出的动作序列），不含 token 用量、也不含被丢弃的 Intent 帧；没有轮转与上限，长期跑要外部做日志轮转。
 11. **共驾只有 REST 降级通道。** `GET /tenon/intents` 一律 405，没有实时推送；队列有界（1024 帧），溢出丢最旧的。前端会话凭据也未定（M0.5 是裸连接）。
 12. **宿主不做能力发现。** 它拿不到动作定义，因此既不能判断 `kind`，也不能给读动作开「只读即放行」的特例：读动作必须在策略文件里逐个登记（`config/policies.dev.json` 给 `inventory.GetStock`、`quote.GetQuote` 各写了一条 `auto` 规则）。漏登记一个动作的后果是该动作所在的整份 plan 被判 deny——闸门上的响失败，不是静默放行。M1 接入 manifest 后可以放宽。
@@ -495,7 +495,7 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
   --agent-result out/agent-result.jsonl --report out/d1.json
 ```
 
-验收顺序：`host` 与各模块 `/readyz` 全 200 → `conformance` 跑 C1–C5/C8/C9/C10（宿主模式）→ `lint` 对仓库零命中 → D1 另需真 LLM 凭据，且卡在 §9 缺口 8。
+验收顺序：`host` 与各模块 `/readyz` 全 200 → `conformance` 跑 C1–C5/C8/C9/C10（宿主模式）→ `lint` 对仓库零命中 → D1 需真 LLM 凭据再跑一次 `d1 run`（接线已就位，见 §7）。
 
 ### 已经验过 / 还没验过
 
@@ -508,12 +508,12 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 | 模块侧 dry-run 404 降级 | ✅ C8 在真实 `inventory` 上判 PASS |
 | 模块侧 `direction=out` 发件箱 | ✅ `cmd/quote` 单测覆盖（`quote.completed` 入箱 + 游标）；端到端「事件 → agent 开回合」未验 |
 | agent 缺 `TENON_ON_BEHALF_OF` 启动即失败 | ✅ 实测 exit 1 + 明确报错 |
-| 模块 `TENON_TEST_MODE=1` 挂载 `admin/reset` | ❌ **未生效**（实测 404，§9 缺口 8） |
+| 模块 `TENON_TEST_MODE=1` 挂载 `admin/reset` | ✅ 实测：设 `1` → 200 `{"reset":true}`；设 `0` → 404 |
 | `tenon d1 run` 已实现（A/B 两轮 + 报告） | ✅ 子命令与 `internal/d1` 在仓库里（`--agent-result`/`--report` 参数齐全）；**未在真 LLM 上跑过** |
 | `host` 完整镜像启动 | ❌ 未验（运行时基础镜像与命名卷可写性都未在容器内验过） |
 | 模块 ↔ 宿主 HMAC 实际握手 | ❌ 未验：M0.5 没有调用方走这个方向（§3.4） |
 | `compose.m0.yaml` 端到端 `up` | ❌ 未验 |
-| D1 差异测试结论（pass/fail） | ❌ 未判定：缺真 LLM 凭据，且卡在模块 reset 不可达（§9 缺口 8、9） |
+| D1 差异测试结论（pass/fail） | ❌ 未判定：没有用真凭据跑过 A/B 两轮（§9 缺口 9） |
 | `-race` 并发验证 | ❌ 本机不跑（`CGO_ENABLED=0` 且无 gcc/clang），见设计增量 §10 |
 
 **上表的❌不许当成已实现来宣称。**

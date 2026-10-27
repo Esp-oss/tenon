@@ -72,7 +72,11 @@ docker build -f docker/node-service.Dockerfile --target build --build-arg PKG=@t
 
 ```bash
 docker compose -f compose.m0.yaml config --quiet   # 语法与引用完整性，现在就能过
-docker compose -f compose.m0.yaml build            # 逐服务构建；build 阶段可过，完整镜像受制于运行时基础镜像
+
+# 只验编译（不拉运行时基础镜像、不碰卷权限）——本条已实测：
+docker build -f docker/go-service.Dockerfile --target build --build-arg ENTRY=./cmd/host .
+
+# 完整镜像（docker compose build）还没验：运行时阶段要 alpine:3.20，且命名卷权限未验。
 ```
 
 7 个服务 + 2 个网络（`edge` 对外、`core` internal）+ 2 个 secret + 5 个命名卷：
@@ -89,7 +93,7 @@ docker compose -f compose.m0.yaml build            # 逐服务构建；build 阶
 
 端口与端点对照见 [`docs/interfaces.md`](../docs/interfaces.md) §1、§4。
 
-判据：`host`、三个模块的 `/readyz` 全 200 → `conformance`（带 `--host`）里 C4/C5 判 PASS → `lint` 零命中。D1 不在这些容器里：它要真 LLM 凭据，而且卡在模块 reset 的环境变量接线（[`docs/interfaces.md`](../docs/interfaces.md) §9 缺口 8）。
+判据：`host`、三个模块的 `/readyz` 全 200 → `conformance`（带 `--host`）里 C4/C5 判 PASS → `lint` 零命中。D1 不在这些容器里跑：它要真 LLM 凭据（`docker/secrets/llm.key` + `tenon d1 run`）。
 
 ## 几个刻意的选择
 
@@ -99,7 +103,7 @@ docker compose -f compose.m0.yaml build            # 逐服务构建；build 阶
 - **`quote` 是容器，不是进程内插件**：本轮宿主选了 Go，没有 TS 宿主，进程内路径 deferred。用容器包一个不存在的进程内插件只会造出假的边界。
 - **`conformance` / `lint` 是一次性任务**：退出码就是结论，不常驻、不健康检查。
 - **`/healthz` 不检查依赖**：否则依赖挂了会把健康容器一起杀掉。依赖就绪走 `/readyz`（两侧检查项不同，见 `interfaces.md` §7）。
-- **测试态端点只在测试拓扑里给**：`host` 段写了 `TENON_TEST_MODE: "1"`（差异测试靠它摘模块），生产部署必须删掉。模块段**没有**声明 `TENON_TEST_MODE`——`internal/module` 目前不读这个变量，写了也不生效（`interfaces.md` §9 缺口 8）。
+- **测试态端点只在测试拓扑里给**：`host` 与三个模块都写了 `TENON_TEST_MODE: "1"`（宿主挂 `POST /tenon/admin/modules`，模块挂 `POST /tenon/admin/reset`）——差异测试的「摘模块 + 两轮同输入」全靠这两个端点。生产部署必须把它们全部删掉：宿主侧能改调度面，模块侧会抹掉幂等记账与两张事件表。
 - **agent 的观测产物也落盘**：`TENON_RESULT_FILE` 指向 `/var/lib/tenon/agent-result.jsonl`（每回合一行：结局、planId、规划出来的动作序列）。它是 `tenon d1 run --agent-result` 的输入；与审计、游标同一块卷，才有 A/B 两轮可比的起点。
 - **审计与游标都要落盘**：命名卷承载 JSONL 与游标文件。运行时用户是 uid 10001，而命名卷首次挂载的属主是 root，**可写性还没在容器里验过**。
 
@@ -109,7 +113,7 @@ docker compose -f compose.m0.yaml build            # 逐服务构建；build 阶
 |---|---|---|
 | `docker compose config --quiet`（`compose.yaml`） | ✅ exit 0 | 本轮 |
 | `docker compose -f compose.m0.yaml config --quiet` | ✅ exit 0 | 本轮 |
-| `go-service --target build`，`./cmd/host` | ✅ exit 0 | 本轮（10:59 前） |
+| `go-service --target build`，`./cmd/host` | ✅ exit 0 | 本轮 |
 | `go-service --target build`，`./cmd/agent` | ✅ exit 0 | 本轮 |
 | `go-service --target build`，`./cmd/quote` | ✅ exit 0 | 本轮 |
 | `go-service --target build`，`./cmd/tenon` | ✅ exit 0 | 本轮 |
@@ -117,6 +121,7 @@ docker compose -f compose.m0.yaml build            # 逐服务构建；build 阶
 | `docker compose run --rm spec` | ✅ `✓ spec 校验通过：11 项检查，0 失败` | M0 轮 |
 | `docker compose run --rm go` | ✅ gofmt / vet / build 全 ok | M0 轮 |
 | `node-service --target build` | ❌ 预期失败：`ERR_PNPM_RECURSIVE_RUN_NO_SCRIPT` | M0 轮 |
+| 模块 `TENON_TEST_MODE=1` 挂 `admin/reset` | ✅ 设 `1` → 200 `{"reset":true}`；设 `0` → 404 | 本轮（本机进程，非容器） |
 | `go-service` **完整镜像**（运行时阶段） | ❌ 未验：`alpine:3.20` 本机拉不到 | — |
 | `compose.m0.yaml` 端到端 `up` | ❌ 未验 | — |
 | 命名卷对 uid 10001 的可写性 | ❌ 未验 | — |

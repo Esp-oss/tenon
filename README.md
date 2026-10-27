@@ -174,7 +174,7 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 **但它还没跑过真 LLM 的 A/B**，所以 D1 的结论是「未判定」，不是「已通过」：
 
 - 本轮没有用真凭据跑过 agent 回合，自然也没有 A/B 两轮可比（没跑 ≠ 通过）；
-- 更硬的阻塞：`POST /tenon/admin/reset` 目前只能由 `Module.TestMode` 字段打开，没有任何 `cmd/*` 从环境变量读它 → 模块以「生产态」启动，reset 回 404，两轮输入就不一致（[docs/interfaces.md](docs/interfaces.md) §9 缺口 8）。
+- 前置接线都已就位、并逐条实测过：宿主 `TENON_TEST_MODE=1` 挂 `POST /tenon/admin/modules`；三个模块 `TENON_TEST_MODE=1` 挂 `POST /tenon/admin/reset`（设 `1` → 200 `{"reset":true}`，设 `0` → 404）；agent 的 `TENON_RESULT_FILE` 每回合追加一行，正是 `--agent-result` 读的文件。
 
 用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
 
@@ -195,7 +195,7 @@ dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、�
 | 阶段 | 内容 | 出口判据 |
 |---|---|---|
 | M0 | schema + conformance C1–C3/C8/C9/C10 + lint + `inventory` / `procurement` 两个侧车 | 模块侧用例全绿 |
-| **M0.5（当前）** | `host` + `agent` + `quote` + 协议扩展三处（写审计 / 注册表 / 发件箱） | C4/C5 判 PASS（**已达成**）；D1 需真 LLM 与模块 reset 接线（**未达成**） |
+| **M0.5（当前）** | `host` + `agent` + `quote` + 协议扩展三处（写审计 / 注册表 / 发件箱） | C4/C5 判 PASS（**已达成**）；D1 需真 LLM 跑一次 A/B（**未跑**，接线已就位） |
 | M1 | grant 校验 + 审批通道 + 审计对账 + 共驾 WS + 进程内接入 | 高风险路径必须人工；对账能发现篡改 |
 | M2 | HTTP 侧车 SDK + MCP 双向 + 非 TS 示例 | 非 TS 模块跑通全套用例 |
 | M3 | skill 仓库 + 轨迹蒸馏 + 发布审计/回滚 | 新流程只改 skill 即可上线 |
