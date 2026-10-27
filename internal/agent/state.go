@@ -119,6 +119,30 @@ func (s *StateStore) ListArchived() ([]Pending, error) {
 	return listPendingDir(filepath.Join(s.dir, "pending", "archived"))
 }
 
+// CountCorrupt 数一遍 pending/ 下解析不了的文件。
+//
+// 必须有这个出口：List() 刻意跳过坏文件（不让一个坏件拖垮整个列表），
+// 但「被跳过」不等于「不存在」——不数出来它就会永远躺在盘上、永不清理、也永不告警。
+func (s *StateStore) CountCorrupt() (int, error) {
+	entries, err := os.ReadDir(filepath.Join(s.dir, "pending"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	bad := 0
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		if _, ok, err := readPending(filepath.Join(s.dir, "pending", e.Name())); err != nil || !ok {
+			bad++
+		}
+	}
+	return bad, nil
+}
+
 // Archive 把一份 pending 标成终态并移入 archived/：单次 rename，原子且可审计。
 func (s *StateStore) Archive(planID string, status PendingState) error {
 	p, ok, err := s.Load(planID)
@@ -216,7 +240,7 @@ func listPendingDir(dir string) ([]Pending, error) {
 	for _, name := range names {
 		p, ok, err := readPending(filepath.Join(dir, name))
 		if err != nil || !ok {
-			continue // 坏文件不让整个列表失败；自检会另外报它
+			continue // 坏文件不让整个列表失败；CountCorrupt 会单独把它数出来供自检告警
 		}
 		out = append(out, p)
 	}
