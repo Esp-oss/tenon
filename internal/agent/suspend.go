@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -183,6 +185,133 @@ func renderLabels(plan Plan) ([]string, error) {
 		out = append(out, fmt.Sprintf("%s（%s）", step.Action, truncateRunes(args, 80)))
 	}
 	return out, nil
+}
+
+// labelMaxRunes 是单条白话的上限（R4）：与 Intent 帧 badge 的 120 对齐，**含省略号**。
+const labelMaxRunes = 120
+
+// renderSteps 逐 step 出一句白话（labels）与一条技术原文（details）。
+//
+// 规则见 P3 spec §4：模板是主路径，任何一步失败都退 R2（标题 + 参数），绝不输出
+// 半个句子；白话里不出现 action id（那是 details 的职责）；数字只抄 args。
+func renderSteps(plan Plan, meta map[string]ActionMeta) (labels, details []string) {
+	labels = make([]string, 0, len(plan.Steps))
+	details = make([]string, 0, len(plan.Steps))
+	for _, step := range plan.Steps {
+		m := meta[step.Action]
+		// truncateRunes 会在截断结果后再补一个省略号，所以传 limit-1，
+		// 保证最终长度（含「…」）不超过 120。
+		labels = append(labels, truncateRunes(renderStepLabel(step, m), labelMaxRunes-1))
+		details = append(details, stepDetail(step))
+	}
+	return labels, details
+}
+
+// renderStepLabel 先试模板，失败退 R2。
+func renderStepLabel(step PlanStep, m ActionMeta) string {
+	args, ok := parseArgsObject(step.Args)
+	if ok && strings.TrimSpace(m.SummaryTemplate) != "" {
+		if out, done := fillTemplate(m.SummaryTemplate, args); done {
+			return out
+		}
+	}
+	return fallbackLabel(m.Title, args, ok)
+}
+
+// fillTemplate 只在**所有**占位符都能取到标量值时才返回 done=true：
+// 少一个就整句作废，避免「缺 件 STD-1002」这种半个句子。
+func fillTemplate(tpl string, args map[string]any) (string, bool) {
+	var b strings.Builder
+	for i := 0; i < len(tpl); i++ {
+		if tpl[i] != '{' {
+			b.WriteByte(tpl[i])
+			continue
+		}
+		rel := strings.IndexByte(tpl[i+1:], '}')
+		if rel < 0 {
+			return "", false
+		}
+		name := tpl[i+1 : i+1+rel]
+		raw, ok := args[name]
+		if !ok {
+			return "", false
+		}
+		s, ok := scalarText(raw)
+		if !ok {
+			return "", false
+		}
+		b.WriteString(s)
+		i += rel + 1
+	}
+	return b.String(), true
+}
+
+// scalarText 只接受字符串/数字/布尔：数组与对象渲染不出人话（R1），一律判失败。
+func scalarText(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case bool:
+		return strconv.FormatBool(x), true
+	case float64:
+		if x == math.Trunc(x) && math.Abs(x) < 1e15 {
+			return strconv.FormatInt(int64(x), 10), true
+		}
+		return strconv.FormatFloat(x, 'f', -1, 64), true
+	case json.Number:
+		return x.String(), true
+	default:
+		return "", false
+	}
+}
+
+// fallbackLabel 是 R2：标题 + 关键参数；标题也缺时给一句可读的占位话，不泄露 action id。
+func fallbackLabel(title string, args map[string]any, hasArgs bool) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return "未命名动作（参数见详情）"
+	}
+	if !hasArgs || len(args) == 0 {
+		return title
+	}
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if s, ok := scalarText(args[k]); ok {
+			parts = append(parts, k+"="+s)
+		}
+	}
+	if len(parts) == 0 {
+		return title
+	}
+	return title + "（" + strings.Join(parts, ", ") + "）"
+}
+
+// stepDetail 是折叠区用的技术原文：action id + args（截断，避免整卡被一份 args 淹没）。
+func stepDetail(step PlanStep) string {
+	args := strings.TrimSpace(string(step.Args))
+	if args == "" || args == "{}" || args == "null" {
+		return step.Action
+	}
+	return fmt.Sprintf("%s（%s）", step.Action, truncateRunes(args, 120))
+}
+
+// parseArgsObject 解出 args 对象；空、非法、非对象一律返回 ok=false（走 R2）。
+func parseArgsObject(raw json.RawMessage) (map[string]any, bool) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil, false
+	}
+	return m, true
 }
 
 // postAuditRecord 把一条审计记录发给宿主；非 200 一律算失败（宿主承诺 200 即已落盘）。

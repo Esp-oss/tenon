@@ -285,3 +285,77 @@ func TestHostAuditProbe(t *testing.T) {
 		}
 	})
 }
+
+// 渲染规则表（P3 spec §4）：模板只取 args；任何一步失败退 R2；R2 不含 action id。
+func TestRenderSteps(t *testing.T) {
+	meta := map[string]ActionMeta{
+		"inventory.DeductStock":             {Title: "扣减库存", SummaryTemplate: "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）"},
+		"inventory.GetStock":                {Title: "查询在库量"},                                                  // 无模板 → R2
+		"inventory.ReleaseStock":            {Title: "回补库存", SummaryTemplate: "回补 {sku} {qty}"},                // 缺占位符 → R2
+		"procurement.CreatePurchaseRequest": {Title: "创建采购申请", SummaryTemplate: "缺 {qty} 件 {sku}（明细 {lines}）"}, // {lines} 是数组 → R2
+		"inventory.Broken":                  {Title: "坏模板", SummaryTemplate: "落单的 {sku"},                       // 未闭合 → R2
+		"inventory.Unnamed":                 {},                                                                // Title 与模板都缺
+	}
+
+	cases := []struct {
+		name       string
+		action     string
+		args       string
+		wantLabel  string
+		wantDetail string
+	}{
+		{"模板正常", "inventory.DeductStock",
+			`{"sku":"STD-1002","qty":3,"referenceNo":"Q-2026-0417"}`,
+			"扣减 STD-1002 库存 3 件（单据 Q-2026-0417）",
+			`inventory.DeductStock（{"sku":"STD-1002","qty":3,"referenceNo":"Q-2026-0417"}）`},
+		{"无模板退 R2", "inventory.GetStock", `{"sku":"STD-1002"}`,
+			"查询在库量（sku=STD-1002）", ""},
+		{"缺占位符退 R2", "inventory.ReleaseStock", `{"sku":"STD-1002"}`,
+			"回补库存（sku=STD-1002）", ""},
+		{"数组参数退 R2", "procurement.CreatePurchaseRequest",
+			`{"sku":"STD-1002","qty":9,"lines":[{"sku":"STD-1002","qty":9}]}`,
+			"创建采购申请（qty=9, sku=STD-1002）", ""},
+		{"未闭合退 R2", "inventory.Broken", `{"sku":"X"}`,
+			"坏模板（sku=X）", ""},
+		{"标题与模板都缺", "inventory.Unnamed", `{"a":1}`,
+			"未命名动作（参数见详情）", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			plan := Plan{PlanID: "pln_1", Steps: []PlanStep{{StepID: "s1", Action: c.action, Args: json.RawMessage(c.args)}}}
+			labels, details := renderSteps(plan, meta)
+			if len(labels) != 1 || len(details) != 1 {
+				t.Fatalf("期望 1 条 label 与 1 条 detail，得到 %v / %v", labels, details)
+			}
+			if labels[0] != c.wantLabel {
+				t.Fatalf("label = %q，期望 %q", labels[0], c.wantLabel)
+			}
+			if strings.Contains(labels[0], c.action) {
+				t.Fatalf("白话里不许出现 action id：%q", labels[0])
+			}
+			if !strings.Contains(details[0], c.action) {
+				t.Fatalf("detail 必须带 action id：%q", details[0])
+			}
+			if c.wantDetail != "" && details[0] != c.wantDetail {
+				t.Fatalf("detail = %q，期望 %q", details[0], c.wantDetail)
+			}
+		})
+	}
+}
+
+// R4：单条白话上限 120 rune（含省略号），超出截断。
+func TestRenderStepsTruncates(t *testing.T) {
+	long := strings.Repeat("很", 200)
+	meta := map[string]ActionMeta{"inventory.DeductStock": {Title: "扣减库存", SummaryTemplate: "{sku}"}}
+	plan := Plan{PlanID: "pln_1", Steps: []PlanStep{{
+		StepID: "s1", Action: "inventory.DeductStock",
+		Args: json.RawMessage(`{"sku":"` + long + `"}`),
+	}}}
+	labels, _ := renderSteps(plan, meta)
+	if n := len([]rune(labels[0])); n > 120 {
+		t.Fatalf("超过 120 rune：%d", n)
+	}
+	if !strings.HasSuffix(labels[0], "…") {
+		t.Fatalf("截断要带省略号：%q", labels[0])
+	}
+}
