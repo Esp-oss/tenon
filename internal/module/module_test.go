@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1095,5 +1096,377 @@ func TestContentTypeEnforcement(t *testing.T) {
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("带 charset 的 application/json 状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+}
+
+// eventsPage 是 GET /tenon/events 的响应形状（in 与 out 两个方向一致）。
+type eventsPage struct {
+	Events     []json.RawMessage `json:"events"`
+	NextCursor string            `json:"nextCursor"`
+}
+
+// getEvents 取一页事件；非 200 即终止用例。
+func getEvents(t *testing.T, url string) eventsPage {
+	t.Helper()
+	resp, raw := doJSON(t, http.MethodGet, url, nil, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s 状态码 = %d，期望 200（原文 %s）", url, resp.StatusCode, raw)
+	}
+	var page eventsPage
+	if err := json.Unmarshal(raw, &page); err != nil {
+		t.Fatalf("事件响应不是合法 JSON：%v（原文 %s）", err, raw)
+	}
+	return page
+}
+
+// 16. 发件箱方向：direction=out 读模块自产事件；缺省 in 仍是宿主投递进来的事件。
+func TestOutboxDirection(t *testing.T) {
+	secret := prepareEnv(t)
+	f := newFixture()
+	if seq := f.module.EmitEvent(Event{EventID: "evt_1", Type: "quote.completed"}); seq != 1 {
+		t.Fatalf("首条发件箱事件序号 = %d，期望 1", seq)
+	}
+	srv := serve(t, f.module)
+
+	// 同一模块也接受宿主投递，用来证明两张事件表互不串味。
+	body := eventBodyWithID("evt_01JBDIR0001")
+	resp, raw := do(t, http.MethodPost, srv.URL+"/tenon/events", body, map[string]string{
+		protocol.HeaderSignature: protocol.Sign(secret, time.Now().UTC().Unix(), body),
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("宿主投递状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+
+	out := getEvents(t, srv.URL+"/tenon/events?direction=out")
+	if len(out.Events) != 1 {
+		t.Fatalf("out 方向 %d 条，期望 1 条", len(out.Events))
+	}
+	if !bytes.Contains(out.Events[0], []byte(`"quote.completed"`)) {
+		t.Fatalf("out 方向未返回模块自有事件：%s", out.Events[0])
+	}
+	if bytes.Contains(out.Events[0], []byte("evt_01JBDIR0001")) {
+		t.Errorf("out 方向混入了宿主投递的事件：%s", out.Events[0])
+	}
+	// 信封的必填字段一个都不能少（domain-event.schema.json 的 required）。
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(out.Events[0], &envelope); err != nil {
+		t.Fatalf("事件信封不是合法 JSON：%v", err)
+	}
+	for _, field := range []string{"eventId", "type", "version", "subject", "occurredAt", "causationId", "correlationId", "payload"} {
+		if _, ok := envelope[field]; !ok {
+			t.Errorf("事件信封缺少 %q 字段：%s", field, out.Events[0])
+		}
+	}
+
+	in := getEvents(t, srv.URL+"/tenon/events") // 缺省方向
+	if len(in.Events) != 1 {
+		t.Fatalf("缺省方向 %d 条，期望 1 条宿主投递的事件", len(in.Events))
+	}
+	if !bytes.Contains(in.Events[0], []byte("evt_01JBDIR0001")) {
+		t.Errorf("缺省方向返回的不是宿主投递的事件：%s", in.Events[0])
+	}
+	if bytes.Contains(in.Events[0], []byte(`"evt_1"`)) {
+		t.Errorf("缺省方向应为 in，不应看到模块自有事件（eventId=evt_1）：%s", in.Events[0])
+	}
+	explicitIn := getEvents(t, srv.URL+"/tenon/events?direction=in")
+	if len(explicitIn.Events) != 1 || explicitIn.NextCursor != in.NextCursor {
+		t.Errorf("显式 direction=in 与缺省行为不一致：%+v vs %+v", explicitIn, in)
+	}
+}
+
+// 17. 发件箱游标推进：先取 1 条，再取只拿到新增的那条；两套游标互不干扰。
+func TestOutboxCursorAdvance(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	for _, id := range []string{"evt_out_0001", "evt_out_0002", "evt_out_0003"} {
+		if seq := f.module.EmitEvent(Event{
+			EventID: id,
+			Type:    "quote.completed",
+			Payload: json.RawMessage(`{"quoteNo":"` + id + `"}`),
+		}); seq == 0 {
+			t.Fatalf("EmitEvent(%s) 被拒绝", id)
+		}
+	}
+	srv := serve(t, f.module)
+
+	first := getEvents(t, srv.URL+"/tenon/events?direction=out&limit=1")
+	if len(first.Events) != 1 || !bytes.Contains(first.Events[0], []byte("evt_out_0001")) {
+		t.Fatalf("第一页 = %+v，期望只有 evt_out_0001", first)
+	}
+	second := getEvents(t, srv.URL+"/tenon/events?direction=out&since="+first.NextCursor+"&limit=1")
+	if len(second.Events) != 1 || !bytes.Contains(second.Events[0], []byte("evt_out_0002")) {
+		t.Fatalf("推进后的那一页 = %+v，期望只有 evt_out_0002（游标必须真的前进）", second)
+	}
+	if second.NextCursor == first.NextCursor {
+		t.Errorf("两次翻页的 nextCursor 相同 = %q，游标没有前进", first.NextCursor)
+	}
+	// 同一个游标重复取结果一致（天然幂等）。
+	again := getEvents(t, srv.URL+"/tenon/events?direction=out&since="+first.NextCursor+"&limit=1")
+	if len(again.Events) != len(second.Events) || again.NextCursor != second.NextCursor {
+		t.Errorf("同一游标两次结果不同：%+v vs %+v", again, second)
+	}
+
+	// 读 out 不会消耗 in 的位点，反之亦然。
+	inPage := getEvents(t, srv.URL+"/tenon/events")
+	if len(inPage.Events) != 0 {
+		t.Errorf("in 方向 %d 条，期望 0（发件箱不串进收件箱）", len(inPage.Events))
+	}
+	inAgain := getEvents(t, srv.URL+"/tenon/events?since="+inPage.NextCursor)
+	if inAgain.NextCursor != inPage.NextCursor {
+		t.Errorf("读 out 之后 in 的游标变了：%q → %q", inPage.NextCursor, inAgain.NextCursor)
+	}
+
+	// 方向不符的游标必须被拒，而不是被当成同一张表的序号静默跳过一段事件。
+	for _, bad := range []string{
+		srv.URL + "/tenon/events?direction=out&since=" + inPage.NextCursor,
+		srv.URL + "/tenon/events?direction=in&since=" + first.NextCursor,
+		srv.URL + "/tenon/events?direction=out&since=" + cursorPrefix + "MA", // 0.1 的无标签游标只属于 in
+	} {
+		resp, raw := doJSON(t, http.MethodGet, bad, nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s 状态码 = %d，期望 400（原文 %s）", bad, resp.StatusCode, raw)
+			continue
+		}
+		if got := decodeTenonError(t, raw); got.Code != "INVALID_CURSOR" {
+			t.Errorf("%s 的 code = %q，期望 INVALID_CURSOR", bad, got.Code)
+		}
+	}
+	// 0.1 的无标签游标在 in 方向仍然可用（向后兼容）。
+	if page := getEvents(t, srv.URL+"/tenon/events?since="+cursorPrefix+"MA"); len(page.Events) != 0 {
+		t.Errorf("以 0.1 游标读 in 方向 = %+v，期望空页", page)
+	}
+}
+
+// 18. 同一 eventId 重复 EmitEvent 的语义：幂等去重；同 id 不同信封则拒。
+func TestEmitEventDeduplicatesByEventID(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	srv := serve(t, f.module)
+
+	firstEvent := Event{EventID: "evt_dup_0001", Type: "quote.completed", Payload: json.RawMessage(`{"n":1}`)}
+	firstSeq := f.module.EmitEvent(firstEvent)
+	if firstSeq != 1 {
+		t.Fatalf("首条事件序号 = %d，期望 1", firstSeq)
+	}
+	// 同 eventId 且同内容：不追加，返回首次序号。跨秒重复也必须幂等——框架补的
+	// occurredAt 精确到秒，若按信封字节比就会被误判成「内容不同」。
+	time.Sleep(1100 * time.Millisecond)
+	if seq := f.module.EmitEvent(firstEvent); seq != firstSeq {
+		t.Fatalf("重复入箱的返回值 = %d，期望首次序号 %d", seq, firstSeq)
+	}
+	// 同 eventId 但信封不同：拒（同一个 eventId 不可能对应两个事实），首个信封保留。
+	conflict := firstEvent
+	conflict.Payload = json.RawMessage(`{"n":2}`)
+	if seq := f.module.EmitEvent(conflict); seq != 0 {
+		t.Fatalf("eventId 冲突但信封不同，返回值 = %d，期望 0（拒绝）", seq)
+	}
+	// 不可入箱的事件一个都不许进箱。
+	for _, bad := range []Event{
+		{}, // 缺 eventId
+		{EventID: "evt_bad_0001", Type: "NotAnEventType"},
+		{EventID: "evt_bad_0002", Type: "quote.completed", Payload: json.RawMessage(`[1,2]`)},
+		{EventID: "evt_bad_0003", Type: "quote.completed", Subject: json.RawMessage(`{`)},
+	} {
+		if seq := f.module.EmitEvent(bad); seq != 0 {
+			t.Errorf("EmitEvent(%+v) = %d，期望 0（不可入箱）", bad, seq)
+		}
+	}
+	// 被拒与重复都不消耗序号：下一条合法事件接着 2；调用方给的字段原样保留。
+	if seq := f.module.EmitEvent(Event{
+		EventID:       "evt_dup_0002",
+		Type:          "quote.completed",
+		Version:       "1.2.3",
+		Subject:       json.RawMessage(`"quote:Quote/Q-2026-0417"`),
+		CorrelationID: "cor:quote/Q-2026-0417",
+	}); seq != 2 {
+		t.Fatalf("第二条合法事件序号 = %d，期望 2", seq)
+	}
+
+	page := getEvents(t, srv.URL+"/tenon/events?direction=out")
+	if len(page.Events) != 2 {
+		t.Fatalf("发件箱 %d 条，期望 2 条", len(page.Events))
+	}
+	if !bytes.Contains(page.Events[0], []byte(`"n":1`)) || bytes.Contains(page.Events[0], []byte(`"n":2`)) {
+		t.Errorf("首个信封被后来的同 id 事件覆盖了：%s", page.Events[0])
+	}
+	if !bytes.Contains(page.Events[0], []byte("evt_dup_0001")) || !bytes.Contains(page.Events[1], []byte("evt_dup_0002")) {
+		t.Errorf("发件箱顺序 = %s | %s，期望按入箱顺序", page.Events[0], page.Events[1])
+	}
+	for _, want := range []string{`"version":"1.2.3"`, `"subject":"quote:Quote/Q-2026-0417"`, `"correlationId":"cor:quote/Q-2026-0417"`} {
+		if !bytes.Contains(page.Events[1], []byte(want)) {
+			t.Errorf("调用方给的字段没原样出现在信封里：缺 %s（原文 %s）", want, page.Events[1])
+		}
+	}
+}
+
+// 19. 非法 direction → 400 + tenonError；合法方向的其余参数仍按各自错误码报。
+func TestInvalidDirection(t *testing.T) {
+	prepareEnv(t)
+	srv := serve(t, newFixture().module)
+
+	for _, query := range []string{"?direction=sideways", "?direction=OUT", "?direction=out%20in"} {
+		resp, raw := doJSON(t, http.MethodGet, srv.URL+"/tenon/events"+query, nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s 状态码 = %d，期望 400（原文 %s）", query, resp.StatusCode, raw)
+			continue
+		}
+		got := decodeTenonError(t, raw)
+		if got.Class != protocol.ClassContractViolation || got.Code != "INVALID_DIRECTION" {
+			t.Errorf("%s 的错误 = %+v，期望 contract_violation/INVALID_DIRECTION", query, got)
+		}
+		if got.Retryable {
+			t.Errorf("%s 的 retryable = true，契约违反不应可重试", query)
+		}
+	}
+
+	for _, tc := range []struct {
+		query string
+		code  string
+	}{
+		{"?direction=out&limit=0", "INVALID_LIMIT"},
+		{"?direction=in&since=not-a-cursor", "INVALID_CURSOR"},
+	} {
+		resp, raw := doJSON(t, http.MethodGet, srv.URL+"/tenon/events"+tc.query, nil, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s 状态码 = %d，期望 400（原文 %s）", tc.query, resp.StatusCode, raw)
+			continue
+		}
+		if got := decodeTenonError(t, raw); got.Code != tc.code {
+			t.Errorf("%s 的 code = %q，期望 %q", tc.query, got.Code, tc.code)
+		}
+	}
+}
+
+// 20. EmitEvent 在 Handle 回调内部调用不得自死锁：写动作执行期间 mu 已被持有。
+func TestEmitEventFromHandleDoesNotDeadlock(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	var m *Module
+	m = &Module{
+		ID:      fixtureModuleID,
+		Title:   "回调内发事件",
+		Version: "0.1.0",
+		Actions: append([]Action(nil), f.module.Actions...),
+		Events:  []string{"demo.created"},
+		DryRun:  f.module.DryRun,
+		Handle: func(ctx context.Context, actionID string, args json.RawMessage) (json.RawMessage, *protocol.Error) {
+			if seq := m.EmitEvent(Event{
+				EventID: "evt_from_handle",
+				Type:    "demo.created",
+				Payload: json.RawMessage(`{"ok":true}`),
+			}); seq == 0 {
+				return nil, testError(protocol.ClassContractViolation, "EMIT_REJECTED", "发件箱拒绝了事件")
+			}
+			return json.RawMessage(`{"seq":1}`), nil
+		},
+	}
+	srv := serve(t, m)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/tenon/actions/"+writeActionID,
+		strings.NewReader(`{"name":"alpha"}`))
+	if err != nil {
+		t.Fatalf("构造请求失败：%v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(protocol.HeaderVersion, protocol.Version)
+	req.Header.Set(protocol.HeaderIdempotencyKey, "tenon:pln_outbox/s1")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("写动作在回调内发事件时请求失败（超时即说明自死锁）：%v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取响应失败：%v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（原文 %s）", resp.StatusCode, raw)
+	}
+	page := getEvents(t, srv.URL+"/tenon/events?direction=out")
+	if len(page.Events) != 1 || !bytes.Contains(page.Events[0], []byte("evt_from_handle")) {
+		t.Fatalf("回调内发出的事件没进发件箱：%+v", page)
+	}
+}
+
+// 21. 并发 EmitEvent：序号不重号、不丢事件（-race 在本机不可用，这里锁语义等价性）。
+func TestEmitEventConcurrent(t *testing.T) {
+	prepareEnv(t)
+	f := newFixture()
+	const workers, perWorker = 8, 25
+	total := workers * perWorker
+
+	seqs := make(chan int64, total)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				seqs <- f.module.EmitEvent(Event{
+					EventID: fmt.Sprintf("evt_conc_%02d_%02d", w, i),
+					Type:    "quote.completed",
+				})
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(seqs)
+
+	seen := make(map[int64]struct{}, total)
+	for seq := range seqs {
+		if seq <= 0 {
+			t.Fatalf("并发入箱被拒绝：seq = %d", seq)
+		}
+		if _, dup := seen[seq]; dup {
+			t.Fatalf("序号 %d 被分配了两次", seq)
+		}
+		seen[seq] = struct{}{}
+	}
+	if len(seen) != total {
+		t.Fatalf("分配了 %d 个序号，期望 %d 个", len(seen), total)
+	}
+
+	srv := serve(t, f.module)
+	page := getEvents(t, srv.URL+"/tenon/events?direction=out&limit=500")
+	if len(page.Events) != total {
+		t.Fatalf("发件箱 %d 条，期望 %d 条", len(page.Events), total)
+	}
+	ids := make(map[string]struct{}, total)
+	for _, ev := range page.Events {
+		var probe struct {
+			EventID string `json:"eventId"`
+		}
+		if err := json.Unmarshal(ev, &probe); err != nil {
+			t.Fatalf("事件信封不是合法 JSON：%v（原文 %s）", err, ev)
+		}
+		ids[probe.EventID] = struct{}{}
+	}
+	if len(ids) != total {
+		t.Fatalf("发件箱只有 %d 个不同的 eventId，期望 %d 个", len(ids), total)
+	}
+}
+
+// 22. 模块重启（状态全在内存里，序号从 1 重新开始）后，旧的 out 游标不许饿死消费方。
+func TestOutboxCursorAfterRestart(t *testing.T) {
+	prepareEnv(t)
+	old := newFixture()
+	for _, id := range []string{"evt_out_0001", "evt_out_0002", "evt_out_0003"} {
+		old.module.EmitEvent(Event{EventID: id, Type: "quote.completed"})
+	}
+	oldSrv := serve(t, old.module)
+	stale := getEvents(t, oldSrv.URL+"/tenon/events?direction=out&limit=2").NextCursor
+	if stale == "" {
+		t.Fatal("旧实例没有给出游标")
+	}
+
+	// 重启后的同一模块：事件重新从 1 开始编号。
+	fresh := newFixture()
+	fresh.module.EmitEvent(Event{EventID: "evt_out_0004", Type: "quote.completed"})
+	freshSrv := serve(t, fresh.module)
+
+	page := getEvents(t, freshSrv.URL+"/tenon/events?direction=out&since="+stale)
+	if len(page.Events) != 1 || !bytes.Contains(page.Events[0], []byte("evt_out_0004")) {
+		t.Fatalf("用重启前的游标读 = %+v，期望整段重放而不是永远空页", page)
 	}
 }

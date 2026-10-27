@@ -73,6 +73,13 @@ const (
 	maxEventPage     = 500
 	// cursorPrefix 是补课游标的前缀；游标本身是不透明字符串，宿主不得解析。
 	cursorPrefix = "cur_"
+	// directionIn / directionOut 是 GET /tenon/events 的 direction 取值（设计增量 §2.2）。
+	// 缺省为 in：0.1 的「宿主投递进来」语义不能因为加了发件箱而改变。
+	directionIn  = "in"
+	directionOut = "out"
+	// 游标带方向标签：in 的游标用在 out 上会判 INVALID_CURSOR，而不是静默跳过事件。
+	cursorInPrefix  = cursorPrefix + directionIn + "_"
+	cursorOutPrefix = cursorPrefix + directionOut + "_"
 )
 
 // 规范里的词法约束（spec/0.1/schemas/*.json），在启动自检时一次性校验。
@@ -139,8 +146,8 @@ type Action struct {
 
 // Module 是一个模块的声明与回调集合。
 //
-// Module 含 sync.Once 与 sync.Mutex，**不可复制**：Handler() 返回的处理器与
-// 模块实例共享同一份幂等表、事件表与游标状态。
+// Module 含 sync.Once 与两把 sync.Mutex，**不可复制**：Handler() 返回的处理器与
+// 模块实例共享同一份幂等表、收件箱、发件箱与游标状态。
 type Module struct {
 	ID      string
 	Title   string
@@ -166,6 +173,175 @@ type Module struct {
 	eventLog []storedEvent
 	eventIDs map[string]struct{}
 	seq      int64
+
+	// 发件箱：模块自己产生的事件，供 agent 用 direction=out 轮询（设计增量 §2.2）。
+	// 用独立互斥锁而不是复用 mu：EmitEvent 的常见调用点就在 Handle 回调内部，
+	// 而写动作执行期间 mu 已由调用栈持有，复用同一把锁会自死锁。
+	outMu     sync.Mutex
+	outbox    []storedEvent
+	outboxIdx map[string]int // eventId → outbox 下标，用于重复入箱去重
+	outSeq    int64
+}
+
+// Event 是模块自己产出的领域事件（domain-event.schema.json 的 Go 投影）。
+//
+// 它是发件箱的入参，不是线格式：缺省字段由框架补成完整信封后再入箱，见 EmitEvent。
+// Subject 与 Payload 按原始 JSON 传入：subject 既可是字符串简写
+// （"quote:Quote/Q-1"）也可是对象（{"module":"quote","type":"Quote","id":"Q-1"}）。
+type Event struct {
+	EventID       string          `json:"eventId"`
+	Type          string          `json:"type"`
+	Version       string          `json:"version,omitempty"`
+	Subject       json.RawMessage `json:"subject,omitempty"`
+	OccurredAt    string          `json:"occurredAt,omitempty"`
+	CausationID   string          `json:"causationId,omitempty"`
+	CorrelationID string          `json:"correlationId,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
+}
+
+// outboxEnvelope 是入箱后的完整信封：字段与 domain-event.schema.json 的 required
+// 一一对应，全部无条件输出（causationId 无上一跳时显式写 null）。
+type outboxEnvelope struct {
+	EventID       string          `json:"eventId"`
+	Type          string          `json:"type"`
+	Version       string          `json:"version"`
+	Subject       json.RawMessage `json:"subject"`
+	OccurredAt    string          `json:"occurredAt"`
+	CausationID   *string         `json:"causationId"`
+	CorrelationID string          `json:"correlationId"`
+	Payload       json.RawMessage `json:"payload"`
+}
+
+// EmitEvent 把模块自己产生的一条业务事件放进发件箱，供 agent 轮询
+// GET /tenon/events?direction=out（0.1 缺口 #6 的出口）。
+//
+// 并发安全，且刻意不持有 mu：常见调用点是业务动作的 Handle 回调内部，而写动作
+// 执行期间 mu 由调用栈持有，复用同一把锁会自死锁。
+//
+// 返回该事件在发件箱里的序号（从 1 起单调递增）。以下两种情况返回 0 且只记日志：
+//   - 信封不可用：eventId 为空、type 不符合事件类型词法、subject/payload 不是
+//     合法 JSON、payload 不是 JSON 对象；
+//   - eventId 与已入箱事件冲突但内容不同：同一个 eventId 不可能对应两个事实。
+//
+// 重复入箱是幂等的：同 eventId 且输入相同不追加第二条，返回首次序号。至少一次
+// 投递带来重复是常态，这与收件箱按 eventId 去重（POST /tenon/events）对称。
+// 「输入相同」比的是调用方给的内容，不含框架补的 occurredAt 等缺省值。
+func (m *Module) EmitEvent(ev Event) int64 {
+	envelope, ok := m.buildEnvelope(ev)
+	if !ok {
+		return 0
+	}
+	input, err := json.Marshal(ev)
+	if err != nil {
+		log.Printf("tenon 模块 %s 的 EmitEvent 入参无法指纹化，事件未入箱：%v", m.ID, err)
+		return 0
+	}
+	fingerprint := hashArgs(input)
+	eventID := strings.TrimSpace(ev.EventID)
+
+	m.outMu.Lock()
+	defer m.outMu.Unlock()
+	// 惰性初始化（而不是在 build() 里）：build 由 Handler()/Validate() 触发，
+	// 可能与业务线程的 EmitEvent 并发，而 EmitEvent 只持有 outMu。
+	if m.outboxIdx == nil {
+		m.outboxIdx = make(map[string]int)
+	}
+	if idx, dup := m.outboxIdx[eventID]; dup {
+		if m.outbox[idx].inputHash == fingerprint {
+			return m.outbox[idx].seq
+		}
+		log.Printf("tenon 模块 %s 已入箱的 eventId=%s 与本条内容不同，拒绝重复入箱", m.ID, eventID)
+		return 0
+	}
+	m.outSeq++
+	m.outbox = append(m.outbox, storedEvent{
+		seq:       m.outSeq,
+		eventID:   eventID,
+		envelope:  envelope,
+		inputHash: fingerprint,
+	})
+	m.outboxIdx[eventID] = len(m.outbox) - 1
+	return m.outSeq
+}
+
+// buildEnvelope 把 Event 补成完整信封。返回 false 表示事件不可入箱（已记日志）。
+func (m *Module) buildEnvelope(ev Event) (json.RawMessage, bool) {
+	eventID := strings.TrimSpace(ev.EventID)
+	if eventID == "" {
+		log.Printf("tenon 模块 %s 的 EmitEvent 缺少 eventId，事件未入箱", m.ID)
+		return nil, false
+	}
+	eventType := strings.TrimSpace(ev.Type)
+	if !eventTypePattern.MatchString(eventType) {
+		log.Printf("tenon 模块 %s 的 EmitEvent type=%q 不符合事件类型词法 %s，事件未入箱", m.ID, ev.Type, eventTypePattern)
+		return nil, false
+	}
+	subject := json.RawMessage(bytes.TrimSpace(ev.Subject))
+	if len(subject) == 0 {
+		// schema 必填而业务没给主角：框架不知道谁是主角，退化成「事件自身」比留空诚实。
+		subject = m.defaultSubject(eventID)
+	} else if !json.Valid(subject) || (subject[0] != '"' && subject[0] != '{') {
+		log.Printf("tenon 模块 %s 的 EmitEvent subject 既不是字符串简写也不是对象，事件未入箱：%s", m.ID, subject)
+		return nil, false
+	}
+	payload := json.RawMessage(bytes.TrimSpace(ev.Payload))
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	} else if !json.Valid(payload) || payload[0] != '{' {
+		log.Printf("tenon 模块 %s 的 EmitEvent payload 不是 JSON 对象，事件未入箱：%s", m.ID, payload)
+		return nil, false
+	}
+	version := strings.TrimSpace(ev.Version)
+	if version == "" {
+		version = DefaultEventVersion
+	}
+	occurredAt := strings.TrimSpace(ev.OccurredAt)
+	if occurredAt == "" {
+		occurredAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	correlationID := strings.TrimSpace(ev.CorrelationID)
+	if correlationID == "" {
+		correlationID = "cor:" + m.contractID() + "/" + eventID
+	}
+	var causation *string
+	if c := strings.TrimSpace(ev.CausationID); c != "" {
+		causation = &c
+	}
+	envelope, err := json.Marshal(outboxEnvelope{
+		EventID:       eventID,
+		Type:          eventType,
+		Version:       version,
+		Subject:       subject,
+		OccurredAt:    occurredAt,
+		CausationID:   causation,
+		CorrelationID: correlationID,
+		Payload:       payload,
+	})
+	if err != nil {
+		log.Printf("tenon 模块 %s 的事件信封编组失败，事件未入箱：%v", m.ID, err)
+		return nil, false
+	}
+	return envelope, true
+}
+
+// defaultSubject 用「事件自身」作缺省主角寻址（<moduleId>:Event/<eventId>）：
+// 它是一个合法的 EntityRefString，比对端去猜一个业务实体更诚实。
+func (m *Module) defaultSubject(eventID string) json.RawMessage {
+	raw, err := json.Marshal(m.contractID() + ":Event/" + eventID)
+	if err != nil {
+		return json.RawMessage(`"tenon:Event/unknown"`)
+	}
+	return raw
+}
+
+// contractID 返回对外报告用的模块 id：优先 EnvModuleID 覆盖值（与 manifest、
+// 审计一致），但它必须是合法 ModuleId，否则退回声明值——缺省字段不能因为一个
+// 非法覆盖就被弄成非法信封。
+func (m *Module) contractID() string {
+	if id := m.id(); moduleIDPattern.MatchString(id) {
+		return id
+	}
+	return m.ID
 }
 
 // actionMeta 是启动自检时算好的派生信息，避免每个请求重复解析 schema。
@@ -182,11 +358,15 @@ type idemRecord struct {
 	body     []byte
 }
 
-// storedEvent 是已接收并去重过的事件信封。
+// storedEvent 是事件表里的一条。
 type storedEvent struct {
 	seq      int64
 	eventID  string
 	envelope json.RawMessage
+	// inputHash 只有发件箱用：输入事件的指纹，用来区分「同一事实重复入箱」与
+	// 「同一 eventId 对应两个不同事实」。不能用信封字节来比——框架补的
+	// occurredAt 精确到秒，跨秒重复会被误判成冲突。
+	inputHash string
 }
 
 // auditRecord 是模块侧审计的一行（审计双写里模块自己那一份，semantics.md §10.4）。
@@ -796,7 +976,7 @@ func (h *handler) serveDryRun(w http.ResponseWriter, r *http.Request, id string)
 	writeJSONBody(w, http.StatusOK, body)
 }
 
-// serveEvents 分发事件投递（POST，宿主 → 模块）与补课/重放（GET，模块 ← 宿主）。
+// serveEvents 分发事件投递（POST，宿主 → 模块）与补课/重放（GET，两个方向）。
 func (h *handler) serveEvents(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -902,14 +1082,23 @@ func (h *handler) deliverEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "duplicate": false, "eventId": envelope.EventID})
 }
 
-// listEvents 提供补课/重放：since 是上一页的 nextCursor，游标不透明且自洽。
+// listEvents 提供补课/重放。direction 决定读哪张事件表：
+//   - in（缺省）：宿主投递进来的事件（0.1 语义，向后兼容）；
+//   - out：模块自己产生的事件（发件箱），供 agent 轮询。
+//
+// 两张表各有自己的序号与游标，互不干扰；响应形状对两个方向一致。
 func (h *handler) listEvents(w http.ResponseWriter, r *http.Request) {
 	if perr := checkVersion(r, false); perr != nil {
 		writeTenonError(w, *perr)
 		return
 	}
 	query := r.URL.Query()
-	since, perr := parseCursor(query.Get("since"))
+	direction, perr := parseDirection(query.Get("direction"))
+	if perr != nil {
+		writeTenonError(w, *perr)
+		return
+	}
+	since, perr := parseCursor(direction, query.Get("since"))
 	if perr != nil {
 		writeTenonError(w, *perr)
 		return
@@ -920,10 +1109,31 @@ func (h *handler) listEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.m.mu.Lock()
+	page, next := h.m.readEventPage(direction, since, limit)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"events":     page,
+		"nextCursor": encodeCursor(direction, next),
+	})
+}
+
+// readEventPage 读出某个方向 since 之后的一页，并返回下一页游标。
+func (m *Module) readEventPage(direction string, since int64, limit int) ([]json.RawMessage, int64) {
+	mu, table := m.eventTable(direction)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 两张事件表都只在内存里：进程重启（或测试态 reset）后序号从 1 重新开始，
+	// 而消费方可能持有更大的游标。这时按 0 处理等于整段重放，而不是让
+	// ev.seq <= since 把新事件全过滤掉、静默饿死消费方。
+	// 「可重放 + 消费侧按 eventId 去重」本就是 domain-event.schema.json 的前提。
+	if since > m.lastSeq(direction) {
+		since = 0
+	}
+
 	page := make([]json.RawMessage, 0, limit)
 	next := since
-	for _, ev := range h.m.eventLog {
+	for _, ev := range *table {
 		if ev.seq <= since {
 			continue
 		}
@@ -933,12 +1143,39 @@ func (h *handler) listEvents(w http.ResponseWriter, r *http.Request) {
 		page = append(page, ev.envelope)
 		next = ev.seq
 	}
-	h.m.mu.Unlock()
+	return page, next
+}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"events":     page,
-		"nextCursor": encodeCursor(next),
-	})
+// lastSeq 返回某个方向已分配到的最新序号；调用方必须已持有该方向的锁。
+func (m *Module) lastSeq(direction string) int64 {
+	if direction == directionOut {
+		return m.outSeq
+	}
+	return m.seq
+}
+
+// eventTable 返回某个方向的事件表及其互斥锁。两个方向的状态没有任何共享，
+// 所以游标不会因为另一个方向被读取而前进。
+func (m *Module) eventTable(direction string) (*sync.Mutex, *[]storedEvent) {
+	if direction == directionOut {
+		return &m.outMu, &m.outbox
+	}
+	return &m.mu, &m.eventLog
+}
+
+// parseDirection 解析 direction：缺省与显式 in 等价，其余一律契约违反。
+func parseDirection(raw string) (string, *protocol.Error) {
+	switch strings.TrimSpace(raw) {
+	case "", directionIn:
+		return directionIn, nil
+	case directionOut:
+		return directionOut, nil
+	default:
+		e := newError(protocol.ClassContractViolation, "INVALID_DIRECTION",
+			"direction 只能是 in 或 out（缺省 in），收到 "+strconv.Quote(raw))
+		e.Details = map[string]any{"direction": raw}
+		return "", e
+	}
 }
 
 // secret 读取 HMAC 密钥文件。密钥就是文件内容去掉首尾空白后的原始字节，
@@ -1162,19 +1399,39 @@ func hashArgs(raw []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// encodeCursor 把递增序号编码成不透明游标。
-func encodeCursor(seq int64) string {
-	return cursorPrefix + base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(seq, 10)))
+// encodeCursor 把某个方向的递增序号编码成不透明游标。
+func encodeCursor(direction string, seq int64) string {
+	return cursorPrefix + direction + "_" + base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(seq, 10)))
 }
 
 // parseCursor 解出 since；空串表示从头开始。
-func parseCursor(raw string) (int64, *protocol.Error) {
+//
+// 游标带方向标签，所以把 in 的游标用到 out 上是 INVALID_CURSOR，而不是被当成
+// 同一张表的序号静默跳过一段事件。0.1 的无标签游标（cur_<b64>）仍可用于 in。
+func parseCursor(direction, raw string) (int64, *protocol.Error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return 0, nil
 	}
-	payload, ok := strings.CutPrefix(raw, cursorPrefix)
-	if !ok {
+	var payload string
+	switch {
+	case strings.HasPrefix(raw, cursorOutPrefix):
+		if direction != directionOut {
+			return 0, invalidCursor(raw)
+		}
+		payload = strings.TrimPrefix(raw, cursorOutPrefix)
+	case strings.HasPrefix(raw, cursorInPrefix):
+		if direction != directionIn {
+			return 0, invalidCursor(raw)
+		}
+		payload = strings.TrimPrefix(raw, cursorInPrefix)
+	case strings.HasPrefix(raw, cursorPrefix):
+		// 0.1 的游标没有方向标签；只有 in 方向可能收到它。
+		if direction != directionIn {
+			return 0, invalidCursor(raw)
+		}
+		payload = strings.TrimPrefix(raw, cursorPrefix)
+	default:
 		return 0, invalidCursor(raw)
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(payload)
@@ -1190,7 +1447,7 @@ func parseCursor(raw string) (int64, *protocol.Error) {
 
 func invalidCursor(raw string) *protocol.Error {
 	return newError(protocol.ClassContractViolation, "INVALID_CURSOR",
-		"since 游标不是本模块发出的值："+strconv.Quote(raw))
+		"since 游标不是本模块为该方向发出的值："+strconv.Quote(raw))
 }
 
 // parseLimit 解析补课分页大小：缺省 100，超过 500 截断。
