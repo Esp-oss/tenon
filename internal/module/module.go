@@ -80,6 +80,9 @@ const (
 	// 游标带方向标签：in 的游标用在 out 上会判 INVALID_CURSOR，而不是静默跳过事件。
 	cursorInPrefix  = cursorPrefix + directionIn + "_"
 	cursorOutPrefix = cursorPrefix + directionOut + "_"
+	// adminResetPath 是仅测试态挂载的管理端点（设计增量 §2.3）。TestMode 为 false 时
+	// 它不进入路由表，请求得到的 404 与「这里本来就没有这个路径」完全同形。
+	adminResetPath = "/tenon/admin/reset"
 )
 
 // 规范里的词法约束（spec/0.1/schemas/*.json），在启动自检时一次性校验。
@@ -162,6 +165,18 @@ type Module struct {
 	Handle func(ctx context.Context, actionID string, args json.RawMessage) (json.RawMessage, *protocol.Error)
 	// DryRun 可选：返回预期 diff（DryRunReport 对象）。为 nil 表示所有 action 都不支持预演。
 	DryRun func(ctx context.Context, actionID string, args json.RawMessage) (json.RawMessage, *protocol.Error)
+
+	// TestMode 打开仅测试态的管理端点 POST /tenon/admin/reset（设计增量 §2.3）。
+	// 用途单一：D1 差异测试要跑 A/B 两轮，两轮输入必须完全相同，因此需要一个
+	// 把内存状态清回起点的入口（库存、幂等表、收件箱、发件箱、两套游标）。
+	// 生产部署必须保持 false——该端点会抹掉幂等记账与两张事件表。
+	// 与 Actions/Events 一样属于启动配置：Handler() 时读一次，之后不再读取。
+	TestMode bool
+	// Reset 可选：业务状态的恢复回调（例如库存回种子），由 reset 端点在框架状态
+	// 清空之后调用。此时 m.mu 仍被持有、outMu 已释放：回调可以调 EmitEvent 发一条
+	// 「已重置」事件，但**不得回调本模块自己的 HTTP 端点**（会在 m.mu 上自死锁）。
+	// 为 nil 表示本模块没有要恢复的业务状态，框架状态照清。
+	Reset func()
 
 	// 以下为框架自用状态，不属于模块契约。
 	once       sync.Once
@@ -262,6 +277,42 @@ func (m *Module) EmitEvent(ev Event) int64 {
 	})
 	m.outboxIdx[eventID] = len(m.outbox) - 1
 	return m.outSeq
+}
+
+// resetState 抹掉框架的全部内存状态，再把业务状态交还给 Reset 回调。
+// 只有测试态端点会走到这里（Handler 在 TestMode=false 时根本不挂这条路由）。
+//
+// 加锁顺序全局唯一：先 m.mu，后 outMu。写动作执行期间 m.mu 由调用栈持有
+// （serveActionExecute → run → record），收件箱追加也只持 m.mu；EmitEvent 只持
+// outMu；没有任何路径先取 outMu 再去取 m.mu，所以这一对锁不会成环。将来若有
+// 代码需要同时持有两把锁，必须沿用 m.mu → outMu 这个顺序，否则这里就有死锁。
+//
+// m.mu 一直持有到 Reset() 返回：reset 与进行中的写动作因此是串行化的，不会出现
+// 某个写动作在状态清空之后才把业务变更落地（那才是真正意义上的「半清」）。
+// outMu 则在调用 Reset() 之前就释放：回调常常要发一条「已重置」事件，而
+// sync.Mutex 不可重入，持着 outMu 去调 EmitEvent 会自死锁。
+func (m *Module) resetState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 幂等表与收件箱（含它自己的序号）。两张 map 都换成新的而不是置 nil：
+	// record 与 deliverEvent 会直接往这两张 map 里写，nil map 赋值会 panic。
+	m.idem = make(map[string]*idemRecord)
+	m.eventLog = nil
+	m.eventIDs = make(map[string]struct{})
+	m.seq = 0
+
+	// 发件箱与它的去重索引必须在同一个临界区里成对清空：只清其中一个，
+	// EmitEvent 就会拿旧下标去索引新表（越界 panic），或让去重表指向不存在的事件。
+	m.outMu.Lock()
+	m.outbox = nil
+	m.outboxIdx = make(map[string]int)
+	m.outSeq = 0
+	m.outMu.Unlock()
+
+	if m.Reset != nil {
+		m.Reset()
+	}
 }
 
 // buildEnvelope 把 Event 补成完整信封。返回 false 表示事件不可入箱（已记日志）。
@@ -617,6 +668,8 @@ func requireMatch(re *regexp.Regexp, value, what string) error {
 //
 // 每次调用共享同一个 Module 的状态（幂等表、事件表），因此一个模块实例应当
 // 只创建一个监听器；测试里用 httptest.NewServer(m.Handler()) 即可。
+// TestMode 为 true 时额外挂一个仅测试态的管理端点 POST /tenon/admin/reset
+// （设计增量 §2.3），让 D1 的 A/B 两轮拿到完全相同的输入。
 func (m *Module) Handler() http.Handler {
 	if err := m.prepare(); err != nil {
 		// 定义自检失败是接入方的 bug，不是运行时故障：所有请求一律 500 + 明确报文。
@@ -624,7 +677,7 @@ func (m *Module) Handler() http.Handler {
 			writeTenonError(w, protocol.NewError(protocol.ClassContractViolation, "MODULE_DEFINITION_INVALID", "模块定义自检未通过："+err.Error()))
 		})
 	}
-	return &handler{m: m}
+	return &handler{m: m, resetEnabled: m.TestMode}
 }
 
 // Addr 返回监听地址：PORT 环境变量优先（端口或完整地址），否则 DefaultPort。
@@ -666,7 +719,12 @@ func (m *Module) id() string {
 	return m.ID
 }
 
-type handler struct{ m *Module }
+type handler struct {
+	m *Module
+	// resetEnabled 是 TestMode 在 Handler() 时的快照：路由表不随之后的字段改动
+	// 变化，也就不存在对 TestMode 的并发读写（它和 Actions/Events 一样是启动配置）。
+	resetEnabled bool
+}
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -679,6 +737,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveManifest(w, r)
 	case path == "/tenon/events":
 		h.serveEvents(w, r)
+	case h.resetEnabled && path == adminResetPath:
+		h.serveReset(w, r)
 	case strings.HasPrefix(path, "/tenon/actions/"):
 		h.serveAction(w, r, strings.TrimPrefix(path, "/tenon/actions/"))
 	default:
@@ -729,6 +789,21 @@ func (h *handler) serveReady(w http.ResponseWriter, r *http.Request) {
 		"ready":  true,
 		"checks": []string{"hmac_secret", "audit_file"},
 	})
+}
+
+// serveReset 是仅测试态的管理端点（设计增量 §2.3）：把模块的内存状态清回起点，
+// 让 D1 的 A/B 两轮输入完全相同。TestMode 为 false 时这条路由根本没挂上，请求
+// 落到 UNKNOWN_ENDPOINT 的 404——与任何不存在的路径同形，而不是 405/403 那种
+// 「存在但不允许」的信号（那等于告诉外部「这里有个隐藏开关」）。
+func (h *handler) serveReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	// 不校验 Tenon-Version：这是框架的运维端点（与 /healthz、/readyz 同类），
+	// 不属于六个协议端点，清的是本进程的内存状态而不是协议状态机。
+	h.m.resetState()
+	writeJSON(w, http.StatusOK, map[string]bool{"reset": true})
 }
 
 // serveManifest 返回摘要级能力清单：动作项只有六个字段，不含 inputSchema。
