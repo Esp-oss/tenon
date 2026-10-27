@@ -2108,6 +2108,8 @@ git commit -m "feat(agent): 恢复执行（审批人/过期/G4/policy/归档）"
 
 ## Task 9: 公告板重推与终态覆盖
 
+**状态：✅ 已完成（commit `15f3438`，5 条用例）；但终态覆盖无生产调用点 + host 侧缺 `state` 字段 → Task 9b 补**
+
 **Task 8 复核后追加的要求（比正文更权威）**
 
 1. **`finishTerminal` 只推公告板，绝不再写 result 段**：`resume.go` 已在归档前写好计划级 result（`auditId = DispatchedAuditID`）。计划正文那句「写计划级 result 段并推终态覆盖」的注释是**错的**——照它再写一次，同一 auditId 会出现两条 result 段（计划级变三条记录）。
@@ -2121,7 +2123,7 @@ git commit -m "feat(agent): 恢复执行（审批人/过期/G4/policy/归档）"
 - Modify: `internal/agent/state.go`（若需按 planId 查 archived，用已有 `LoadArchived`）
 - Test: `internal/agent/board_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 // 归档终态时推一条 state=终态 的公告板覆盖：否则已执行的单会在板上挂到过期。
@@ -2172,7 +2174,7 @@ func TestRepushPendingBoard(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 实现 `board.go`**
+- [x] **Step 2: 实现 `board.go`**
 
 ```go
 package agent
@@ -2224,12 +2226,12 @@ func finishTerminal(ctx context.Context, client *HostClient, p Pending, state Pe
 }
 ```
 
-- [ ] **Step 3: 跑测试至全绿**
+- [x] **Step 3: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestFinishTerminal|TestRepushPendingBoard' -count=1 -v`
 Expected: 2 个用例全 PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add internal/agent/board.go internal/agent/board_test.go internal/agent/resume.go
@@ -2238,7 +2240,68 @@ git commit -m "feat(agent): 公告板重推与终态覆盖"
 
 ---
 
+## Task 9b: host 侧补 `pendingItem.state`（Task 9 复核发现的缺口）
+
+**为什么必须单独一步**：Task 9 让 agent 推 `state`，但 `internal/controlplane/pending.go` 的 `pendingItem` **没有 `State` 字段**——`json.Unmarshal` 会静默丢弃它。今天的实际行为是：agent 推了终态覆盖，host 把同一条目原样重写、页面仍然显示"待批"。也就是说 **Task 9 的成果在线上等于零**。
+
+**Files:**
+- Modify: `internal/controlplane/pending.go`（`pendingItem` 加字段 + 缺省值）
+- Test: `internal/controlplane/pending_test.go`
+
+- [ ] **Step 1: 写失败测试**
+
+```go
+// 公告板条目必须带回 state：它是"待批"与"刚刚处理完"的唯一区分。
+func TestPendingBoardKeepsState(t *testing.T) {
+	// POST 一条 state=done 的覆盖，GET 必须原样带回 "done"。
+	// 再 POST 一条**不带 state** 的，GET 必须给缺省 "awaiting_approval"。
+}
+
+// 缺省值不是"空串"：旧客户端（不推 state）的条目仍要能显示成待批。
+func TestPendingBoardDefaultsStateToAwaiting(t *testing.T) {}
+```
+
+（用例骨架实现者补全，沿用 `pending_test.go` 现有的 `newTestServer` / token 夹具；`expiresAt` 用远期常量。）
+
+- [ ] **Step 2: 实现**
+
+```go
+type pendingItem struct {
+	// 原有字段不动…
+	// State 区分「待批」与「刚刚处理完」：页面按它决定怎么显示，协议层不替页面过滤。
+	// 缺省 awaiting_approval —— 老客户端不推这个字段时不能被当成终态。
+	State string `json:"state"`
+}
+```
+
+在 upsert 里补缺省：`if item.State == "" { item.State = "awaiting_approval" }`；`List` 仍按 `expiresAt` 剔除过期条目（不变）。
+
+- [ ] **Step 3: 跑测试**
+
+```bash
+go test ./internal/controlplane/ -run 'TestPendingBoard' -count=1 -v
+go test ./... -count=1
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add internal/controlplane/pending.go internal/controlplane/pending_test.go
+git commit -m "feat(controlplane): 公告板条目带回 state（终态覆盖否则被静默丢弃）"
+```
+
+**注意**：本任务**不接线**终态覆盖的调用点——那是 Task 10 的事（`Resume` 缺登录凭证，需要由 poller 推）。
+
+---
+
 ## Task 10: `cmd/agent` 的 tick 四段顺序与装配
+
+**Task 9 复核后追加的四条（比正文更权威）**
+
+1. **终态覆盖必须有生产调用点**：`finishTerminal` 未导出、`Resume` 无凭证。选**方案 (b)**：`Resume` 把终态（`*Pending` + `PendingState`）作为返回值给 poller，由 poller 用它的 `HostClient` 推（`board.go` 加一个导出包装 `PushTerminal(ctx, client, p, state) error`）。
+2. **挂起前校验 `approvers` 非空**：`rolesIntersect` 对空集 fail-closed，`requiredRoles` 为空的 approve 计划**谁点都是 403**。在 `buildPending`/挂起处判空 → 不挂起、走 `needs_human` 且 Detail 写明"策略要求审批但没给审批人角色"。
+3. **`resumeError.Retryable` 要能被调用方判断**：加 `agent.IsRetryable(err) bool`；确定性拒绝（角色不匹配/过期/未知 planId/已归档非 done/未知处置）立即 ack，可重试才留到下一 tick。
+4. **合成事件 id 必须确定性**：`evt_req_<requestId>`，**不要用 `newID()`**（时间基会让同一 request 在重启/重放后 triggerEventId 漂移，审计对账对不上）。
 
 **Files:**
 - Modify: `cmd/agent/main.go`
