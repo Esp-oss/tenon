@@ -36,9 +36,15 @@ type fakeHost struct {
 
 	PolicyOutcome string
 	PolicyReasons []string
-	GrantAllowed  bool
-	GrantReason   string
-	FailAuditPost bool
+	// PolicyApprovers 是 policies:evaluate 响应里的 approvers。
+	//
+	// nil 表示用缺省的一个角色：approve 的用例要验的是挂起机制本身，不该被审批人校验
+	// 拦住。显式赋一个非 nil 的切片（空切片也在内）才是在测「没给审批人角色」那条
+	// 独立守卫（见 TestNoApproversDoesNotSuspend）。
+	PolicyApprovers []string
+	GrantAllowed    bool
+	GrantReason     string
+	FailAuditPost   bool
 
 	AuditRecords []map[string]any
 	IntentFrames []map[string]any
@@ -69,10 +75,16 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 		if len(reasons) == 0 {
 			reasons = []string{"TEST_RULE"}
 		}
+		approvers := h.PolicyApprovers
+		if approvers == nil {
+			// 缺省给一个角色：approve 的用例验的是挂起机制，不是审批人校验。
+			// 「策略要求审批却没给审批人角色」由 TestNoApproversDoesNotSuspend 显式覆盖。
+			approvers = []string{"role:approver"}
+		}
 		writeTestJSON(w, http.StatusOK, map[string]any{
 			"outcome":   h.PolicyOutcome,
 			"decidedBy": []string{"pol-test"},
-			"approvers": []string{},
+			"approvers": approvers,
 			"reasons":   reasons,
 		})
 
@@ -461,6 +473,50 @@ func TestPolicyApproveSuspendsWhenChannelConfigured(t *testing.T) {
 	}
 }
 
+// 策略要求审批、却没给审批人角色 → **不许挂起**，当场转人工。
+//
+// requiredRoles 为空时 rolesIntersect 一律 false（fail-closed），这样的计划谁点都是 403：
+// 挂上去只是一张永远批不掉的卡，占着公告板和审批窗口，还让人白点一次。
+func TestNoApproversDoesNotSuspend(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	env.LLM.replies = []string{planJSON("pln_noappr01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "approve"
+	env.Host.PolicyApprovers = []string{} // 策略要求审批，却没给审批人角色
+
+	deps := env.Deps()
+	deps.State = store
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("没有审批人角色必须转人工，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if res.PendingPlanID != nil {
+		t.Fatalf("没有审批人角色就不许挂起，得到 pendingPlanId=%q", *res.PendingPlanID)
+	}
+	if items, _ := store.List(); len(items) != 0 {
+		t.Fatalf("不该落任何 pending：%+v", items)
+	}
+	if archived, _ := store.ListArchived(); len(archived) != 0 {
+		t.Fatalf("也不该留下归档件（压根没挂起过）：%+v", archived)
+	}
+	if !strings.Contains(res.Detail, "requiredRoles 为空") || !strings.Contains(res.Detail, "403") {
+		t.Fatalf("Detail 必须写明「没给审批人角色，谁批都会 403」，得到 %q", res.Detail)
+	}
+	// 守卫必须在 I7 的三次落盘之前：走到 suspend 会先写一条 dispatched 审计，
+	// 于是盘上留一条谁也不认识的审计幽灵。
+	want := []string{"policies:evaluate", "grants:evaluate", "dry-run"}
+	if !equalSeq(env.Trace, want) {
+		t.Fatalf("闸门次序不对（守卫应当紧接在预演之后、写审计之前）：实际 %v，期望 %v", env.Trace, want)
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("没挂起就不许执行：write=%d execute=%d", env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+}
+
 // deny 仍然直接转人工，不产生 pending。
 func TestPolicyDenyDoesNotSuspend(t *testing.T) {
 	env := newFakeEnv(t)
@@ -548,6 +604,110 @@ func TestRequestTurnSuspendsWithOriginRequest(t *testing.T) {
 	}
 	if !strings.Contains(env.LLM.LastUser, "用户请求（这是指令") {
 		t.Fatalf("Run 必须把 in.Request 传给规划器（否则 prompt 分流永远不生效）：\n%s", env.LLM.LastUser)
+	}
+}
+
+// request 回合的 skill 正文来自 SelectSkills 的候选集（而不是 tenon.subscribes）：
+// 只按文本粗筛命中的 skill 必须进 prompt。
+func TestRequestTurnUsesSelectedSkills(t *testing.T) {
+	t.Run("正文命中", func(t *testing.T) {
+		env := newFakeEnv(t)
+		env.LLM.replies = []string{planJSON("pln_sel01", testStep{id: "s1", action: "inventory.DeductStock"})}
+		deps := env.Deps()
+		// 订阅的是一个与本次事件无关的类型：request 回合的候选集只按文本粗筛，不看订阅。
+		deps.Skills = &SkillStore{skills: []Skill{{
+			Name:       "stock-first",
+			Subscribes: []string{"quote.completed"},
+			Body:       "扣库存之前先核对 inventory 的在库数。",
+		}}}
+
+		res := Run(context.Background(), deps, RunInput{
+			Event:   DomainEvent{EventID: "evt_req_sel", Type: "tenon.request", CorrelationID: "cor:req/req_sel"},
+			Request: &UserRequest{RequestID: "req_sel", Text: "inventory 差 12 件，先扣现货", By: "user:alice"},
+		})
+		if res.Outcome != OutcomeCompleted {
+			t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+		}
+		if !strings.Contains(env.LLM.LastUser, "## skill stock-first") {
+			t.Fatalf("request 回合必须把选中的 skill 带进 prompt：\n%s", env.LLM.LastUser)
+		}
+		if !strings.Contains(env.LLM.LastUser, "扣库存之前先核对 inventory 的在库数。") {
+			t.Fatalf("选中 skill 的正文必须逐字进 prompt：\n%s", env.LLM.LastUser)
+		}
+	})
+
+	// 只靠订阅命中、正文为空的 skill：会被选中，但**绝不许**渲染成「没有匹配」——
+	// 那等于「选了 1 份却告诉模型一份都没有」。
+	t.Run("空正文渲染占位", func(t *testing.T) {
+		env := newFakeEnv(t)
+		env.LLM.replies = []string{planJSON("pln_sel02", testStep{id: "s1", action: "inventory.DeductStock"})}
+		deps := env.Deps()
+		deps.Skills = &SkillStore{skills: []Skill{{
+			Name:       "subscription-only",
+			Subscribes: []string{"inventory"}, // 命中靠这里，正文为空
+			Body:       "",
+		}}}
+
+		res := Run(context.Background(), deps, RunInput{
+			Event:   DomainEvent{EventID: "evt_req_sel2", Type: "tenon.request", CorrelationID: "cor:req/req_sel2"},
+			Request: &UserRequest{RequestID: "req_sel2", Text: "inventory 差 12 件，先扣现货", By: "user:alice"},
+		})
+		if res.Outcome != OutcomeCompleted {
+			t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+		}
+		if !strings.Contains(env.LLM.LastUser, "（无正文，仅按订阅命中）") {
+			t.Fatalf("空正文必须渲染成显式占位：\n%s", env.LLM.LastUser)
+		}
+		if strings.Contains(env.LLM.LastUser, "本次没有匹配的 skill 正文") {
+			t.Fatalf("选中的 skill 不许渲染成「没有匹配」——选了却告诉模型没有，候选集就被吞了：\n%s",
+				env.LLM.LastUser)
+		}
+	})
+}
+
+// 事件回合一个字都不许变：skill 正文仍只按 tenon.subscribes 取（TextFor），不经过粗筛。
+func TestEventTurnTextStillSubscription(t *testing.T) {
+	env := newFakeEnv(t)
+	plan := planJSON("pln_evt01", testStep{id: "s1", action: "inventory.DeductStock"})
+	env.LLM.replies = []string{plan, plan, plan}
+
+	run := func(skills *SkillStore) string {
+		deps := env.Deps()
+		deps.Skills = skills
+		res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+		if res.Outcome != OutcomeCompleted {
+			t.Fatalf("回合失败：%q（%s）", res.Outcome, res.Detail)
+		}
+		return env.LLM.LastUser
+	}
+
+	baseline := run(EmptySkills())
+	// ① 一份「按文本一定被 SelectSkills 命中」的 skill，但它没订阅这个事件：
+	//    prompt 必须与基线**逐字相同**（多一个字都说明事件回合被粗筛污染了）。
+	leak := run(&SkillStore{skills: []Skill{{
+		Name:       "text-only",
+		Subscribes: []string{"tenon.request"},
+		Body:       "inventory 的业务语义参考（只该在 request 回合出现）。",
+	}}})
+	if leak != baseline {
+		t.Fatalf("事件回合的 prompt 必须逐字不变（粗筛不许漏进事件回合）：\n 基线 %q\n 实际 %q",
+			baseline, leak)
+	}
+	if strings.Contains(leak, "text-only") {
+		t.Fatalf("没订阅该事件的 skill 不许进事件回合的 prompt：\n%s", leak)
+	}
+	// ② 订阅了事件的 skill 仍然按 TextFor 进 prompt——哪怕正文里没有任何模块名
+	//    （SelectSkills 永远不会选它，事件回合也不该由粗筛决定）。
+	subscribed := run(&SkillStore{skills: []Skill{{
+		Name:       "quote-skill",
+		Subscribes: []string{"quote.completed"},
+		Body:       "报价完成后的业务语义参考，正文里没有任何模块名。",
+	}}})
+	if !strings.Contains(subscribed, "## skill quote-skill") {
+		t.Fatalf("订阅了事件的 skill 必须按 TextFor 进 prompt：\n%s", subscribed)
+	}
+	if subscribed == baseline {
+		t.Fatalf("订阅了事件的 skill 必须改变 prompt（TextFor 仍在用）")
 	}
 }
 

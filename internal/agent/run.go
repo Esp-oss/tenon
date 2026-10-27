@@ -35,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -194,8 +195,20 @@ func (r *runner) run(ctx context.Context) RunResult {
 			Detail: "可达模块为 0：没有任何可执行能力，转人工"})
 	}
 
+	// skill 正文按回合类型分流（Task 5 复核后追加的三条）：
+	//   - request 回合：SelectSkills 做确定性粗筛，TextForSelected 渲染候选集；
+	//   - 事件回合：仍按 tenon.subscribes 取 TextFor(event.Type)，一个字都不改。
 	skillText := ""
-	if r.deps.Skills != nil {
+	if r.deps.Skills.Len() == 0 {
+		// SelectSkills 不返回 error，区分不出「压根没加载 skill」与「加载了但没命中」，
+		// 所以 0 份必须单独打出来：那是部署问题（永远没有业务语义参考），不是「这次没命中」。
+		log.Printf("agent: 没有加载任何 skill（Skills 为 0 份）：本次回合没有 skill 正文，只能靠事件与动作清单")
+	} else if r.request != nil {
+		// viewModule 传空串：**请求帧里没有视图模块**（UserRequest 只有 requestId/text/by，
+		// 本任务不为此加字段）。没有视图模块时，粗筛只看请求文本。
+		selected := SelectSkills(r.deps.Skills.All(), r.request.Text, "", 2)
+		skillText = r.deps.Skills.TextForSelected(selected)
+	} else {
 		skillText = r.deps.Skills.TextFor(r.event.Type)
 	}
 
@@ -387,6 +400,16 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 // requestId 可为 null（事件回合）：spec §6.3 要求「等审批」只有一条实现路径，不分来源，
 // 所以事件回合也挂起，只是 origin=event。
 func (r *runner) buildPending(plan Plan, policy policyEvaluation) (Pending, error) {
+	// 挂起前必须确认「谁能批」：rolesIntersect 对空集 fail-closed，requiredRoles 为空的
+	// approve 计划**谁点都是 403**。挂上去只会得到一张永远批不掉的卡——它占着公告板、
+	// 占着一个审批窗口，而审批人点下去只换来一次 403。这不是可恢复状态（换个人批也一样），
+	// 所以要当场转人工，而不是等人白点一次才发现。
+	//
+	// 空白条目同样不算审批人：["  "] 与任何角色都交不出交集，效果与空集相同。
+	if !hasApproverRole(policy.Approvers) {
+		return Pending{}, fmt.Errorf(
+			"策略要求审批但没有给审批人角色（requiredRoles 为空，谁批都会 403）：不挂起，转人工")
+	}
 	labels, err := renderLabels(plan)
 	if err != nil {
 		return Pending{}, fmt.Errorf("渲染白话失败：%w", err)
@@ -418,6 +441,16 @@ func (r *runner) buildPending(plan Plan, policy policyEvaluation) (Pending, erro
 		// 丢了它，恢复执行的审计 effects.entities 与 Intent 帧 actions 就退化成空数组。
 		Subject: r.event.Subject,
 	}, nil
+}
+
+// hasApproverRole 判断策略是否真的给了审批人角色（空白条目不算）。
+func hasApproverRole(roles []string) bool {
+	for _, role := range roles {
+		if strings.TrimSpace(role) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- 能力发现 ----------

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,6 +32,76 @@ func (auditProbeFound) Has(context.Context, string) (bool, error) { return true,
 type auditProbeNotFound struct{}
 
 func (auditProbeNotFound) Has(context.Context, string) (bool, error) { return false, nil }
+
+// auditProbePage 是翻审计链时的每页条数。取宿主的分页上限（internal/controlplane 的
+// maxAuditPage = 500）：超过它的 limit 会被宿主静默截断，不如一开始就按满页取。
+const auditProbePage = 500
+
+// hostAuditProbe 是 auditProbe 的真实现：用 HostClient 查宿主审计链。
+//
+// host 绑在 client 里、不进 Has 的签名（理由见 auditProbe 的注释：早先带一个 host 参数、
+// 调用处传空串，等于给「拼出相对 URL」留了个口子）。
+type hostAuditProbe struct{ client *HostClient }
+
+// HostAuditProbe 返回「用 HostClient 查审计链」的 probe，供 SelfCheck 的第三个参数使用。
+//
+// 导出它只是为了装配：auditProbe 是未导出接口、真实现也只能由本包构造——没有这个
+// 构造函数，包外即使拿到导出的 SelfCheck 也传不进 probe。
+func HostAuditProbe(client *HostClient) auditProbe { return hostAuditProbe{client: client} }
+
+// Has 回答「审计链上有没有这条记录」。
+//
+// 端点的真实参数只有 planId / since / limit（internal/controlplane/http.go 的
+// serveAuditQuery），**没有 auditId 过滤**——所以只能按写入顺序把链翻完再逐条比对：
+// since 是写入顺序的 0 基游标，响应里的 nextCursor 就是下一页要传的 since。
+//
+// 必须翻到底才能回答 false：「前 limit 条里没有」不等于「链上没有」。把「没翻到」当成
+// 「不存在」，自检会把一份审计其实齐全的 pending 归档成 stale——那是替人丢掉一张待批件。
+func (h hostAuditProbe) Has(ctx context.Context, auditID string) (bool, error) {
+	if h.client == nil {
+		return false, fmt.Errorf("agent: 审计探测没有宿主客户端（HostClient 为 nil），无法回答 %q 在不在链上", auditID)
+	}
+	auditID = strings.TrimSpace(auditID)
+	if auditID == "" {
+		// 空串只能答出「链上有空 auditId 吗」，而那不是自检要问的问题。
+		return false, fmt.Errorf("agent: 审计探测缺少 auditId（空串无法判定）")
+	}
+	since := 0
+	for {
+		status, raw, err := h.client.do(ctx, http.MethodGet,
+			fmt.Sprintf("%s/tenon/audit?since=%d&limit=%d", h.client.base, since, auditProbePage), nil)
+		if err != nil {
+			return false, fmt.Errorf("查审计失败：%w", err)
+		}
+		if status != http.StatusOK {
+			return false, fmt.Errorf("查审计返回 %d：%s", status, snippet(raw))
+		}
+		var page struct {
+			Records []struct {
+				AuditID string `json:"auditId"`
+			} `json:"records"`
+			NextCursor string `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return false, fmt.Errorf("审计查询的响应不是合法 JSON：%w", err)
+		}
+		for _, rec := range page.Records {
+			if rec.AuditID == auditID {
+				return true, nil
+			}
+		}
+		next, err := strconv.Atoi(strings.TrimSpace(page.NextCursor))
+		if err != nil {
+			// 游标读不懂就答不出「翻完了没有」：不能降级成 false（见上面的 stale 风险）。
+			return false, fmt.Errorf("审计查询的 nextCursor 不是整数（%q）：%w", page.NextCursor, err)
+		}
+		if next <= since {
+			// 游标不再前进 = 已经翻到底：链上确实没有这条。
+			return false, nil
+		}
+		since = next
+	}
+}
 
 // suspend 执行 I7 的三次落盘：
 //
@@ -180,6 +251,17 @@ func selfCheck(ctx context.Context, store *StateStore, probe auditProbe) func(ti
 		}
 		return rep, nil
 	}
+}
+
+// SelfCheck 是 selfCheck 的导出包装：cmd/agent 的 tick 第二段（过期清理与自检）用它，
+// 时间取当前时刻（时钟在包装里取，调用方不必也不再自己传）。
+//
+// 返回的 selfCheckReport 是未导出类型，但**字段全部导出**：包外调用方用
+// rep.Kept / rep.Expired / rep.Stale / rep.Settled / rep.Corrupt 读结果即可，不需要
+// （也没法）给这个类型命名。Corrupt 必须原样带出去——坏文件对 List() 不可见，它是
+// 「盘上有读不了的 pending」唯一的告警出口。
+func SelfCheck(ctx context.Context, store *StateStore, probe auditProbe) (selfCheckReport, error) {
+	return selfCheck(ctx, store, probe)(time.Now().UTC())
 }
 
 // postJSONWith 发一个 JSON POST，返回状态码与响应体。

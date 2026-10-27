@@ -161,6 +161,20 @@ func finishTerminal(ctx context.Context, client *HostClient, p Pending, state Pe
 	return client.PushPending(ctx, boardPayload(p, state))
 }
 
+// PushTerminal 是 finishTerminal 的导出包装：cmd/agent 的恢复段在 Resume 成功返回后，
+// 用 store.LoadArchived(planId) 取回归档件再调它推一条终态覆盖。
+//
+// 之所以要这个出口：Resume 的入参里只有宿主地址、没有带凭证的 HostClient（签名不改），
+// 所以恢复路径只归档、把「推终态」留给调用方；而 finishTerminal 未导出，调用方够不着。
+//
+// 语义一个字没改，边界仍是 finishTerminal 那两条：
+//   - 只推公告板，绝不写 result 段（计划级 result 在归档之前就由 resume.go 写过）；
+//   - 推失败**不要回滚归档**——归档已成功，回滚会让同一份 confirm 被重放执行第二次。
+//     错误只该记日志；重放时归档件已在，再推一次是幂等 upsert。
+func PushTerminal(ctx context.Context, client *HostClient, p Pending, state PendingState) error {
+	return finishTerminal(ctx, client, p, state)
+}
+
 // isTerminalState 判断是不是终态：pending/ 只该有 awaiting_approval 与 resuming，
 // archived/ 只该有这四个。
 func isTerminalState(s PendingState) bool {

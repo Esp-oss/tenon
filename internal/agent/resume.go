@@ -28,6 +28,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -71,6 +72,30 @@ type resumeError struct {
 }
 
 func (e resumeError) Error() string { return e.Msg }
+
+// IsRetryable 回答「这条 confirm 该留到下一 tick 重放，还是当场 ack 掉」。
+//
+// 确定性拒绝重放一万次也是同一个结论——角色不匹配（换个人批是另一帧的事）、已过期、
+// 未知 planId、已归档为非 done、不认识的处置、缺审批人/缺宿主地址这类装配问题都该
+// 立刻 ack：留着只会让同一个坏帧每 tick 重来一次，把日志刷满而永远不成功。
+//
+// 可重试的是「这一次没问成」：审计/策略/授权/能力发现/归档写失败，以及执行结果未定。
+// 那类错误的 pending 与审计都还完整，下一 tick 重放是正确动作。
+//
+// 不是 resumeError 的错误按**可重试**处理：Resume 的返回值恒为 resumeError（本文件的
+// 每个出口都包了它），真收到别的类型说明有人在包装链上丢了 Retryable 这个事实。此时
+// 宁可多来一次，也不要把一条可能成功的 confirm 当成确定性拒绝丢掉。
+func IsRetryable(err error) bool {
+	if err == nil {
+		// 已经处理完（含幂等重放）：没有可重试的事。
+		return false
+	}
+	var re resumeError
+	if errors.As(err, &re) {
+		return re.Retryable
+	}
+	return true
+}
 
 // resumeOutcome 是 runResumed 的结论：要么执行完毕，要么给出归档原因。
 //

@@ -527,6 +527,37 @@ func (s *SkillStore) TextFor(eventType string) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// noBodyPlaceholder 是「选中的 skill 没有正文」的渲染文本。
+//
+// 它必须是一句显式的话，不能是空串：候选集是按模块名命中的，一份只靠 subscribes 命中、
+// 正文为空的 skill 被选中很正常。渲染成空串，userPrompt 就会写下「本次没有匹配的
+// skill 正文」——选了 N 份却告诉模型一份都没有。
+const noBodyPlaceholder = "（无正文，仅按订阅命中）"
+
+// TextForSelected 渲染**已选中**的 skill（候选集），格式与 TextFor 逐字一致：
+// 每份一个「## skill <name>」小标题加正文，份与份之间空一行。
+//
+// 与 TextFor 的唯一区别是空正文的渲染（见 noBodyPlaceholder）——所以不能用 TextFor
+// 来渲染候选集：它跳过空 Body，选中的 skill 越多，prompt 越可能声称「没有正文」。
+// selected 为空时返回空串，让 userPrompt 走它自己的「本次没有匹配」分支。
+//
+// 接收者用不到：留在 SkillStore 上是为了与 TextFor 同一调用形状，并且 nil *SkillStore
+// 也能直接调用（Run 里因此不必为它单独判空）。
+func (s *SkillStore) TextForSelected(selected []Skill) string {
+	if len(selected) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(selected))
+	for _, skill := range selected {
+		body := strings.TrimSpace(skill.Body)
+		if body == "" {
+			body = noBodyPlaceholder
+		}
+		parts = append(parts, fmt.Sprintf("## skill %s\n%s", skill.Name, body))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 // loadSkill 读一份 SKILL.md 并解析 frontmatter。
 func loadSkill(path string) (Skill, error) {
 	raw, err := os.ReadFile(path)

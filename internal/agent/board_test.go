@@ -120,6 +120,36 @@ func TestFinishTerminalPushesOverride(t *testing.T) {
 	}
 }
 
+// PushTerminal 是给 cmd/agent 的导出出口（finishTerminal 未导出、Resume 又拿不到凭证）：
+// 它必须**真的 POST** 一条 state=done 的覆盖，而不是「等价于推过了」。
+func TestPushTerminal(t *testing.T) {
+	host, srv := newBoardHost(t)
+	client := NewHostClient(srv.URL, "agent", "pw", http.DefaultClient)
+	p := samplePending()
+
+	if err := PushTerminal(context.Background(), client, p, StateDone); err != nil {
+		t.Fatalf("推终态失败：%v", err)
+	}
+
+	pushes := host.takePushes()
+	if len(pushes) != 1 {
+		t.Fatalf("应 POST 1 条公告板覆盖：%+v", pushes)
+	}
+	if got := pushes[0]["state"]; got != string(StateDone) {
+		t.Fatalf("state 必须是 %q（否则卡片会继续冒充「等人批」），得到 %+v", StateDone, got)
+	}
+	if pushes[0]["planId"] != p.PlanID {
+		t.Fatalf("覆盖必须带同一个 planId（公告板按它 upsert）：%+v", pushes[0])
+	}
+	// 导出包装不是另一个实现：仍然只推公告板，绝不写 result 段（那会让同一 auditId
+	// 出现两条 result）。
+	for _, path := range host.takePaths() {
+		if path == "/tenon/audit" {
+			t.Fatalf("PushTerminal 不许碰审计（result 段已由 resume.go 写过）：%v", host.takePaths())
+		}
+	}
+}
+
 // 重推现存 pending：幂等 upsert，payload 带 state=awaiting_approval。
 func TestRepushPendingBoard(t *testing.T) {
 	host, srv := newBoardHost(t)

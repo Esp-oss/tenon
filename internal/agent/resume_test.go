@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -170,6 +171,122 @@ func (e *resumeEnv) ArchivedState(planID string) PendingState {
 }
 
 // ---------- 用例 ----------
+
+// IsRetryable 是「这一帧立刻 ack 掉，还是留到下一 tick 重放」的唯一判据。
+//
+// 每条子用例都走真实的 Resume，而不是手捏一个 resumeError：谓词要判的正是 Resume
+// 各出口给出的那个错误，捏一个同形状的值只能证明「字段读得出来」。
+func TestIsRetryable(t *testing.T) {
+	approveAsBob := []string{"role:warehouse_manager"}
+
+	t.Run("nil", func(t *testing.T) {
+		if IsRetryable(nil) {
+			t.Fatal("没有错误就没有可重试的事（已处理完，含幂等重放）")
+		}
+	})
+
+	// 确定性拒绝：重放一万次也是同一个结论，必须立刻 ack。
+	rejects := []struct {
+		name string
+		run  func(t *testing.T, env *resumeEnv)
+	}{
+		{"角色不匹配", func(t *testing.T, env *resumeEnv) {
+			p := env.SeedPending(t, "pln_retry_r1")
+			err := env.Resume(t, confirmFrame(p.PlanID, "approve", "user:alice", []string{"role:warehouse_clerk"}))
+			if err == nil {
+				t.Fatal("角色不匹配必须报错")
+			}
+			if IsRetryable(err) {
+				t.Fatalf("角色不匹配是确定性拒绝（换个人批是另一帧的事）：%v", err)
+			}
+		}},
+		{"过期", func(t *testing.T, env *resumeEnv) {
+			p := env.SeedPendingExpired(t, "pln_retry_r2")
+			err := env.Resume(t, confirmFrame(p.PlanID, "approve", "user:bob", approveAsBob))
+			if err == nil {
+				t.Fatal("过期必须报错")
+			}
+			if IsRetryable(err) {
+				t.Fatalf("过期是确定性拒绝（时间不会倒流）：%v", err)
+			}
+		}},
+		{"未知 planId", func(t *testing.T, env *resumeEnv) {
+			err := env.Resume(t, confirmFrame("pln_retry_missing", "approve", "user:bob", approveAsBob))
+			if err == nil {
+				t.Fatal("未知 planId 必须报错")
+			}
+			if IsRetryable(err) {
+				t.Fatalf("未知 planId 是确定性拒绝（等多久都不会出现）：%v", err)
+			}
+		}},
+		{"已归档非 done", func(t *testing.T, env *resumeEnv) {
+			p := env.SeedPending(t, "pln_retry_r3")
+			if err := env.Store.Archive(p.PlanID, StateRejected); err != nil {
+				t.Fatalf("造归档件失败：%v", err)
+			}
+			err := env.Resume(t, confirmFrame(p.PlanID, "approve", "user:bob", approveAsBob))
+			if err == nil {
+				t.Fatal("已归档非 done 必须报错")
+			}
+			if IsRetryable(err) {
+				t.Fatalf("已归档非 done 是确定性拒绝（重放只会重复敲同一扇门）：%v", err)
+			}
+		}},
+		{"未知处置", func(t *testing.T, env *resumeEnv) {
+			p := env.SeedPending(t, "pln_retry_r4")
+			err := env.Resume(t, confirmFrame(p.PlanID, "maybe", "user:bob", approveAsBob))
+			if err == nil {
+				t.Fatal("未知处置必须报错")
+			}
+			if IsRetryable(err) {
+				t.Fatalf("未知处置是确定性拒绝（amend 属规划路径，不在恢复里）：%v", err)
+			}
+		}},
+	}
+	for _, tc := range rejects {
+		t.Run(tc.name, func(t *testing.T) { tc.run(t, newResumeEnv(t)) })
+	}
+
+	// 瞬时故障：审计/策略/能力发现/网络类，pending 与审计都还完整，必须留着重放。
+	t.Run("瞬时故障可重试", func(t *testing.T) {
+		env := newResumeEnv(t)
+		p := env.SeedPending(t, "pln_retry_r5")
+		dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		deadURL := dead.URL
+		dead.Close()
+
+		deps := env.Deps()
+		deps.Host = deadURL
+		err := Resume(context.Background(), deps, env.Store,
+			confirmFrame(p.PlanID, "approve", "user:bob", approveAsBob))
+		if err == nil {
+			t.Fatal("宿主不可达必须报错")
+		}
+		if !IsRetryable(err) {
+			t.Fatalf("宿主不可达是瞬时故障，必须可重试：%v", err)
+		}
+		if _, ok, _ := env.Store.Load(p.PlanID); !ok {
+			t.Fatal("可重试的故障不许把 pending 弄丢")
+		}
+	})
+
+	// 包装链不该改变结论：errors.As 要能穿过 fmt.Errorf("%w")。
+	t.Run("包装后的错误", func(t *testing.T) {
+		retry := fmt.Errorf("恢复失败：%w", resumeError{Msg: "宿主不可达", Retryable: true})
+		if !IsRetryable(retry) {
+			t.Fatalf("包装后的可重试错误必须仍是可重试：%v", retry)
+		}
+		deny := fmt.Errorf("恢复失败：%w", resumeError{Msg: "未知 planId"})
+		if IsRetryable(deny) {
+			t.Fatalf("包装后的确定性拒绝必须仍不可重试：%v", deny)
+		}
+		// 不是 resumeError 的错误按可重试处理：没人给它定性时，宁可多来一次，
+		// 也不要把一条可能成功的 confirm 当确定性拒绝丢掉。
+		if !IsRetryable(errors.New("某个没包 resumeError 的错误")) {
+			t.Fatal("非 resumeError 的错误按可重试处理（丢帧的代价更高）")
+		}
+	})
+}
 
 // 合法审批人 → 执行全部步骤 → 计划级 result 段带 approvedBy → 归档 done。
 func TestResumeExecutesAllStepsWithApprovedBy(t *testing.T) {
