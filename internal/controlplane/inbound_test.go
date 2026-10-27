@@ -76,7 +76,7 @@ func TestInboundOverwritesByAndMintsSyntheticID(t *testing.T) {
 		t.Fatalf("入队失败 %d：%s", status, body)
 	}
 
-	_, pollBody := getJSON(t, ts.URL+"/tenon/requests/poll?after=0")
+	_, pollBody := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", tok)
 	var got struct {
 		Frames []struct {
 			Seq   int64           `json:"seq"`
@@ -129,7 +129,7 @@ func TestInboundOriginRegistrySurvivesRestart(t *testing.T) {
 		t.Fatalf("入队失败 %d：%s", status, body)
 	}
 	var evtID string
-	_, pollBody := getJSON(t, ts1.URL+"/tenon/requests/poll?after=0")
+	_, pollBody := getJSONAuth(t, ts1.URL+"/tenon/requests/poll?after=0", tok)
 	var poll struct {
 		Frames []struct {
 			Frame json.RawMessage `json:"frame"`
@@ -186,7 +186,7 @@ func TestInboundReportsNonDurableOnPersistFailure(t *testing.T) {
 	if !strings.Contains(body, `"durable":false`) {
 		t.Fatalf("必须明确告知未落盘，得到 %s", body)
 	}
-	if _, pollBody := getJSON(t, ts.URL+"/tenon/requests/poll?after=0"); !strings.Contains(pollBody, `"seq":1`) {
+	if _, pollBody := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", tok); !strings.Contains(pollBody, `"seq":1`) {
 		t.Fatalf("落盘失败时帧仍应在内存队列里可回放，得到 %s", pollBody)
 	}
 	// Broken 是这条失败的唯一出口（Push 只回序号）：必须能读到。
@@ -207,6 +207,34 @@ func TestInboundRejectsUnknownFrameType(t *testing.T) {
 	status, _ := postJSONAuth(t, ts.URL+"/tenon/requests", tok, `{"type":"tenon.unknown"}`)
 	if status != http.StatusBadRequest {
 		t.Fatalf("未知帧类型应 400，得到 %d", status)
+	}
+}
+
+// 入站三个端点都必须鉴权：poll 会把别人说过的话摊开，ack 能把未被处理的请求直接吞掉。
+func TestInboundPollAndAckRequireToken(t *testing.T) {
+	_, ts := newInboundServer(t)
+	defer ts.Close()
+
+	if status, _ := getJSON(t, ts.URL+"/tenon/requests/poll?after=0"); status != http.StatusUnauthorized {
+		t.Fatalf("poll 无 token 应 401，得到 %d", status)
+	}
+	if status, _ := postJSON(t, ts.URL+"/tenon/requests/ack", `{"upto":1}`); status != http.StatusUnauthorized {
+		t.Fatalf("ack 无 token 应 401，得到 %d", status)
+	}
+
+	// 鉴权先于 preflight：Content-Type 不对且没有 token 时回 401，而不是 400。
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/tenon/requests", strings.NewReader("x"))
+	if err != nil {
+		t.Fatalf("构造请求失败：%v", err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("请求失败：%v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("无 token 时应先回 401（不该泄露 Content-Type 要求），得到 %d", resp.StatusCode)
 	}
 }
 

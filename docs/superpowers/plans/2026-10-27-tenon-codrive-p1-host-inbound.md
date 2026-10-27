@@ -38,6 +38,7 @@ git worktree add ../dsh_for_sys-p1 -b feat/p1-host-inbound
 8. **`TENON_REQUIRE_TRIGGER` 默认必须为 false，且只认 `== "1"`**。一旦默认 true，现有 `cmd/agent`（还不发 `triggerEventId`）会拿到 `200 + deny + MISSING_TRIGGER`——传输层与业务拒绝无法区分，agent 会把每份 plan 都报成"策略拒绝"，P1 上线即停摆。开启时必须在启动日志打一条显式告警。
 9. **不要把 HTTP 请求体直接 `Unmarshal` 进 `policy.PolicyRequest`**：它现在带 `json:"origin,omitempty"`，透传就会让"来源只能由宿主判定"的保证作废。HTTP 层必须继续用自己的 `policyEvaluateRequest`。
 10. **`origin` 不是 inputSchema 路径**：Task 7 的加载期校验只能校验 `arg.*`；`origin` 与 `risk.*` 不是动作入参，别拿它们去 `inputSchema.properties` 里找，否则合法规则会被整份丢弃。
+11. **三个入站端点都要求 token（Task 6 复核后收紧）**：`POST /tenon/requests`、`GET …/poll`、`POST …/ack`。spec §3.7 原写「入站端点全部要求」，但 Task 4 只给 enqueue 加了鉴权——poll 会把用户说过的话摊开、ack 能把未处理请求吞掉，必须补。鉴权顺序统一为**鉴权先于 `Content-Type` 预检**（未认证的调用不该拿到端点细节）。agent 作为消费方要用**服务账号**登录（dev 账号表新增 `agent` → `role:agent`），P2 的 agent 启动时需先 `POST /tenon/session` 换 token（`TENON_AGENT_USER` / `TENON_AGENT_PASSWORD`）。
 
 **本计划刻意包含一处受控重构**：把现有 `intentQueue` 提取成 `Queue` 端口的 `memoryQueue` 实现。出站行为**不变**，靠既有的 `TestIntentsRESTRoundTrip` / `TestIntentsRejectsBadFrame` 当安全网。不做这个提取，就要复制约 70 行队列代码，两份迟早漂移。
 

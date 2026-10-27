@@ -1,4 +1,5 @@
 [
   {"user": "alice", "password": "alice-dev", "roles": ["role:warehouse_clerk"]},
-  {"user": "bob", "password": "bob-dev", "roles": ["role:warehouse_manager", "role:procurement_manager"]}
+  {"user": "bob", "password": "bob-dev", "roles": ["role:warehouse_manager", "role:procurement_manager"]},
+  {"user": "agent", "password": "agent-dev", "roles": ["role:agent"]}
 ]

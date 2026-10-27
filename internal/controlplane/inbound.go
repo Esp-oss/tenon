@@ -115,13 +115,14 @@ func (s *Server) serveInboundEnqueue(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	if perr := preflight(r); perr != nil {
-		writeTenonError(w, *perr)
-		return
-	}
+	// 鉴权先于 preflight：未认证的调用不该拿到「你的 Content-Type 不对」这种端点细节。
 	// bearerClaims 失败时已经把 401 写好了：这里只 return，再写一次会让响应失效。
 	claims, ok := s.bearerClaims(w, r)
 	if !ok {
+		return
+	}
+	if perr := preflight(r); perr != nil {
+		writeTenonError(w, *perr)
 		return
 	}
 	body, perr := readBody(r)
@@ -195,9 +196,15 @@ func normalizeInboundFrame(body []byte, subject string, origin *originStore) (ma
 }
 
 // serveInboundPoll 处理 GET /tenon/requests/poll?after=。
+//
+// 要求 token：入站队列里装的是用户说过的话，未鉴权的读等于把别人的话摊开给人看。
+// 消费方是 agent，它用服务账号登录（见 config/users.dev.json 与 spec §3.7）。
 func (s *Server) serveInboundPoll(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if _, ok := s.bearerClaims(w, r); !ok {
 		return
 	}
 	after, perr := parseAfter(r.URL.Query().Get("after"))
@@ -210,9 +217,15 @@ func (s *Server) serveInboundPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveInboundAck 处理 POST /tenon/requests/ack。
+//
+// 要求 token：未鉴权的 ack 能把还没被处理的用户请求直接吞掉（游标一推进，
+// poll 就再也回放不出来），这是拒绝服务而不只是越权。
 func (s *Server) serveInboundAck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if _, ok := s.bearerClaims(w, r); !ok {
 		return
 	}
 	if perr := preflight(r); perr != nil {
