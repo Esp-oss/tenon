@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/plan.schema.json",
+  "title": "Plan（执行计划）",
+  "description": "agent 产出的可审阅计划：带依赖的步骤集合、预期数据差异、预演结论与理由；它必须人能读懂、可被策略评估、可回放重建，执行前依次过 dry-run、策略、授权三个闸门。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["planId", "supersedes", "trigger", "steps", "expectedDiff", "dryRun", "estimatedRisk", "rationale"],
+  "properties": {
+    "planId": {
+      "description": "计划标识，形如 pln_<ULID>。amend 会产生新的 planId，旧计划不复活（§4.4、§5.1）。",
+      "type": "string",
+      "pattern": "^pln_[A-Za-z0-9_-]{4,}$"
+    },
+    "supersedes": {
+      "description": "被本计划取代的旧 planId；首版为 null。被取代的计划终止于 aborted，其已执行步骤不得重放（由幂等键吸收），仅未执行步骤可改（§4.4）。",
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^pln_[A-Za-z0-9_-]{4,}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "trigger": {
+      "description": "本计划的触发源：事件实例与业务链关联标识。两者是审计可回放、对账可对齐的锚点。",
+      "$ref": "#/$defs/PlanTrigger"
+    },
+    "steps": {
+      "description": "计划步骤（有向无环的依赖集合）。至少一步：零步计划没有可执行语义，也会绕过全部闸门，因此不合法。执行顺序由 dependsOn 决定，数组顺序不代表执行顺序。",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/PlanStep"
+      }
+    },
+    "expectedDiff": {
+      "description": "预期产生的数据差异，人读与对账都用它。空数组表示预期无数据变化（纯读计划）。",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExpectedDiff"
+      }
+    },
+    "dryRun": {
+      "description": "预演结论。status 是四态枚举（不是布尔），承载「未验证即强制审批」的降级矩阵（§4.4、§8）。",
+      "$ref": "#/$defs/DryRunReport"
+    },
+    "estimatedRisk": {
+      "description": "agent 对整份计划的风险估计，供策略参考。它不替代逐动作的 risk 判定，也不能用来降低动作自身声明的风险。",
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "rationale": {
+      "description": "选择这条执行路径的理由，人能读懂的散文；0.1 不强制内容，但字段必须出现（无理由时写 null）。审计回放会展示它，缺失即无法解释「为何这么选」（§4.4、§14 未决问题 1）。",
+      "type": ["string", "null"],
+      "maxLength": 4000
+    }
+  },
+  "$defs": {
+    "PlanTrigger": {
+      "description": "触发源：eventId 指出是哪条事件实例触发了本计划（人工发起时使用宿主生成的合成事件 id），correlationId 指向业务链。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eventId", "correlationId"],
+      "properties": {
+        "eventId": {
+          "description": "触发本计划的事件实例标识。",
+          "type": "string",
+          "pattern": "^evt_[A-Za-z0-9_-]{4,}$"
+        },
+        "correlationId": {
+          "description": "业务链关联标识，与触发事件相同。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/CorrelationId"
+        }
+      }
+    },
+    "PlanStep": {
+      "description": "计划的一步：调哪个动作、传什么参、依赖哪些前序步骤。kind 必须与目标动作声明的 kind 一致（该一致性由一致性用例校验，JSON Schema 无法跨文档比对）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stepId", "action", "args", "dependsOn", "kind"],
+      "properties": {
+        "stepId": {
+          "description": "步骤标识，在 Plan 内唯一；dependsOn 与审计的 stepId 都引用它。",
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+        },
+        "action": {
+          "description": "要调用的动作 id，必须在能力发现结果中存在。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+        },
+        "args": {
+          "description": "调用入参，结构由目标动作的 inputSchema 决定，故本对象不封闭字段集合。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonObject"
+        },
+        "dependsOn": {
+          "description": "依赖的前序 stepId 列表；空数组表示无依赖。语义为「全部成功后才可调度」，构成 DAG（引用完整性由一致性用例校验）。",
+          "$ref": "#/$defs/StepIdList"
+        },
+        "kind": {
+          "description": "本步的读写分类，用于规划期判定不可逆约束与补偿顺序；必须与动作声明的 kind 一致。",
+          "type": "string",
+          "enum": ["read", "write"]
+        },
+        "idempotencyKey": {
+          "description": "本步的幂等键，约定形如 tenon:<planId>/<stepId>。write 步骤必须携带：崩溃恢复后靠它向模块回查，把 unknown 收敛为 succeeded 或 failed（§5.1、§5.2）。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/IdempotencyKey"
+        },
+        "compensation": {
+          "description": "本步失败（或后续步骤失败需回滚）时调用的补偿动作 id。不可逆步骤不得出现在非末位，正是靠它（或强制审批）兜底（§4.2、§5.2）。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/ActionId"
+        }
+      }
+    },
+    "StepIdList": {
+      "description": "stepId 的引用数组，允许为空（无依赖）。",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+      }
+    },
+    "ExpectedDiff": {
+      "description": "预期的一处数据变化：实体、字段、变化前后值。from/to 用任意 JSON 值（新建时 from 为 null，删除时 to 为 null）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "field", "from", "to"],
+      "properties": {
+        "entity": {
+          "description": "受影响的实体，对象形式或字符串简写均可（§4.0）。对账两侧必须使用同一寻址。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/EntityRefLike"
+        },
+        "field": {
+          "description": "实体上的字段名（例 onHand）。",
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_.]*$"
+        },
+        "from": {
+          "description": "变化前的值。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonValue"
+        },
+        "to": {
+          "description": "变化后的预期值。",
+          "$ref": "https://tenon.dev/spec/0.1/schemas/common.schema.json#/$defs/JsonValue"
+        }
+      }
+    },
+    "DryRunReport": {
+      "description": "预演报告：status 是结论，diff 是预演算出的差异明细。unsupported/pending 时通常没有 diff。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "description": "预演结论：verified 已确认安全、unsafe 预演发现风险、unsupported 模块未实现预演、pending 尚未预演。只有 verified 允许自动执行，其余一律强制审批（fail-closed）。",
+          "$ref": "#/$defs/DryRunStatus"
+        },
+        "diff": {
+          "description": "预演算出的差异明细，结构同 expectedDiff。用于核对「计划以为会变什么」与「模块实际会变什么」。",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExpectedDiff"
+          }
+        }
+      }
+    },
+    "DryRunStatus": {
+      "description": "预演状态四态（三态加一）：verified / unsafe / unsupported / pending。刻意不用布尔，才能承载降级矩阵。",
+      "type": "string",
+      "enum": ["verified", "unsafe", "unsupported", "pending"]
+    }
+  }
+}

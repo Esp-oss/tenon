@@ -4,11 +4,21 @@
   "private": true,
   "description": "协议类型、schema 校验、EntityRef 寻址、幂等键、sha256 哈希与 HMAC 签名工具",
   "type": "module",
-  "files": ["dist"],
+  "files": [
+    "dist",
+    "schemas"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "sync:schemas": "node scripts/sync-schemas.mjs",
+    "sync:schemas:check": "node scripts/sync-schemas.mjs --check",
     "test": "npm run build && node --test \"dist/**/*.test.js\""
   },
-  "peerDependencies": {},
-  "engines": { "node": ">=22" }
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1"
+  }
 }
