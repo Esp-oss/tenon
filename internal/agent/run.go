@@ -108,6 +108,19 @@ type RunInput struct {
 	Request       *UserRequest
 }
 
+// RequestCorrelationID 给人工请求回合一个**确定性且合规**的业务链锚点。
+//
+// common.schema.json#/$defs/CorrelationId 的模式是 ^cor:\S+$，所以「谁问的」不能当
+// 锚点：把 by（user:alice）写进 correlationId，落进审计 trigger.correlationId 就是一条
+// 不合规记录（真冒烟暴露的 F2）；而「谁问的」已由 actor.onBehalfOf 承载，两者不是一回事。
+//
+// 用 requestId 而不是 newID()：同一句请求重放后必须仍落在同一条业务链上，否则审计对账
+// 与差异测试都对不上。请求回合是**合成事件**，没有自带锚点，所以由这里派生；事件回合
+// 不经过这里——它沿用事件自带的 correlationId。
+func RequestCorrelationID(requestID string) string {
+	return "cor:request/" + requestID
+}
+
 // RunResult 是一个回合的结局。ActionsTaken 只记**真正执行过**的动作（按执行顺序），
 // 被闸门挡住、或规划出来却没轮到的步骤不在里面。
 type RunResult struct {
@@ -370,6 +383,8 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 			outcome:  policy.Outcome,
 			policyID: firstNonEmpty(policy.DecidedBy...),
 			grantID:  grantIDs[step.StepID],
+			// approvedBy 留 nil：走到这里的计划必是 auto（approve 在挂起路径上，
+			// deny 直接转人工），这条路径确实没有人按过批准。
 		}
 		verdict := r.executeStep(ctx, plan, step, gate)
 		switch verdict.kind {
@@ -657,10 +672,16 @@ type stepVerdict struct {
 // outcome 是处置（auto/approve/deny）；policyID 是作出该处置的策略 id（来自
 // policies:evaluate 的 decidedBy），grantID 是命中的授权。三者混用会让审计
 // 「看起来有策略」却答不出是哪一条，这是我在自审时修掉的一处语义错。
+//
+// approvedBy 是**谁按的批准**，与 outcome 是两个维度：outcome 说「这道闸门怎么处置的」，
+// approvedBy 说「哪个主体批的」。auto 路径没人批，必须为 nil；人工批准过的路径（恢复
+// 执行）必须填审批人——audit-event.schema.json 规定 outcome=approve 时 approvedBy 非空，
+// 留 nil 就是一条不合规记录。
 type gateDecision struct {
-	outcome  string
-	policyID string
-	grantID  string
+	outcome    string
+	policyID   string
+	grantID    string
+	approvedBy *string
 }
 
 // executeStep 执行一步：写 dispatched 审计 → 调用 → 写 result 审计，retryable 时退避重试。
@@ -873,10 +894,12 @@ func (r *runner) auditBase(plan Plan, step PlanStep, auditID, stage string, gate
 		Action:    step.Action,
 		InputHash: inputHash,
 		Decision: auditDecision{
-			Outcome:    gate.outcome,
-			PolicyID:   nilIfEmpty(gate.policyID),
-			GrantID:    nilIfEmpty(gate.grantID),
-			ApprovedBy: nil, // 走到执行的计划必是 auto：approve 在挂起路径上（buildPending），deny 直接转人工
+			Outcome:  gate.outcome,
+			PolicyID: nilIfEmpty(gate.policyID),
+			GrantID:  nilIfEmpty(gate.grantID),
+			// 审批人只能由闸门结论带进来：auto 路径的 gateDecision 不填它（那条路径确实
+			// 没人批），恢复路径填 c.By（人批过的事实必须留痕）。
+			ApprovedBy: gate.approvedBy,
 		},
 		Effects:    auditEffects{Entities: r.entities()},
 		TokenUsage: auditTokenUsage{}, // internal/llm 目前不回传用量，见交付说明的已知缺口

@@ -121,6 +121,17 @@ func (e *resumeEnv) PlanResultAudit(auditID string) map[string]any {
 	return nil
 }
 
+// PlanAudit 返回计划级（stepId 为 null）指定 auditId + stage 的那条记录。
+func (e *resumeEnv) PlanAudit(auditID, stage string) map[string]any {
+	for _, rec := range e.Host.AuditRecords {
+		if rec["auditId"] != auditID || rec["stage"] != stage || rec["stepId"] != nil {
+			continue
+		}
+		return rec
+	}
+	return nil
+}
+
 // ResultApprovedBy 读计划级 result 段里的 decision.approvedBy。
 func (e *resumeEnv) ResultApprovedBy(auditID string) string {
 	rec := e.PlanResultAudit(auditID)
@@ -336,6 +347,83 @@ func TestResumeExecutesAllStepsWithApprovedBy(t *testing.T) {
 	}
 	if got := env.Trace[seeded:]; !equalSeq(got, want) {
 		t.Fatalf("恢复路径的请求次序不对：\n  实际 %v\n  期望 %v", got, want)
+	}
+}
+
+// F1（真冒烟暴露的实质缺陷）：恢复执行写的**步骤级**两段审计，decision.outcome 是
+// approve，所以 audit-event.schema.json 要求 decision.approvedBy 非空。审批人必须经
+// gateDecision 一路传进 auditBase，而不是在那里硬写 null。
+//
+// 同时锁住两头：计划级 dispatched（挂起那一刻写的）仍是 null——那时确实还没人批（I2
+// 不因 F1 而破）；outcome 仍是闸门处置 approve，不许改写成 auto。
+func TestResumeStepAuditsCarryApprover(t *testing.T) {
+	env := newResumeEnv(t)
+	p := env.SeedPending(t, "pln_r11")
+
+	if err := env.Resume(t, confirmFrame(p.PlanID, "approve", "user:bob", []string{"role:warehouse_manager"})); err != nil {
+		t.Fatalf("恢复失败：%v", err)
+	}
+
+	stepRecords := 0
+	for _, rec := range env.Host.AuditRecords {
+		if rec["stepId"] == nil {
+			continue // 计划级记录另算（见下面的两段断言）
+		}
+		stepRecords++
+		stage, _ := rec["stage"].(string)
+		decision, _ := rec["decision"].(map[string]any)
+		if decision["outcome"] != outcomeApprove {
+			t.Fatalf("步骤级 %s 的 decision.outcome 必须是闸门处置 %q（人批的），实际 %v",
+				stage, outcomeApprove, decision["outcome"])
+		}
+		by, ok := decision["approvedBy"].(string)
+		if !ok || by != "user:bob" {
+			t.Fatalf("步骤级 %s 的 decision.approvedBy 必须是审批人 user:bob"+
+				"（schema：outcome=approve 时非空），实际 %#v", stage, decision["approvedBy"])
+		}
+	}
+	// 一步计划 = 一条 dispatched + 一条 result，两段都要带上审批人。
+	if stepRecords != 2 {
+		t.Fatalf("一步计划应有 2 条步骤级审计（dispatched + result），实际 %d 条", stepRecords)
+	}
+
+	// 计划级 dispatched（suspend 写的）：此刻没人批过，必须仍是 null。
+	planDispatched := env.PlanAudit(p.DispatchedAuditID, auditStageDispatched)
+	if planDispatched == nil {
+		t.Fatalf("缺计划级 dispatched 审计（挂起时写的）")
+	}
+	decision, _ := planDispatched["decision"].(map[string]any)
+	if decision["approvedBy"] != nil {
+		t.Fatalf("计划级 dispatched 的 decision.approvedBy 必须仍是 null（那一刻没人批，I2），实际 %#v",
+			decision["approvedBy"])
+	}
+	if decision["outcome"] != outcomeApprove {
+		t.Fatalf("计划级 dispatched 的 decision.outcome 仍是 %q，实际 %v", outcomeApprove, decision["outcome"])
+	}
+}
+
+// F3（只修 array）：挂起路径写的**计划级 dispatched** 审计，effects.entities 必须是
+// 数组（[]）。schema 的 AuditEffects.entities 只允许 array；写 null 的后果是「声明了 0
+// 个实体」与「字段缺失」在哈希链里变成两种字节，对账侧也读不出本意。
+func TestAuditSuspendPlanEffectsEntitiesIsArray(t *testing.T) {
+	env := newResumeEnv(t)
+	p := env.SeedPending(t, "pln_r12") // 内部走真实 suspend（I7 三次落盘）
+
+	rec := env.PlanAudit(p.DispatchedAuditID, auditStageDispatched)
+	if rec == nil {
+		t.Fatalf("缺计划级 dispatched 审计")
+	}
+	effects, ok := rec["effects"].(map[string]any)
+	if !ok {
+		t.Fatalf("缺 effects 段：%#v", rec["effects"])
+	}
+	entities, ok := effects["entities"].([]any)
+	if !ok {
+		t.Fatalf("effects.entities 必须是数组（schema 只允许 array），实际 %#v", effects["entities"])
+	}
+	// 挂起时一步都没执行：空数组才是诚实的「没有实体级影响」。
+	if len(entities) != 0 {
+		t.Fatalf("挂起时一笔写都没发，entities 必须是空数组，实际 %v", entities)
 	}
 }
 

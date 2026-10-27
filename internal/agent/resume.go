@@ -15,9 +15,14 @@
 //	5 执行全部步骤（**业务拒绝 = 前置条件失效**：不硬跑，归档 stale）
 //	6 终态归档（done / rejected / expired / stale）
 //
-// 审计边界（I2）：挂起路径的 dispatched 段在 suspend 里写过，approvedBy 恒为 null；
-// 恢复只补计划级 result 段，并在那里记 approvedBy——人批过的事实哪怕后来被策略拒了
-// 也必须留痕。
+// 审计边界（I2）：挂起路径的计划级 dispatched 段在 suspend 里写过，那时 approvedBy
+// 恒为 null（还没人批）；恢复只补**计划级** result 段，并在那里记 approvedBy——人批过的
+// 事实哪怕后来被策略拒了也必须留痕。
+//
+// 恢复执行的**每一步**仍各自写自己的 dispatched/result 两段（与 auto 路径同一套
+// executeStep）。这两段的 decision.outcome 是 approve，所以按 audit-event.schema.json
+// 的要求 approvedBy 必须非空：审批人由 gateDecision 一路传进 auditBase（见 runResumed
+// 的 gate 构造），不再是「硬写 null」。
 //
 // 公告板**不在这里推**：终态覆盖是 board.go 的 finishTerminal（spec §3.4），而它需要一个
 // 带登录凭证的 HostClient——Resume 的入参里只有宿主地址（Deps.Host），没有凭证，所以
@@ -105,6 +110,9 @@ type resumeOutcome struct {
 	err       error
 	archiveAs PendingState
 	retryable bool
+	// steps 是**真正落地**的步数（只有全步成功才会走到归档 done，所以它等于 ordered 的
+	// 长度）。日志行要报「这一帧到底做了几步」，不能只有一句「归档了」。
+	steps int
 }
 
 // Resume 处理一条 confirm。返回 nil 表示已处理完毕（含幂等重放）；
@@ -174,6 +182,10 @@ func Resume(ctx context.Context, deps Deps, store *StateStore, c Confirm) error 
 			p.PlanID, p.Plan.PlanID)}
 	}
 
+	// 这一帧被处理的耗时（F5：成功路径原来一行日志都没有，排障时看不出「处理过」）。
+	// 从校验之后开始算：入站 ack 与重放的耗时不属于恢复本身。
+	frameStarted := time.Now()
+
 	switch strings.TrimSpace(c.Decision) {
 	case confirmReject:
 		if err := archivePending(store, p.PlanID, StateRejected); err != nil {
@@ -181,6 +193,7 @@ func Resume(ctx context.Context, deps Deps, store *StateStore, c Confirm) error 
 		}
 		// 归档即可：终态覆盖见 board.go 的 finishTerminal（它需要带凭证的 HostClient，
 		// 接线在 cmd/agent，不在恢复路径里）。
+		logResumed(p, c, confirmReject, 0, time.Since(frameStarted), StateRejected)
 		return nil
 	case confirmApprove:
 		// 继续走下面的固定顺序
@@ -232,7 +245,19 @@ func Resume(ctx context.Context, deps Deps, store *StateStore, c Confirm) error 
 	if err := archivePending(store, p.PlanID, StateDone); err != nil {
 		return resumeError{Msg: "执行已完成但归档 done 失败（重放会被幂等键挡住）：" + err.Error(), Retryable: true}
 	}
+	logResumed(p, c, confirmApprove, out.steps, time.Since(frameStarted), StateDone)
 	return nil
+}
+
+// logResumed 在恢复**成功**时打一行（planId、处置、审批人、执行了几步、耗时、终态）。
+//
+// 失败路径各自已经带了上下文（错误会经 IsRetryable 决定 ack 还是重放，并打进调用方的
+// 日志），所以这里只管成功：原来成功的 resume 完全静默——审计落了、库存改了、归档成
+// done 了，日志里一个字都没有，排障时看不出「这一帧被处理过」。
+func logResumed(p Pending, c Confirm, decision string, steps int, elapsed time.Duration, state PendingState) {
+	log.Printf("agent: confirm %s planId=%s decision=%s 审批人=%s 执行 %d/%d 步 耗时=%s → 归档 %s",
+		firstNonEmpty(c.ConfirmID, "-"), p.PlanID, decision, firstNonEmpty(c.By, "-"),
+		steps, len(p.Plan.Steps), elapsed.Round(time.Millisecond), state)
 }
 
 // runResumed 用原计划重跑闸门并执行全部步骤。
@@ -240,6 +265,10 @@ func Resume(ctx context.Context, deps Deps, store *StateStore, c Confirm) error 
 // 返回的 archiveAs 非空表示该归档成什么；为空表示可重试的瞬时故障，pending 必须留着。
 func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutcome {
 	r := newResumeRunner(deps, p)
+	// 审批人在这条路径上**只有一个取值**：宿主已用 token 的 sub 覆写过 c.By，这里去掉
+	// 空白后同时喂给 step 级审计（gate.approvedBy）与计划级 result 段——同一次批准在两条
+	// 记录里写两个样（一个带空格、一个不带）会让对账侧读成两个人。
+	by := strings.TrimSpace(c.By)
 
 	// Step 0b：必须自己装模块清单。discover 填 r.modules，moduleBase 靠它反查基地址；
 	// 漏了这一步，每一步都会报「动作所属模块不在可达清单里」。
@@ -261,7 +290,7 @@ func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutc
 	if policy.Outcome != outcomeApprove && policy.Outcome != outcomeAuto {
 		// deny 与任何未知取值都不放行（与 Run 的策略闸门同一口径）：
 		// 不执行，但人批过的事实必须留痕——result 段仍带 approvedBy。
-		return r.closeWithResult(ctx, p, c.By, auditStatusError, string(protocol.ClassPolicyDenied),
+		return r.closeWithResult(ctx, p, by, auditStatusError, string(protocol.ClassPolicyDenied),
 			fmt.Errorf("恢复时策略已收紧为 %s（decidedBy=%v reasons=%v），不执行；旧计划归档 stale，请重新发起",
 				policy.Outcome, policy.DecidedBy, policy.Reasons),
 			StateStale)
@@ -279,7 +308,7 @@ func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutc
 			}
 		}
 		if !grant.Allowed {
-			return r.closeWithResult(ctx, p, c.By, auditStatusError, string(protocol.ClassPolicyDenied),
+			return r.closeWithResult(ctx, p, by, auditStatusError, string(protocol.ClassPolicyDenied),
 				fmt.Errorf("恢复时授权已拒绝动作 %s（reason=%s），不执行；旧计划归档 stale",
 					step.Action, grant.Reason),
 				StateStale)
@@ -291,10 +320,16 @@ func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutc
 	if err != nil {
 		// 计划缺陷：重放也不会变。用 contract_violation 收尾不是为了归罪，而是要把
 		// suspend 那条 dispatched 的 unknown 关掉——一个调用都没发出去，结果是确定的。
-		return r.closeWithResult(ctx, p, c.By, auditStatusError, string(protocol.ClassContractViolation),
+		return r.closeWithResult(ctx, p, by, auditStatusError, string(protocol.ClassContractViolation),
 			fmt.Errorf("计划的 steps 无法定序（不执行）：%w", err),
 			StateStale)
 	}
+
+	// 审批人：整份计划的 step 级两段审计都要带上它。audit-event.schema.json 规定
+	// outcome=approve 时 approvedBy 非空，而恢复执行的每一步都是 approve 处置——
+	// 不填就写出一串「批准了却不知道谁批的」记录（真冒烟暴露的 F1）。
+	// 与计划级 result 段同一来源（by，见函数开头）。
+	approver := nilIfEmpty(by)
 
 	for _, step := range ordered {
 		// 能力清单的变化是可判定的终局：模块被摘除/禁用之后，这份计划再也执行不了。
@@ -302,7 +337,7 @@ func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutc
 		// 它只是「计划作废」，无限重试没有意义。注册表/manifest 读不到另走上面的可重试分支，
 		// 所以走到这里的「不在清单里」就是真的被摘掉了。
 		if _, ok := r.moduleBase(step.Action); !ok {
-			return r.closeWithResult(ctx, p, c.By, auditStatusError, string(protocol.ClassContractViolation),
+			return r.closeWithResult(ctx, p, by, auditStatusError, string(protocol.ClassContractViolation),
 				fmt.Errorf("恢复时能力已变化：%s 所属模块不在可达清单里（被摘除或禁用），旧计划作废",
 					step.Action),
 				StateStale)
@@ -311,6 +346,8 @@ func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutc
 			outcome:  outcomeApprove, // 人批的：计划级与步骤级的处置都是 approve，不改写成 auto
 			policyID: firstNonEmpty(policy.DecidedBy...),
 			grantID:  grantIDs[step.StepID],
+			// 步骤级审计的 approvedBy 就来自这里（auditBase 不再硬写 null）。
+			approvedBy: approver,
 		}
 		verdict := r.executeStep(ctx, p.Plan, step, gate)
 		switch verdict.kind {
@@ -326,14 +363,14 @@ func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutc
 				// 前面几步已经落地：这是「部分成功」，写成整体失败会让对账少算已完成的部分。
 				status = auditStatusPartiallyFailed
 			}
-			return r.closeWithResult(ctx, p, c.By, status, string(protocol.ClassBusinessRejection),
+			return r.closeWithResult(ctx, p, by, status, string(protocol.ClassBusinessRejection),
 				fmt.Errorf("恢复时前置条件失效（如库存已被他人改变），动作 %s 被业务拒绝：%s；"+
 					"旧计划归档 stale，请重新发起（已执行 %d/%d 步）",
 					step.Action, verdict.detail, len(r.taken), len(ordered)),
 				StateStale)
 		case verdictPolicyDenied:
 			// 模块侧的治理闸门拒绝：不换路、不重试。
-			return r.closeWithResult(ctx, p, c.By, auditStatusError, string(protocol.ClassPolicyDenied),
+			return r.closeWithResult(ctx, p, by, auditStatusError, string(protocol.ClassPolicyDenied),
 				fmt.Errorf("恢复执行被模块的治理闸门拒绝：%s；旧计划归档 stale", verdict.detail),
 				StateStale)
 		default:
@@ -348,7 +385,9 @@ func runResumed(ctx context.Context, deps Deps, p Pending, c Confirm) resumeOutc
 
 	// 收尾：计划级 result 段（stepId 为空，auditId 复用挂起时那条）带 approvedBy。
 	// archiveAs 为空 + cause 为 nil，调用方据此归档 done。
-	return r.closeWithResult(ctx, p, c.By, auditStatusOK, "", nil, "")
+	out := r.closeWithResult(ctx, p, by, auditStatusOK, "", nil, "")
+	out.steps = len(r.taken) // 全步成功才走到这里，所以它就是 ordered 的长度
+	return out
 }
 
 // closeWithResult 写计划级 result 段，并把「归档到哪」一起给出。

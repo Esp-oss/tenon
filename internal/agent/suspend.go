@@ -140,7 +140,11 @@ func suspend(ctx context.Context, store *StateStore, deps Deps, p Pending) error
 			GrantID:    nil,
 			ApprovedBy: nil, // 计划级 dispatched：此刻确实还没人批（I2）
 		},
-		Effects: auditEffects{Entities: nil},
+		// effects.entities 必须是数组（audit-event.schema.json#/$defs/AuditEffects 只允许
+		// array）：写 null 会让「声明了 0 个实体」与「字段缺失」在哈希链里变成两种字节，
+		// 对账侧也读不出本意（真冒烟暴露的 F3）。挂起时计划一步都没执行，确实没有
+		// 实体级影响，所以是空数组而不是编一个实体。
+		Effects: auditEffects{Entities: []json.RawMessage{}},
 		// audit-event.schema.json：stage=dispatched 时 result.status 必须是 "unknown"
 		// （「已派出、结果未定」）。写别的值会让这条记录连自己的 schema 都不符合——
 		// 宿主今天只校验 auditId 与 stage，但那是宽松，不是许可。

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -929,6 +930,93 @@ func TestAuditRecordsTwoSegments(t *testing.T) {
 	}
 }
 
+// F1 的反面：auto 路径没有人批准过，step 级两段的 decision.approvedBy 必须是 null。
+// 恢复路径给 step 级审计填审批人时，若把 gate（以及 auditBase）的取值搞混，这条会先红。
+func TestAuditAutoPathKeepsApprovedByNull(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_auto0003", testStep{id: "s1", action: "inventory.DeductStock"})}
+	_ = Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if len(env.Host.AuditRecords) != 2 {
+		t.Fatalf("期望 dispatched + result 两段，实际 %d 条", len(env.Host.AuditRecords))
+	}
+	for _, rec := range env.Host.AuditRecords {
+		decision, _ := rec["decision"].(map[string]any)
+		if decision["outcome"] != outcomeAuto {
+			t.Fatalf("auto 路径的 decision.outcome 应为 %q，实际 %v", outcomeAuto, decision["outcome"])
+		}
+		if got := decision["approvedBy"]; got != nil {
+			t.Fatalf("auto 路径的 decision.approvedBy 必须是 null（那条路径确实没人批），实际 %#v", got)
+		}
+	}
+}
+
+// F2：人工请求回合的业务链锚点必须是**合法**的 cor: 值。
+// 判据在 schema（common.schema.json#/$defs/CorrelationId 的 ^cor:\S+$），不在实现里；
+// 原先直接把 by（user:alice）当锚点，落进审计 trigger.correlationId 就是一条不合规记录。
+func TestAuditRequestCorrelationIDIsSchemaValid(t *testing.T) {
+	// 与 common.schema.json 的 CorrelationId 模式逐字相同。
+	correlationIDPattern := regexp.MustCompile(`^cor:\S+$`)
+
+	for _, requestID := range []string{"req_01JB0TEST", "req_FAKE"} {
+		got := RequestCorrelationID(requestID)
+		if got != "cor:request/"+requestID {
+			t.Fatalf("锚点形状应为 cor:request/<requestId>，实际 %q", got)
+		}
+		if !correlationIDPattern.MatchString(got) {
+			t.Fatalf("锚点 %q 不满足 CorrelationId 模式 ^cor:\\S+$", got)
+		}
+		// 业务键必须来自 requestId：「谁问的」不在这里重复表达。
+		if strings.Contains(got, "user:") {
+			t.Fatalf("锚点不许拿身份当业务键，实际 %q", got)
+		}
+	}
+}
+
+// request 回合把锚点一路带进审计：run.go 用 RunInput.CorrelationID 覆盖 plan.Trigger，
+// 审计 trigger 也取自它。这里断言审计里是 cor:request/<requestId>，而「谁问的」仍在
+// actor.onBehalfOf——两者不互相冒充。
+func TestAuditRequestTurnCorrelationIsCorAnchor(t *testing.T) {
+	env := newFakeEnv(t)
+	store, err := NewStateStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("建 store 失败：%v", err)
+	}
+	const requestID = "req_cor01"
+	anchor := RequestCorrelationID(requestID)
+	env.LLM.replies = []string{planJSON("pln_cor01", testStep{id: "s1", action: "inventory.GetStock", kind: "read"})}
+
+	deps := env.Deps()
+	deps.State = store
+	res := Run(context.Background(), deps, RunInput{
+		Event:         DomainEvent{EventID: "evt_req_cor01", Type: "tenon.request", CorrelationID: anchor},
+		CorrelationID: anchor,
+		Request:       &UserRequest{RequestID: requestID, Text: "查一下 STD-1002 的库存", By: "user:alice"},
+	})
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+
+	correlationIDPattern := regexp.MustCompile(`^cor:\S+$`)
+	if len(env.Host.AuditRecords) != 2 {
+		t.Fatalf("一步计划应写 dispatched + result 两段，实际 %d 条", len(env.Host.AuditRecords))
+	}
+	for _, rec := range env.Host.AuditRecords {
+		trigger, _ := rec["trigger"].(map[string]any)
+		got, _ := trigger["correlationId"].(string)
+		if got != anchor {
+			t.Fatalf("审计 trigger.correlationId 应为 %q，实际 %q", anchor, got)
+		}
+		if !correlationIDPattern.MatchString(got) {
+			t.Fatalf("审计 trigger.correlationId %q 不满足 ^cor:\\S+$", got)
+		}
+		actor, _ := rec["actor"].(map[string]any)
+		if actor["onBehalfOf"] != "user:alice" {
+			t.Fatalf("「谁问的」必须仍由 actor.onBehalfOf 承载，实际 %v", actor["onBehalfOf"])
+		}
+	}
+}
+
 func TestIntentFrameSentOnCompleted(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{planJSON("pln_intent001", testStep{id: "s1", action: "inventory.DeductStock"})}
@@ -950,7 +1038,6 @@ func TestIntentFrameSentOnCompleted(t *testing.T) {
 		t.Fatalf("第一帧动作不对：%v", first)
 	}
 }
-
 func TestPlanSchemaFailureIsFailedNotNeedsHuman(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{`{"planId":"pln_broken1","steps":"oops"}`}

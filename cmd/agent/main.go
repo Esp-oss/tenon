@@ -908,9 +908,13 @@ func (p *poller) handleRequest(ctx context.Context, raw []byte) (bool, error) {
 	}
 
 	event := agent.DomainEvent{
-		EventID:       syntheticEventID(req.SyntheticEventID, requestID),
-		Type:          kindRequest,
-		CorrelationID: req.By,
+		EventID: syntheticEventID(req.SyntheticEventID, requestID),
+		Type:    kindRequest,
+		// 业务链锚点必须是合法 cor: 值（common.schema.json#/$defs/CorrelationId 的
+		// ^cor:\S+$）：原先直接把 by（user:alice）当锚点，落进审计 trigger.correlationId
+		// 就是一条不合规记录。合成事件没有自带锚点，所以由 requestId 确定性派生——同一句
+		// 请求重放后必须仍落在同一条业务链上（不能用时间基的 newID）。
+		CorrelationID: agent.RequestCorrelationID(requestID),
 	}
 	// by 是宿主用 token 的 sub 覆写过的**可信身份**（客户端自称一律不认）。每回合改
 	// **副本**：改 p.deps 会让下一帧继承上一个人的委托关系。
@@ -921,8 +925,10 @@ func (p *poller) handleRequest(ctx context.Context, raw []byte) (bool, error) {
 	}
 	p.plans.beginRound()
 	res := agent.Run(ctx, deps, agent.RunInput{
-		Event:         event,
-		CorrelationID: by,
+		Event: event,
+		// 与 Event 同一个锚点：run.go 会用 RunInput.CorrelationID 覆盖进 plan.Trigger，
+		// 两处不一致会让审计与计划挂在不同业务链上。
+		CorrelationID: event.CorrelationID,
 		Request:       &agent.UserRequest{RequestID: requestID, Text: req.Text, By: by},
 	})
 	p.finishRequest(requestID, event, res)
