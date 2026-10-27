@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -89,6 +90,15 @@ func LoadApprovalRules(skillsDir string, baseURLFor func(module string) (string,
 			errs = append(errs, ruleLoadError{Path: path, Err: fmt.Errorf("规则引用的入参路径不存在，整份丢弃")})
 			continue
 		}
+		// 用引擎试编译一遍：未知算子、非法路径语法（arg 不带点、foo.bar）在这里就会暴露。
+		// 不做这一步，坏规则会进规则池，然后在 New() 的策略自检里把**整个宿主**拖垮——
+		// 而 spec §3.8 承诺的是「只丢这个 skill 的规则」。
+		if _, err := policy.NewPolicyEngine(fileRules).Evaluate(context.Background(),
+			policy.PolicyRequest{Action: "tenon.selfcheck.Noop"}); err != nil {
+			errs = append(errs, ruleLoadError{Path: path,
+				Err: fmt.Errorf("规则无法编译（未知算子或非法路径语法）：%w", err)})
+			continue
+		}
 		rules = append(rules, fileRules...)
 	}
 	return rules, errs
@@ -114,26 +124,37 @@ func LoadApprovalRules(skillsDir string, baseURLFor func(module string) (string,
 // 注意：模块是否在线、定义是否拉得到，与「这条规则有没有 arg.* 路径」无关——
 // 连定义都拿不到的规则不予加载（fail-closed），空 when 也一样。
 func validateRulePaths(rules []policy.PolicyRule, baseURLFor func(string) (string, bool)) (bool, error) {
-	cache := map[string]map[string]bool{} // actionID -> 允许的 arg 首段
+	cache := map[string]actionSchema{}
 	for _, rule := range rules {
+		if len(rule.Match.Actions) == 0 {
+			// 模块级规则（省略 actions）覆盖该模块全部动作，我们无法枚举它们去校验入参，
+			// 只能要求业务级规则写明 actions —— 否则 arg.* 的笔误会静默通过加载期。
+			return false, fmt.Errorf("规则 %q 省略了 match.actions：业务级文件必须写明要覆盖的动作，否则无法校验入参路径", rule.PolicyID)
+		}
 		for _, action := range rule.Match.Actions {
-			allowed, ok := cache[action]
+			schema, ok := cache[action]
 			if !ok {
 				module := strings.SplitN(action, ".", 2)[0]
 				base, online := baseURLFor(module)
 				if !online {
 					return false, fmt.Errorf("模块 %q 离线，无法校验 %q 的入参路径", module, action)
 				}
-				schema, err := fetchInputSchema(base, action)
+				var err error
+				schema, err = fetchActionSchema(base, action)
 				if err != nil {
 					return false, err
 				}
-				allowed = firstLevelProps(schema)
-				cache[action] = allowed
+				cache[action] = schema
 			}
 			for _, path := range collectArgPaths(rule.When) {
 				first := strings.SplitN(strings.TrimPrefix(path, "arg."), ".", 2)[0]
-				if !allowed[first] {
+				if !schema.inputProps[first] {
+					return true, nil
+				}
+			}
+			for _, path := range collectRiskPaths(rule.When) {
+				first := strings.SplitN(strings.TrimPrefix(path, "risk."), ".", 2)[0]
+				if !schema.riskProps[first] {
 					return true, nil
 				}
 			}
@@ -142,32 +163,48 @@ func validateRulePaths(rules []policy.PolicyRule, baseURLFor func(string) (strin
 	return false, nil
 }
 
-// fetchInputSchema 拉一次动作定义并取出 inputSchema。
+// actionSchema 是校验需要的两份要点：入参属性键与风险字段键。
+//
+// riskProps 为空表示动作定义里没有 risk 字段：此时任何 risk.* 路径都判「不存在」
+// （fail-closed）。action.schema.json 里 risk 是必填，正常不会走到这里。
+type actionSchema struct {
+	inputProps map[string]bool
+	riskProps  map[string]bool
+}
+
+// fetchActionSchema 拉一次动作定义，取出校验需要的两份要点。
 //
 // manifest 摘要不含 inputSchema 是按需拉取的设计（D15 的上下文成本），所以校验只能
 // 逐个 action id 追一次 GET /tenon/actions/{id}；同一份规则文件里重复出现的 action
 // 由 validateRulePaths 的 cache 收敛成一次。
-func fetchInputSchema(baseURL, actionID string) (json.RawMessage, error) {
+func fetchActionSchema(baseURL, actionID string) (actionSchema, error) {
+	var out actionSchema
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(strings.TrimRight(baseURL, "/") + "/tenon/actions/" + actionID)
 	if err != nil {
-		return nil, fmt.Errorf("拉取 %q 的定义失败：%w", actionID, err)
+		return out, fmt.Errorf("拉取 %q 的定义失败：%w", actionID, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("拉取 %q 的定义返回 %d", actionID, resp.StatusCode)
+		return out, fmt.Errorf("拉取 %q 的定义返回 %d", actionID, resp.StatusCode)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return nil, err
+		return out, err
 	}
 	var wrap struct {
-		InputSchema json.RawMessage `json:"inputSchema"`
+		InputSchema json.RawMessage            `json:"inputSchema"`
+		Risk        map[string]json.RawMessage `json:"risk"`
 	}
 	if err := json.Unmarshal(raw, &wrap); err != nil {
-		return nil, err
+		return out, err
 	}
-	return wrap.InputSchema, nil
+	out.inputProps = firstLevelProps(wrap.InputSchema)
+	out.riskProps = map[string]bool{}
+	for k := range wrap.Risk {
+		out.riskProps[k] = true
+	}
+	return out, nil
 }
 
 // firstLevelProps 取 inputSchema.properties 的键集合。
@@ -192,11 +229,16 @@ func firstLevelProps(schema json.RawMessage) map[string]bool {
 //
 // 它只按 JSON 结构走 all/any/not，**不做路径文法校验**（不复制 policy.parsePath 的
 // 前缀与段名规则）：路径是否合法由 policy.NewPolicyEngine 编译时决定，这里只负责
-// 把「规则里写了哪些入参字段」找出来，交给 inputSchema 比对。
+// 把「规则里写了哪些字段」找出来，交给对应的声明去比对。
 //
-// origin 与 risk.* 的叶子刻意不收集：它们不是动作入参（origin 由宿主判定、
-// risk 是动作声明的风险），拿它们去 inputSchema 里找会把合法规则整份丢掉。
-func collectArgPaths(when json.RawMessage) []string {
+// origin 的叶子刻意不收集：它由宿主判定，没有「声明」可比对。arg.* 与 risk.* 分两路
+// 收集，各自比对不同的声明（入参 schema / 动作 risk）。
+func collectArgPaths(when json.RawMessage) []string { return collectLeafPaths(when, "arg.") }
+
+// collectRiskPaths 从条件树里收集所有 risk.* 叶子路径。
+func collectRiskPaths(when json.RawMessage) []string { return collectLeafPaths(when, "risk.") }
+
+func collectLeafPaths(when json.RawMessage, prefix string) []string {
 	var out []string
 	if len(when) == 0 {
 		return out
@@ -223,7 +265,7 @@ func collectArgPaths(when json.RawMessage) []string {
 					walk(child)
 				}
 			default:
-				if strings.HasPrefix(key, "arg.") {
+				if strings.HasPrefix(key, prefix) {
 					out = append(out, key)
 				}
 			}

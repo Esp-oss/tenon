@@ -2485,6 +2485,50 @@ git commit -m "feat(controlplane): GET / 同源静态页路由（无 UI 目录�
 	devSessionSecret = "tenon-dev-session-secret"
 ```
 
+- [ ] **Step 1b: 收窄平台级规则（否则业务阈值永远不生效）**
+
+`config/policies.dev.json` 现在有一条 `pol-procurement-create-approve`（`when: {"all": []}`，**无条件** approve）。因为合并取更严（`deny > approve > auto`），它会把 `skills/quote-to-fulfillment/approval.json` 里的 `qty<=5 → auto` **完全压住**：启动日志会打印"业务级规则已加载 2 条"，但行为一点没变。
+
+把它替换成只对**对话发起**要求审批：
+
+```json
+{
+  "policyId": "plat-request-needs-human",
+  "priority": 1000,
+  "match": { "module": "procurement", "actions": ["procurement.CreatePurchaseRequest"] },
+  "when": { "all": [ { "origin": { "eq": "request" } } ] },
+  "outcome": "approve",
+  "approvers": ["role:procurement_manager"]
+}
+```
+
+`pol-inventory-deduct-approve`（qty>10）与两条读动作 `auto` 保留不变；**删掉**原来的 `pol-procurement-create-approve`。
+
+- [ ] **Step 1c: `TENON_STRICT_RULES` 与启动说明**
+
+常量区补 `envStrictRules = "TENON_STRICT_RULES"`；`controlplane.Config` 补 `StrictRules bool`（本步只加字段，不在 `New()` 里加行为）；`loadConfig` 补：
+
+```go
+	cfg.StrictRules = strings.TrimSpace(os.Getenv(envStrictRules)) == "1"
+```
+
+业务规则加载那段补：
+
+```go
+		for _, e := range errs {
+			log.Printf("host: 业务规则未生效：%v", e)
+		}
+		if cfg.StrictRules && len(errs) > 0 {
+			return cfg, fmt.Errorf("host: %d 份业务规则未生效，TENON_STRICT_RULES=1 要求启动失败", len(errs))
+		}
+```
+
+启动说明（写进 Step 3 的冒烟记录）至少三条：
+
+1. **模块必须先于 host 启动**——加载期要拉 `GET /tenon/actions/{id}` 校验规则里的入参路径，模块离线则该 skill 规则整份不加载（告警），本进程内不再重试；
+2. `TENON_SKILLS_DIR` 缺省 `skills`，是**相对 cwd** 的路径，必须在仓库根启动；
+3. 重置入站队列要**同时删** `requests.jsonl`、`requests.jsonl.meta`、`requests-index.jsonl`（第三个是治理状态：单删它会把在途 request 静默降级成事件驱动）。
+
 - [ ] **Step 2: 编译并跑 host 冒烟**
 
 ```bash
