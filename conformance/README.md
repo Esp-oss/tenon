@@ -74,7 +74,11 @@ tenon lint --path .                                 # C10 扫描，见 tools/lin
 
 ## 阶段状态
 
-M0（当前）：Go 包只有包声明与文档（`doc.go`），未实现。M0 计划实现 C1–C5 / C8 / C9 / C10 与 D1 的 runner 及报告输出，达成 M0 出口判据「D1 与 C10 全绿」。
+M0（当前）：**已实现**模块侧用例 C1 / C2 / C3 / C8 / C9 / C10。宿主侧用例 C4、C5 与 D1 在本轮**显式记为 SKIP 并写明原因**——SKIP 不等于 PASS，报告会明说「不能视为整体合规」，`--strict` 下 SKIP 让退出码变 2。
+
+实测（对真实 `cmd/inventory` 与 `cmd/procurement` 服务）：`exit=0`，pass 6 / fail 0 / skip 3。
+
+M1 计划实现 C6（事件重放）与 C7（补偿），并把 C5 从桩切到真引擎对真引擎。
 
 M1 计划实现 C6（事件重放）与 C7（补偿），并把 C5 从桩切到真引擎对真引擎。
 

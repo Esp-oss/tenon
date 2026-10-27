@@ -1,0 +1,37 @@
+{
+  "$comment": "M0 场景数据：一致性套件里需要真实业务参数的用例（C2 幂等、C3 未知字段、C9 错误分类）从这里取值。args 必须满足对应 action 的 inputSchema.required。",
+  "modules": [
+    {
+      "module": "inventory",
+      "invocations": [
+        {
+          "name": "deduct-2-of-120",
+          "action": "inventory.DeductStock",
+          "args": { "sku": "STD-1001", "qty": 2, "referenceNo": "CF-DEDUCT-OK" },
+          "expect": { "status": 200, "idempotent": true, "unknownFieldTolerated": true }
+        },
+        {
+          "name": "deduct-more-than-onhand",
+          "action": "inventory.DeductStock",
+          "args": { "sku": "STD-1002", "qty": 999, "referenceNo": "CF-DEDUCT-FAIL" },
+          "expect": {
+            "status": 422,
+            "errorClass": "business_rejection",
+            "errorCode": "STOCK_INSUFFICIENT"
+          }
+        }
+      ]
+    },
+    {
+      "module": "procurement",
+      "invocations": [
+        {
+          "name": "create-pr-9",
+          "action": "procurement.CreatePurchaseRequest",
+          "args": { "sku": "STD-1002", "qty": 9, "referenceNo": "CF-PR-1" },
+          "expect": { "status": 200, "idempotent": true, "unknownFieldTolerated": true }
+        }
+      ]
+    }
+  ]
+}
