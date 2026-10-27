@@ -1,0 +1,681 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"tenon.dev/internal/spec"
+)
+
+// 本文件的全部用例都用假 LLM + httptest 桩服务：不发真实模型请求、不花 token、
+// 不依赖任何外部进程（设计 §6 测试策略）。
+
+// ---------- 桩宿主 ----------
+
+// fakeHost 扮演控制平面：注册表、策略、授权、审计、共驾帧。
+//
+// 它同时是**闸门轨迹的记录者**：每次收到请求就把闸门名写进共享的 trace，于是
+// TestGateOrder 断言的是真实请求顺序，而不是运行时对自我调用的声明。
+type fakeHost struct {
+	*httptest.Server
+	t     *testing.T
+	trace *[]string
+	mu    sync.Mutex
+
+	// InventoryURL 是注册表里 inventory 的地址（由 newFakeEnv 注入）。
+	InventoryURL string
+	// ExtraModules 追加到注册表响应里（例如 enabled=false 的条目）。
+	ExtraModules []moduleEntry
+
+	PolicyOutcome string
+	PolicyReasons []string
+	GrantAllowed  bool
+	GrantReason   string
+	FailAuditPost bool
+
+	AuditRecords []map[string]any
+	IntentFrames []map[string]any
+}
+
+func newFakeHost(t *testing.T, trace *[]string) *fakeHost {
+	t.Helper()
+	h := &fakeHost{t: t, trace: trace, PolicyOutcome: outcomeAuto, GrantAllowed: true}
+	h.Server = httptest.NewServer(http.HandlerFunc(h.serve))
+	t.Cleanup(h.Server.Close)
+	return h
+}
+
+func (h *fakeHost) appendTrace(name string) {
+	*h.trace = append(*h.trace, name)
+}
+
+func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/tenon/modules":
+		mods := []moduleEntry{{ID: "inventory", BaseURL: h.InventoryURL, Enabled: true}}
+		mods = append(mods, h.ExtraModules...)
+		writeTestJSON(w, http.StatusOK, map[string]any{"modules": mods})
+
+	case "/tenon/policies:evaluate":
+		h.appendTrace("policies:evaluate")
+		reasons := h.PolicyReasons
+		if len(reasons) == 0 {
+			reasons = []string{"TEST_RULE"}
+		}
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"outcome":   h.PolicyOutcome,
+			"decidedBy": []string{"pol-test"},
+			"approvers": []string{},
+			"reasons":   reasons,
+		})
+
+	case "/tenon/grants:evaluate":
+		h.appendTrace("grants:evaluate")
+		if !h.GrantAllowed {
+			writeTestJSON(w, http.StatusOK, map[string]any{"allowed": false, "reason": h.GrantReason})
+			return
+		}
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"allowed":        true,
+			"matchedGrantId": "gr-test001",
+			"quota":          map[string]any{"remaining": 100, "unit": "calls"},
+		})
+
+	case "/tenon/audit":
+		var rec map[string]any
+		if err := json.Unmarshal(readTestBody(h.t, r), &rec); err != nil {
+			h.t.Errorf("审计请求体不是 JSON：%v", err)
+		}
+		stage, _ := rec["stage"].(string)
+		h.appendTrace("audit:" + stage)
+		if h.FailAuditPost {
+			writeTestError(w, http.StatusServiceUnavailable, "retryable", "AUDIT_WRITE_FAILED", "注入的审计写失败")
+			return
+		}
+		h.mu.Lock()
+		h.AuditRecords = append(h.AuditRecords, rec)
+		h.mu.Unlock()
+		writeTestJSON(w, http.StatusOK, map[string]any{"ok": true})
+
+	case "/tenon/intents":
+		var frame map[string]any
+		if err := json.Unmarshal(readTestBody(h.t, r), &frame); err != nil {
+			h.t.Errorf("Intent 帧不是 JSON：%v", err)
+		}
+		h.mu.Lock()
+		h.IntentFrames = append(h.IntentFrames, frame)
+		h.mu.Unlock()
+		writeTestJSON(w, http.StatusOK, map[string]any{"ok": true, "seq": 1})
+
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// ---------- 桩模块 ----------
+
+// fakeModule 扮演一个模块侧车：manifest、动作执行、可选的 dry-run。
+type fakeModule struct {
+	*httptest.Server
+	mu    sync.Mutex
+	trace *[]string
+
+	ModuleID string
+	Actions  []string
+
+	DryRunStatus  string // 默认 verified
+	DryRunMissing bool   // 声明「不支持预演」：回 404 空体
+
+	RetryableTimes int    // 前 n 次执行返回 retryable
+	AlwaysReject   string // 非空则每次执行都返回该错误码的 business_rejection
+
+	ManifestCalls   int
+	ExecuteCalls    int
+	WriteCalls      int // 带幂等键的执行次数（= 写调用次数）
+	IdempotencyKeys []string
+	executed        int
+}
+
+func newFakeModule(t *testing.T, id string, actions []string, trace *[]string) *fakeModule {
+	t.Helper()
+	m := &fakeModule{ModuleID: id, Actions: actions, trace: trace, DryRunStatus: dryRunVerified}
+	m.Server = httptest.NewServer(http.HandlerFunc(m.serve))
+	t.Cleanup(m.Server.Close)
+	return m
+}
+
+func (m *fakeModule) appendTrace(name string) {
+	*m.trace = append(*m.trace, name)
+}
+
+func (m *fakeModule) serve(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/.well-known/tenon" {
+		m.mu.Lock()
+		m.ManifestCalls++
+		m.mu.Unlock()
+		actions := make([]map[string]any, 0, len(m.Actions))
+		for _, id := range m.Actions {
+			actions = append(actions, map[string]any{"id": id, "version": "0.1.0", "title": id, "kind": "write"})
+		}
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"tenon":   "0.1",
+			"module":  map[string]any{"id": m.ModuleID, "version": "0.1.0", "title": "测试模块"},
+			"actions": actions,
+			"events":  []any{},
+		})
+		return
+	}
+
+	rest, ok := strings.CutPrefix(r.URL.Path, "/tenon/actions/")
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if _, isDryRun := strings.CutSuffix(rest, ":dry-run"); isDryRun {
+		m.appendTrace("dry-run")
+		if m.DryRunMissing {
+			// 「没有预演能力」必须是可判定的信号：404 空体（interfaces.md §3.3）。
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		// 真实模块把报告包在 {"dryRun": ...} 里（internal/module 的 wrapDryRun，
+		// interfaces.md §3.3）：桩必须同形，否则测不到真正的解析路径。
+		writeTestJSON(w, http.StatusOK, map[string]any{"dryRun": map[string]any{"status": m.DryRunStatus}})
+		return
+	}
+
+	m.appendTrace("execute")
+	key := r.Header.Get("Idempotency-Key")
+	m.mu.Lock()
+	m.ExecuteCalls++
+	if key != "" {
+		m.WriteCalls++
+		m.IdempotencyKeys = append(m.IdempotencyKeys, key)
+	}
+	m.executed++
+	executed := m.executed
+	m.mu.Unlock()
+
+	if m.AlwaysReject != "" {
+		writeTestError(w, http.StatusUnprocessableEntity, "business_rejection", m.AlwaysReject, "可用 3，需求 12")
+		return
+	}
+	if executed <= m.RetryableTimes {
+		writeTestError(w, http.StatusServiceUnavailable, "retryable", "UPSTREAM_BUSY", "瞬时故障")
+		return
+	}
+	writeTestJSON(w, http.StatusOK, map[string]any{"onHand": 0})
+}
+
+// ---------- 环境 ----------
+
+type fakeEnv struct {
+	t      *testing.T
+	spec   *spec.Set
+	Host   *fakeHost
+	Module *fakeModule
+	LLM    *fakeLLM
+	Trace  []string
+}
+
+func newFakeEnv(t *testing.T) *fakeEnv {
+	t.Helper()
+	env := &fakeEnv{t: t, spec: testSpec(t)}
+	// &env.Trace 在 env 是堆指针时地址稳定：桩服务与 Deps 拿到的是同一个切片。
+	env.Module = newFakeModule(t, "inventory", []string{"inventory.GetStock", "inventory.DeductStock"}, &env.Trace)
+	env.Host = newFakeHost(t, &env.Trace)
+	env.Host.InventoryURL = env.Module.URL
+	env.LLM = &fakeLLM{}
+	return env
+}
+
+// Deps 组装一次 Run 的依赖，Trace 指向 env 自己的轨迹切片。
+func (e *fakeEnv) Deps() Deps {
+	return Deps{
+		Host:       e.Host.URL,
+		AgentID:    "ag_test",
+		OnBehalfOf: "user:alice",
+		Planner:    &Planner{LLM: e.LLM, Spec: e.spec},
+		HTTP:       &http.Client{Timeout: 10 * time.Second},
+		Skills:     EmptySkills(),
+		Trace:      &e.Trace,
+	}
+}
+
+// PlannerCalls 是本轮实际发生的规划次数（含重规划）。
+func (e *fakeEnv) PlannerCalls() int { return e.LLM.Calls }
+
+// equalSeq 比较两个字符串序列是否逐项相同。
+func equalSeq(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------- 用例 ----------
+
+func TestGateOrder(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_gate0001", testStep{id: "s1", action: "inventory.DeductStock"})}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	want := []string{"policies:evaluate", "grants:evaluate", "dry-run", "audit:dispatched", "execute", "audit:result"}
+	if !equalSeq(env.Trace, want) {
+		t.Fatalf("闸门顺序不对：\n  实际 %v\n  期望 %v", env.Trace, want)
+	}
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if res.PlanID != "pln_gate0001" || len(res.ActionsTaken) != 1 {
+		t.Fatalf("结局字段不对：%+v", res)
+	}
+}
+
+func TestGateOrderWithReadStep(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_gate0002",
+		testStep{id: "s1", action: "inventory.GetStock", kind: "read", args: `{"sku":"STD-1002"}`},
+		testStep{id: "s2", action: "inventory.DeductStock", dependsOn: `["s1"]`},
+	)}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	// 授权要先把整份计划的每个动作都过一遍（不能执行一半才撞拒绝）；
+	// 两段审计则与各自的执行紧邻，所以顺序是「dispatched → execute → result」×2。
+	want := []string{
+		"policies:evaluate", "grants:evaluate", "grants:evaluate", "dry-run",
+		"audit:dispatched", "execute", "audit:result",
+		"audit:dispatched", "execute", "audit:result",
+	}
+	if !equalSeq(env.Trace, want) {
+		t.Fatalf("闸门顺序不对：\n  实际 %v\n  期望 %v", env.Trace, want)
+	}
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	// 读动作没有幂等语义：只有那个写动作算一次写调用。
+	if env.Module.ExecuteCalls != 2 || env.Module.WriteCalls != 1 {
+		t.Fatalf("执行次数不对：execute=%d write=%d", env.Module.ExecuteCalls, env.Module.WriteCalls)
+	}
+}
+
+func TestTraceOrderAgainstStubRequestsOnly(t *testing.T) {
+	// 轨迹由桩服务写入（而不是运行时自报），这条用例固定「谁在写轨迹」这个前提：
+	// 如果哪天有人在运行时里 append 轨迹，这条会先红。
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_gate0003", testStep{id: "s1", action: "inventory.DeductStock"})}
+	_ = Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if len(env.Trace) == 0 {
+		t.Fatal("轨迹为空：桩服务没有写入，TestGateOrder 就失去意义")
+	}
+	if env.Module.ManifestCalls != 1 {
+		t.Fatalf("能力发现应当只读一次 manifest，实际 %d 次", env.Module.ManifestCalls)
+	}
+}
+
+func TestAuditDispatchedFailureAbortsExecution(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_audit0001", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.FailAuditPost = true
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeFailed {
+		t.Fatalf("期望 failed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("dispatched 审计写失败时必须拒绝执行，实际 write=%d execute=%d",
+			env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+	want := []string{"policies:evaluate", "grants:evaluate", "dry-run", "audit:dispatched"}
+	if !equalSeq(env.Trace, want) {
+		t.Fatalf("审计失败后应当立即终止：实际 %v，期望 %v", env.Trace, want)
+	}
+}
+
+func TestPolicyDeniedGoesNeedsHumanWithoutWorkaround(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_deny0001", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "deny"
+	env.Host.PolicyReasons = []string{"NO_POLICY_MATCH_DEFAULT_DENY"}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("期望 needs_human，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("被策略拒绝后不得尝试替代路径：write=%d execute=%d", env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+	if env.PlannerCalls() != 1 {
+		t.Fatalf("policy_denied 不许重新规划（换个计划就是换路绕过），实际规划 %d 次", env.PlannerCalls())
+	}
+	want := []string{"policies:evaluate"}
+	if !equalSeq(env.Trace, want) {
+		t.Fatalf("被策略拒绝后不应再碰任何闸门：实际 %v，期望 %v", env.Trace, want)
+	}
+	if !strings.Contains(res.Detail, "NO_POLICY_MATCH_DEFAULT_DENY") {
+		t.Fatalf("结局必须带上理由码，实际：%s", res.Detail)
+	}
+}
+
+func TestPolicyApproveGoesNeedsHumanWithoutApprovalChannel(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_approve01", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.PolicyOutcome = "approve"
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	// 只有 auto 允许自动执行：approve 要人来按，而 M0.5 没有确认通道。
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("approve 必须转人工，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("没有人批准就不能执行写动作，实际 write=%d", env.Module.WriteCalls)
+	}
+}
+
+func TestGrantsDeniedGoesNeedsHuman(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_grant0001", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Host.GrantAllowed = false
+	env.Host.GrantReason = "SUBJECT_NOT_PERMITTED"
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("期望 needs_human，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("授权未通过时不得执行，实际 write=%d", env.Module.WriteCalls)
+	}
+	if !strings.Contains(res.Detail, "SUBJECT_NOT_PERMITTED") {
+		t.Fatalf("结局必须带上拒绝原因，实际：%s", res.Detail)
+	}
+}
+
+func TestDryRunUnsafeGoesNeedsHuman(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_dry0001", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Module.DryRunStatus = "unsafe"
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("预演 unsafe 必须转人工，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("预演不安全时不得执行，实际 write=%d", env.Module.WriteCalls)
+	}
+}
+
+// TestDryRunNotFoundForcesHuman 锁住 fail-closed 语义：
+// 模块没实现预演（404）不等于免检。设计文档 §8 的降级矩阵写的是
+// 「无 dry-run（unsupported）或 unsafe → 强制审批」。
+//
+// 曾经的实现把它当「忽略并继续」，那会形成一个供应商可自助开启的旁路：
+// 删掉 :dry-run 端点就能绕过 G1。这条用例就是那个旁路的回归护栏。
+func TestDryRunNotFoundForcesHuman(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_dry0002", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Module.DryRunMissing = true
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("dry-run 404 应转人工（fail-closed），得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("预演不可用时不得执行，实际 write=%d", env.Module.WriteCalls)
+	}
+	if !strings.Contains(res.Detail, "未实现预演") {
+		t.Fatalf("Detail 应说明原因，得到 %q", res.Detail)
+	}
+}
+
+func TestBusinessRejectionReplansAtMostTwice(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{
+		planJSON("pln_br0001", testStep{id: "s1", action: "inventory.DeductStock"}),
+		planJSON("pln_br0002", testStep{id: "s1", action: "inventory.DeductStock", args: `{"sku":"STD-1002","qty":3,"referenceNo":"Q-1"}`}),
+		planJSON("pln_br0003", testStep{id: "s1", action: "inventory.DeductStock", args: `{"sku":"STD-1002","qty":1,"referenceNo":"Q-1"}`}),
+		planJSON("pln_br0004", testStep{id: "s1", action: "inventory.DeductStock"}),
+	}
+	env.Module.AlwaysReject = "STOCK_INSUFFICIENT"
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("期望 needs_human，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if got := env.PlannerCalls(); got != 3 {
+		t.Fatalf("期望 1 次初始 + 2 次重规划 = 3 次规划，实际 %d 次", got)
+	}
+	if env.Module.WriteCalls != 3 {
+		t.Fatalf("三轮各执行一次写，期望 3 次写调用，实际 %d", env.Module.WriteCalls)
+	}
+	if !strings.Contains(res.Detail, "重新规划 2 轮") {
+		t.Fatalf("结局必须说明重规划上限已用尽，实际：%s", res.Detail)
+	}
+	if env.LLM.prompts[1] == env.LLM.prompts[0] {
+		t.Fatal("重规划的 prompt 必须带上上一轮被拒的原因，否则就是拿同一份 prompt 撞三次墙")
+	}
+	if !strings.Contains(env.LLM.prompts[1], "STOCK_INSUFFICIENT") {
+		t.Fatalf("重规划 prompt 必须包含业务拒绝的错误码，实际：\n%s", env.LLM.prompts[1])
+	}
+}
+
+func TestRetryableIsRetriedWithSameIdempotencyKey(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_retry0001", testStep{id: "s1", action: "inventory.DeductStock"})}
+	env.Module.RetryableTimes = 1
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("retryable 后重试成功应当 completed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.Module.WriteCalls != 2 {
+		t.Fatalf("期望「失败一次 + 重试成功」= 2 次写调用，实际 %d", env.Module.WriteCalls)
+	}
+	keys := env.Module.IdempotencyKeys
+	if len(keys) != 2 || keys[0] != keys[1] {
+		t.Fatalf("重试期间幂等键必须不变，实际 %v", keys)
+	}
+	if want := "tenon:pln_retry0001/s1"; keys[0] != want {
+		t.Fatalf("幂等键必须是 %q（protocol.IdempotencyKey 的约定），实际 %q", want, keys[0])
+	}
+}
+
+func TestHostUnreachableFailsClosed(t *testing.T) {
+	env := newFakeEnv(t)
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	deps := env.Deps()
+	deps.Host = deadURL
+	res := Run(context.Background(), deps, RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeFailed {
+		t.Fatalf("host 不可达必须 failed（fail-closed），得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
+		t.Fatalf("host 不可达时不得执行任何写：write=%d execute=%d", env.Module.WriteCalls, env.Module.ExecuteCalls)
+	}
+	if env.PlannerCalls() != 0 {
+		t.Fatalf("连模块清单都拿不到就不该规划，实际规划 %d 次", env.PlannerCalls())
+	}
+}
+
+func TestCapabilityGapGoesNeedsHuman(t *testing.T) {
+	env := newFakeEnv(t)
+	// 规划里出现了清单外的动作（例如模型硬要买料，而采购模块已被摘除）。
+	env.LLM.replies = []string{planJSON("pln_gap0001", testStep{id: "s1", action: "procurement.CreatePurchaseRequest"})}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("能力不足必须 needs_human（不是 failed），得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if res.PlanID != "pln_gap0001" {
+		t.Fatalf("结局要能指出是哪份计划缺口，实际 planId=%q", res.PlanID)
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("清单外的动作绝不能被执行，实际 write=%d", env.Module.WriteCalls)
+	}
+	if env.PlannerCalls() != 1 {
+		t.Fatalf("能力不足不重试规划，实际 %d 次", env.PlannerCalls())
+	}
+}
+
+func TestEnabledModulesAreFiltered(t *testing.T) {
+	env := newFakeEnv(t)
+	// 注册表是管理面视图：摘除的模块仍然在列表里，但 enabled=false。
+	disabled := newFakeModule(t, "procurement", []string{"procurement.CreatePurchaseRequest"}, &env.Trace)
+	env.Host.ExtraModules = []moduleEntry{{ID: "procurement", BaseURL: disabled.URL, Enabled: false}}
+	env.LLM.replies = []string{planJSON("pln_filter001", testStep{id: "s1", action: "inventory.DeductStock"})}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("期望 completed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if disabled.ManifestCalls != 0 {
+		t.Fatalf("enabled=false 的模块不该被做能力发现，实际读了 %d 次 manifest", disabled.ManifestCalls)
+	}
+	if strings.Contains(env.LLM.LastUser, "procurement") {
+		t.Fatalf("摘除模块的动作绝不能出现在 prompt 里：\n%s", env.LLM.LastUser)
+	}
+}
+
+func TestAuditRecordsTwoSegments(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_audit0002", testStep{id: "s1", action: "inventory.DeductStock"})}
+	_ = Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if len(env.Host.AuditRecords) != 2 {
+		t.Fatalf("期望 dispatched + result 两段，实际 %d 条", len(env.Host.AuditRecords))
+	}
+	dispatched, result := env.Host.AuditRecords[0], env.Host.AuditRecords[1]
+	if dispatched["stage"] != "dispatched" || result["stage"] != "result" {
+		t.Fatalf("两段顺序不对：%v / %v", dispatched["stage"], result["stage"])
+	}
+	if dispatched["auditId"] != result["auditId"] {
+		t.Fatalf("同一笔调用的两段必须共用 auditId：%v / %v", dispatched["auditId"], result["auditId"])
+	}
+	if dispatched["planId"] != "pln_audit0002" || dispatched["stepId"] != "s1" {
+		t.Fatalf("审计缺少计划锚点：%v", dispatched)
+	}
+	if got := dispatched["idempotencyKey"]; got != "tenon:pln_audit0002/s1" {
+		t.Fatalf("写动作的审计必须带幂等键，实际 %v", got)
+	}
+	for _, field := range []string{"trigger", "inputHash", "tokenUsage", "actor", "effects"} {
+		if _, ok := dispatched[field]; !ok {
+			t.Fatalf("审计记录缺少必填字段 %q（audit-event.schema.json）：%v", field, dispatched)
+		}
+	}
+	decision, _ := dispatched["decision"].(map[string]any)
+	if decision["outcome"] != outcomeAuto {
+		t.Fatalf("审计的 decision.outcome 应当是闸门处置 %q，实际 %v", outcomeAuto, decision["outcome"])
+	}
+	// 这里锁一个曾经写错过的语义：policyId 必须是「作出该处置的策略 id」，
+	// 不是处置值本身（把 outcome 抄进 policyId 会看起来有策略却答不出是哪一条）。
+	if decision["policyId"] != "pol-test" {
+		t.Fatalf("audit.decision.policyId 应当是策略 id（pol-test），实际 %v", decision["policyId"])
+	}
+	if decision["grantId"] != "gr-test001" {
+		t.Fatalf("audit.decision.grantId 应当是命中的授权，实际 %v", decision["grantId"])
+	}
+	res, _ := dispatched["result"].(map[string]any)
+	if res["status"] != "unknown" {
+		t.Fatalf("dispatched 段的结果必须未定（unknown），实际 %v", res["status"])
+	}
+}
+
+func TestIntentFrameSentOnCompleted(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_intent001", testStep{id: "s1", action: "inventory.DeductStock"})}
+	_ = Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if len(env.Host.IntentFrames) != 1 {
+		t.Fatalf("完成一回合应当发一帧 Intent，实际 %d 帧", len(env.Host.IntentFrames))
+	}
+	frame := env.Host.IntentFrames[0]
+	if frame["type"] != frameTypeIntent || frame["planId"] != "pln_intent001" {
+		t.Fatalf("Intent 帧字段不对：%v", frame)
+	}
+	actions, _ := frame["actions"].([]any)
+	if len(actions) != 2 {
+		t.Fatalf("completed 应当给 open + highlight，实际 %v", actions)
+	}
+	first, _ := actions[0].(map[string]any)
+	if first["kind"] != "open" || first["target"] != "quote:Quote/Q-1" {
+		t.Fatalf("第一帧动作不对：%v", first)
+	}
+}
+
+func TestPlanSchemaFailureIsFailedNotNeedsHuman(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{`{"planId":"pln_broken1","steps":"oops"}`}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeFailed {
+		t.Fatalf("模型输出坏了必须 failed（不是 needs_human），得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if env.PlannerCalls() != maxPlanAttempts {
+		t.Fatalf("坏输出应当在规划器内部重试一次（共 %d 次），实际 %d 次", maxPlanAttempts, env.PlannerCalls())
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("没有合法计划就不得执行，实际 write=%d", env.Module.WriteCalls)
+	}
+}
+
+// ---------- 测试用 HTTP 工具 ----------
+
+func readTestBody(t *testing.T, r *http.Request) []byte {
+	t.Helper()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Errorf("读取请求体失败：%v", err)
+	}
+	return body
+}
+
+func writeTestJSON(w http.ResponseWriter, status int, v any) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func writeTestError(w http.ResponseWriter, status int, class, code, message string) {
+	writeTestJSON(w, status, map[string]any{
+		"tenonError": map[string]any{
+			"class":     class,
+			"code":      code,
+			"message":   message,
+			"retryable": class == "retryable",
+		},
+	})
+}
