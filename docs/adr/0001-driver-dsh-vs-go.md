@@ -80,6 +80,19 @@
 - **前提**：`ApprovalService.ask` 在**没有开着的回合时会抛错**（`throws when no turn is open`），实验必须走真实回合，不能裸调服务。
 - **映射**：不存活 ⇒ 公告板为唯一真相（预期结论）；存活 ⇒ 仍以公告板为准，但 DSH 的审批 UI 可直接复用。
 
+### 实测结论（2026-10-27，DSH `0.2.0-rc.2`）
+
+- **POC-1：fail-open。** 只有**显式** `exit 2`（或方言认得的 `{"decision":"block"}` / `hookSpecificOutput.permissionDecision=deny`）能拦下工具；脚本崩溃（exit 1）、超时（124）、spawn 失败、以及**写成 `{"decision":"deny"}` 这种方言不认的 JSON** 一律放行。
+  → **I7 落在 Go host 强制**：adapter 调工具前同步 `POST /tenon/audit`，非 200 就不调工具；DSH 钩子只做提示，且脚本必须把任何失败路径收敛成 `exit 2`，否则静默失效。
+  证据：[`docs/designs/poc-pre-tool-gate.md`](../designs/poc-pre-tool-gate.md)，复跑 `node scripts/poc-hook-codec.mjs`。
+- **POC-2：不存活（设计如此）。** `ApprovalService.request()` 是回合内的同步 await——`approval/asked` → 等 answerer → `approval/decided`，**pending 只是一个进程内 promise**；源码把重启后孤立的 `asked` 明确称作 *crash-tail garbage on reload*。
+  → **公告板为唯一真相**（原预期被证实）；重启后的续批必须由 adapter 从公告板重建，并在**新的回合内**重新发起 `ask`（回合外调用会直接抛错）。
+  证据：[`docs/designs/poc-approval-restart.md`](../designs/poc-approval-restart.md)。
+
+**证据层级（诚实声明）**：两项都是**源码级 + 库函数级实测**（POC-1 的每条结论都由探针实跑产出）。**未做** live 会话验证（起独立 DSH 实例 + 配置真实钩子/审批）。要补这一层时，它只影响「桥接是否把 deny 落到工具调用上」这一条，不改变「故障时放行」的判定。
+
+**POC 结论对 §6 的影响**：第 3 步（approval 接 `ctx.get('approval')`）的形态确定为「DSH 侧只做入口 + 公告板 durable 真相 + adapter 在回合内重建续批」；第 2 步（module-host）里 I7 的强制点在 Go host，DSH 侧不承担审计前置。
+
 ## 6. 落地顺序（每步带出口判据）
 
 0. **先做搬迁与清理**：`git mv` 5 个 README → `docs/designs/dsh-adapter-boundaries/`；删 5 个占位包目录；README 指向本 ADR → 出口：`pnpm check` 仍绿（`@tenon/core` 不受影响）
