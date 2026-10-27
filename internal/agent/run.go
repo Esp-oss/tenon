@@ -6,7 +6,8 @@
 //	1 规划（Plan 过 plan.schema.json）
 //	2 policies:evaluate   → 不是 auto 就转人工（deny 不得换路绕过，approve 也要人来按）
 //	3 grants:evaluate     → 逐 action 全部先过（不允许即转人工）
-//	4 每个 write 的 :dry-run（404 视为模块没有预演能力并继续；结论不是 verified 即转人工）
+//	4 每个 write 的 :dry-run（**404 也转人工**：模块不实现预演不等于免检；
+//	  结论不是 verified 同样转人工——fail-closed，见设计文档 §8 降级矩阵）
 //	5 每步执行前写 stage=dispatched 审计（非 200 立即终止，本次调用数必须为 0）
 //	6 执行（write 带 Idempotency-Key = protocol.IdempotencyKey(planId, stepId)）
 //	7 写 stage=result 审计

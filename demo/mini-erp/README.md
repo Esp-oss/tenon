@@ -9,15 +9,15 @@ Tenon 纵切面演示：标准件报价完成 → 核对库存 → 扣减（或�
 
 quote 是触发器，inventory 是主路径 + 补偿，procurement 是**分支路径**。只有存在两条可能路径，才能用差异测试（D1）证明 agent 在**推理**而不是在跑流水线（§6.1、D12）。
 
-## 模块实现语言：1 个 TS + 2 个 Go（按测试目的分配，不为好看）
+## 模块实现语言：三个都是 Go 侧车（进程内路径 deferred）
 
-| 模块 | 语言 / 形态 | 为什么是它 |
+| 模块 | 语言 / 形态 | 说明 |
 |---|---|---|
-| quote | TypeScript，in-process cordis 插件 | 它是事件源头，必须验证 `dsh-plugin-module-host` 的**进程内**路径（注册 action、发事件、HMR 热插拔）。这条路径只有 TS 能测，Go 侧车测不到 |
-| inventory | Go，HTTP 侧车 | 协议最重的写路径（幂等 / 补偿 / 前置条件 / 审计双写 / dry-run）。**用侧车是为了强制走真实 HTTP 报文**——写成 in-process 插件就能直接 import 类型、绕过 schema 校验，协议的空洞会被掩盖掉 |
-| procurement | Go，HTTP 侧车 | 分支路径的第二跳，与 inventory 同构，顺便验证「模块清单里有两个 HTTP 模块时，能力发现能否都看见」 |
+| quote | Go，HTTP 侧车，端口 **8083** | 事件源头：`quote.completed` 写进**发件箱**，agent 用 `GET /tenon/events?direction=out` 轮询取走 |
+| inventory | Go，HTTP 侧车，端口 8081 | 协议最重的写路径（幂等 / 补偿 / 前置条件 / 模块侧审计 / dry-run）。**用侧车是为了强制走真实 HTTP 报文**——写成进程内插件就能直接 import 类型、绕过 schema 校验，协议的空洞会被掩盖掉 |
+| procurement | Go，HTTP 侧车，端口 8082 | 分支路径的第二跳，与 inventory 同构；**故意不实现 `:dry-run`**，用来验证 G1 的 fail-closed 降级 |
 
-所以这不是「三种语言秀多样性」，而是**两条接入路径各测一次**：进程内（TS 插件）与跨进程（Go 侧车）。少任何一条，M0 的出口判据都缺一半。
+**原计划是「1 个 TS 进程内插件 + 2 个 Go 侧车」，本轮只覆盖了跨进程路径。** 因为宿主选了 Go（决策 A），没有 TS 宿主，`quote` 也只能是 Go 侧车——「进程内路径」记为 **deferred**，等 dsh 集成时补。这里不假装已经覆盖。
 
 为什么侧车不选 Python：`conformance/` 与 `tools/lint/` 已经是 Go，模块也用 Go 就只需装一套工具链；Python SDK 是 M2 要交付的**接入示例**，不该成为 M0 demo 的运行依赖。
 
@@ -54,7 +54,7 @@ sequenceDiagram
     U->>Q: T1 完成标准件报价
     Q-->>A: T2 quote.completed（outbox，至少一次）
     Note over A: T3 开回合：事实 + skill 索引 + 能力摘要<br/>（不是 handler）
-    A->>A: T4 加载 skill quote-to-fulfillment@1.2
+    A->>A: T4 加载 skill quote-to-fulfillment@0.1
     A->>I: T5 GET /.well-known/tenon（能力发现）
     A->>A: T6 规划 → Plan DAG + expectedDiff
     A->>I: T7 [G1] :dry-run
@@ -89,7 +89,7 @@ sequenceDiagram
 
 D1 是 M0 的主判据，也是「AI 驱动」唯一不依赖实现方自觉的机械证明（§10.2、D13）。
 
-1. **冻结输入**：同一 `quote.completed` 事件 + 同一库存快照（例如可用 3、需求 12）+ 固定 skill 版本 `quote-to-fulfillment@1.2.0`。
+1. **冻结输入**：同一 `quote.completed` 事件 + 同一库存快照（例如可用 3、需求 12）+ 固定 skill 版本 `quote-to-fulfillment@0.1.0`。
 2. **跑 A**：三模块全在 → 记录 Plan A 的 action 序列。期望形态（M0 计划）：先 `inventory.GetStock`，再 `inventory.DeductStock`，缺口部分走 `procurement.CreatePurchaseRequest`。
 3. **跑 B**：摘掉 `procurement` 模块再跑同一输入 → 记录 Plan B 的 action 序列。
 
@@ -100,5 +100,5 @@ D1 是 M0 的主判据，也是「AI 驱动」唯一不依赖实现方自觉的�
 ## 交付边界
 
 - 本目录（当前，M0 骨架阶段）：只有这份 README。三模块、页面与 skill 都还没有实现。
-- M0 计划：quote / inventory / procurement 三模块服务、共驾页面（`@tenon/dsh-plugin-intent-ui` 的 demo 面板）、`quote-to-fulfillment@1.2` skill，以及「一条命令起 demo」+「D1 与 C10 全绿」的出口判据（§12）。
+- M0 计划：quote / inventory / procurement 三模块服务、共驾页面（`@tenon/dsh-plugin-intent-ui` 的 demo 面板）、`quote-to-fulfillment@0.1` skill，以及「一条命令起 demo」+「D1 与 C10 全绿」的出口判据（§12）。
 - 前置依赖：`spec/0.1/schemas/*.json`（线格式唯一真源，§2.1）与本目录之外的三模块实现；本文件不替代 schema。

@@ -51,7 +51,7 @@ tenon lint --path .                                 # C10 扫描，见 tools/lin
 ```
 
 - `--target`：被测**模块**的基地址（`/.well-known/tenon`、`/tenon/actions/{id}` 等六个模块侧端点）。
-- `--host`：被测**宿主**的基地址（`/tenon/policies:evaluate`、`/tenon/audit` 等控制平面端点）。**这个开关还没接到 CLI 上**：宿主模式已在库层可用（`conformance.Options.HostTarget`，用例见 `host_test.go`），把 `--host` 接进 `tenon conformance run` 是紧跟着的一处改动。在那之前从 CLI 跑出来的 C4/C5 仍是 SKIP——报告会如实写「未判定」，不会假装通过。
+- `--host`：被测**宿主**的基地址（`/tenon/policies:evaluate`、`/tenon/audit` 等控制平面端点）。**已接到 CLI**（`tenon conformance run --host …`）。不传 `--host` 时 C4/C5 仍是 SKIP——报告会如实写「未判定」，不会假装通过。
 - `--report`：机器可读报告输出路径，内容为逐用例结果与证据。
 - 退出码：`0` 全绿；`1` 有 FAIL；`2` 有 SKIP 且带 `--strict`（或用法 / 环境错误）。SKIP 默认不算失败，但报告会写明「不能视为整体合规」。
 - 分发：单文件二进制 `tenon`，`go install tenon.dev/cmd/tenon` 或直接下载 release 产物；无运行时依赖。
