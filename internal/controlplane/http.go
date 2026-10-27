@@ -18,6 +18,8 @@
 //	GET  /tenon/intents/poll?after=        按序回放未确认的帧
 //	POST /tenon/intents/ack                确认到某个序号，此后不再回放
 //	POST /tenon/admin/modules              登记/摘除模块（仅 TENON_TEST_MODE=1）
+//	GET  /                                 同源静态页（P1 只做路由，页面内容在 P3）
+//	GET  /ui/…                             静态页引用的资源（只读 TENON_UI_DIR 之内）
 //
 // 关于 WebSocket：0.1 把 /tenon/intents 写成 WS 端点，但 Go 标准库没有 WS 服务端，
 // 为 M0.5 引一个第三方依赖不值得。本包**不做协议升级**：GET /tenon/intents 一律 405，
@@ -141,6 +143,9 @@ type Config struct {
 	SessionSecret []byte
 	// InboundDir 是入站队列与 origin 登记表的目录。空则用 out/inbound。
 	InboundDir string
+	// UIDir 是同源静态页（`GET /` 与 `/ui/…`）的根目录。空表示不提供页面：
+	// 此时 `GET /` 回 503 并说明原因，而不是 404（「页面没配」是部署问题）。
+	UIDir string
 	// RequireTrigger 为 true 时，policies:evaluate 缺少 triggerEventId 即 deny。
 	// P1 的过渡开关（默认 false：缺 triggerEventId 视为事件驱动，保证现有 agent 可用），
 	// P4 收口时把缺省行为改成强制。见 spec §3.11 的「分阶段启用」。
@@ -167,6 +172,8 @@ type Server struct {
 	// requireTrigger 为 true 时缺 triggerEventId 直接 deny（TENON_REQUIRE_TRIGGER=1）。
 	// 从 Config.RequireTrigger 装配，装配后不可变。
 	requireTrigger bool
+	// uiDir 是同源静态页的根目录（Config.UIDir）；空表示不提供页面。
+	uiDir string
 	// pending 是待批公告板：只读 read-model，agent 推、前端看。刻意不落盘（可重建）。
 	pending *pendingBoard
 }
@@ -195,6 +202,7 @@ func New(cfg Config) (*Server, error) {
 		grantCount:  len(cfg.Grants),
 		// 过渡开关：默认 false，缺 triggerEventId 视为事件驱动（现有 agent 可用）。
 		requireTrigger: cfg.RequireTrigger,
+		uiDir:          cfg.UIDir,
 		// 公告板是纯内存 read-model：可丢、可重建，重建靠 agent 每 tick 的幂等 upsert。
 		pending: newPendingBoard(),
 	}
@@ -262,6 +270,11 @@ func (s *Server) Registry() *registry.Registry { return s.modules }
 // ServeHTTP 按路径分派。每个处理函数自己判定方法，好让「路径存在但方法不对」回 405
 // 而不是 404。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 静态页与静态资源放在 switch 之前：`/ui/` 之下路径不固定，枚举不出来。
+	if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, uiPrefix) {
+		s.serveStatic(w, r)
+		return
+	}
 	switch r.URL.Path {
 	case "/healthz":
 		s.serveHealth(w, r)
