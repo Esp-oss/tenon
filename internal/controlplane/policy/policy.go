@@ -67,12 +67,15 @@ const (
 	ReasonDeny = "POLICY_DENY"
 )
 
-// 条件字段路径的根前缀：只有这两类取值域，schema 也只定义这两类。
+// 条件字段路径的根前缀：只有这三类取值域，schema 也只定义这三类。
 const (
 	// pathRootArg 指向被评估动作的入参。
 	pathRootArg = "arg"
 	// pathRootRisk 指向动作声明的风险（action.schema.json#/$defs/Risk）。
 	pathRootRisk = "risk"
+	// pathRootOrigin 指向调用来源；它是单段路径（不带 `.`），取值由宿主判定后注入，
+	// 不是动作入参的一部分。
+	pathRootOrigin = "origin"
 )
 
 // supportedOperators 是封闭的算子集合（§4.7）：只接受这九个，未知算子必须报错。
@@ -146,6 +149,10 @@ type PolicyRequest struct {
 	Args json.RawMessage `json:"args,omitempty"`
 	// Risk 是动作声明的风险（action.schema.json#/$defs/Risk），供 risk.* 路径取值。
 	Risk json.RawMessage `json:"risk,omitempty"`
+	// Origin 是本次调用的来源：request（人发起）或 event（事件驱动）。
+	// **由宿主从登记表判定**，不接受调用方自报；空串表示来源未知，此时 origin 条件
+	// 一律不成立（不猜来源）。
+	Origin string `json:"origin,omitempty"`
 }
 
 // PolicyEvaluation 是 policies:evaluate 的响应体
@@ -297,10 +304,13 @@ func reasonFor(outcome string) string {
 	}
 }
 
-// evalScope 是一次求值的取值上下文：条件里的 arg.* 与 risk.* 分别落到这两棵树上。
+// evalScope 是一次求值的取值上下文：条件里的 arg.* / risk.* 落到两棵 JSON 树上，
+// origin 是宿主判定的单段来源。
 type evalScope struct {
 	args any
 	risk any
+	// origin 是本次调用的来源；空串表示未知（条件一律不成立）。
+	origin string
 }
 
 // newEvalScope 把请求里的入参与风险解码成可走路径的 JSON 树。
@@ -314,7 +324,7 @@ func newEvalScope(req PolicyRequest) (*evalScope, error) {
 	if err != nil {
 		return nil, fmt.Errorf("policy: 解析 risk 失败：%w", err)
 	}
-	return &evalScope{args: args, risk: risk}, nil
+	return &evalScope{args: args, risk: risk, origin: req.Origin}, nil
 }
 
 // decodeOptional 允许字段缺省（空字节或 null 都当作「没有这棵树」）。
@@ -339,7 +349,16 @@ func decodeJSON(raw json.RawMessage) (any, error) {
 
 // lookup 沿路径段找值。任一段走不通（中间层不是对象、键不存在）都算「取不到值」，
 // 由调用方按「不匹配」处理——这不是错误，条件本就是在描述「有没有这个值」。
+//
+// origin 是例外：它是单段取值（没有路径段），且空串表示「宿主没判定来源」，
+// 此时同样按取不到值处理，而不是把空串当成一个可比较的来源。
 func (s *evalScope) lookup(root string, path []string) (any, bool) {
+	if root == pathRootOrigin {
+		if len(path) != 0 || s.origin == "" {
+			return nil, false
+		}
+		return s.origin, true
+	}
 	cur := s.args
 	if root == pathRootRisk {
 		cur = s.risk
@@ -405,9 +424,9 @@ func (c notCond) eval(s *evalScope) bool { return !c.child.eval(s) }
 
 // leafCond 是算子叶：一条取值路径配一个算子。
 type leafCond struct {
-	// root 是取值前缀（arg 或 risk）。
+	// root 是取值前缀（arg、risk 或 origin）。
 	root string
-	// path 是前缀之后的路径段。
+	// path 是前缀之后的路径段；origin 是单段前缀，此时为空。
 	path []string
 	// op 是算子，构造期已验证属于封闭集合。
 	op string
@@ -536,15 +555,25 @@ func compileLeaf(obj map[string]json.RawMessage) (condition, error) {
 	return c, nil
 }
 
-// parsePath 拆出取值前缀与路径段。前缀只有 arg（动作入参）与 risk（动作风险声明）；
-// 未知前缀是配置错误而不是「取不到值」——前缀写错会让规则静默永不命中。
+// parsePath 拆出取值前缀与路径段。前缀只有 arg（动作入参）、risk（动作风险声明）与
+// origin（调用来源，单段）；未知前缀是配置错误而不是「取不到值」——前缀写错会让规则
+// 静默永不命中。
+//
+// origin 必须是整条路径：接受 origin.sub 会让规则作者写出引擎不提供的子路径
+// （如 origin.requestId），而它只会安静地永不命中。
 func parsePath(path string) (string, []string, error) {
+	if path == pathRootOrigin {
+		return pathRootOrigin, nil, nil
+	}
 	root, rest, found := strings.Cut(path, ".")
 	if !found {
-		return "", nil, fmt.Errorf("取值路径 %q 必须形如 arg.qty 或 risk.reversible", path)
+		return "", nil, fmt.Errorf("取值路径 %q 必须形如 arg.qty、risk.reversible 或 origin", path)
+	}
+	if root == pathRootOrigin {
+		return "", nil, fmt.Errorf("取值路径 %q：origin 是单段路径，不能带路径段", path)
 	}
 	if root != pathRootArg && root != pathRootRisk {
-		return "", nil, fmt.Errorf("取值路径 %q 的前缀只能是 arg 或 risk", path)
+		return "", nil, fmt.Errorf("取值路径 %q 的前缀只能是 arg、risk 或 origin", path)
 	}
 	segs := strings.Split(rest, ".")
 	for _, seg := range segs {

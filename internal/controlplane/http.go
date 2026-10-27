@@ -96,6 +96,13 @@ const (
 	// reasonEvaluationFailed 是求值出错时的理由码：大写蛇形，符合
 	// policy.schema.json 对 reasons 的词法约束（^[A-Z][A-Z0-9_]*$）。
 	reasonEvaluationFailed = "POLICY_EVALUATION_FAILED"
+	// reasonMissingTrigger 是开启了 TENON_REQUIRE_TRIGGER 后请求缺 triggerEventId 的
+	// 理由码。与 POLICY_EVALUATION_FAILED 分开：这是调用方没给来源凭证，不是规则坏了。
+	reasonMissingTrigger = "MISSING_TRIGGER"
+	// originRequest / originEvent 是两条来源轴取值，进 policy.PolicyRequest.Origin。
+	// 判定权在宿主（origin 登记表），调用方自报的 origin 一律忽略。
+	originRequest = "request"
+	originEvent   = "event"
 	// quotaField 是授权评估从 args 里取业务量的字段名（见包注释的取舍）。
 	quotaField = "qty"
 	// 三种共驾帧的判别值，见 frames.schema.json。
@@ -134,6 +141,10 @@ type Config struct {
 	SessionSecret []byte
 	// InboundDir 是入站队列与 origin 登记表的目录。空则用 out/inbound。
 	InboundDir string
+	// RequireTrigger 为 true 时，policies:evaluate 缺少 triggerEventId 即 deny。
+	// P1 的过渡开关（默认 false：缺 triggerEventId 视为事件驱动，保证现有 agent 可用），
+	// P4 收口时把缺省行为改成强制。见 spec §3.11 的「分阶段启用」。
+	RequireTrigger bool
 }
 
 // Server 是组装好的控制平面。构造后并发安全；Handler() 与服务共享同一份状态。
@@ -153,6 +164,9 @@ type Server struct {
 	origin      *originStore
 	policyCount int
 	grantCount  int
+	// requireTrigger 为 true 时缺 triggerEventId 直接 deny（TENON_REQUIRE_TRIGGER=1）。
+	// 从 Config.RequireTrigger 装配，装配后不可变。
+	requireTrigger bool
 }
 
 // New 装配控制平面。审计日志打不开或策略规则自检不过都会返回错误：宿主不该带着
@@ -177,6 +191,8 @@ func New(cfg Config) (*Server, error) {
 		intents:     newMemoryQueue(maxIntentFrames),
 		policyCount: len(cfg.Policies),
 		grantCount:  len(cfg.Grants),
+		// 过渡开关：默认 false，缺 triggerEventId 视为事件驱动（现有 agent 可用）。
+		requireTrigger: cfg.RequireTrigger,
 	}
 	for _, entry := range cfg.Modules {
 		s.modules.Upsert(entry)
@@ -345,6 +361,9 @@ func (s *Server) auditWritable() error {
 // policyEvaluateRequest 是 policies:evaluate 的请求体（interfaces.md §4.2）。
 type policyEvaluateRequest struct {
 	Plan json.RawMessage `json:"plan"`
+	// TriggerEventID 是本次计划的触发事件 id；宿主拿它查 origin 登记表判定来源。
+	// 请求体里若出现 origin 字段，json 解码时被忽略——来源必须由宿主判定，agent 不得自报。
+	TriggerEventID string `json:"triggerEventId,omitempty"`
 }
 
 // planView 是 plan.schema.json 里宿主做策略评估需要的子集：只取 steps 的动作与入参。
@@ -390,7 +409,23 @@ func (s *Server) servePoliciesEvaluate(w http.ResponseWriter, r *http.Request) {
 		writeTenonError(w, *perr)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.evaluatePlan(r.Context(), plan))
+	// origin 由宿主判定：登记表里有这枚事件 id 就是人发起的 request，否则是事件驱动。
+	// 缺 triggerEventId 时的缺省值是 event（过渡期保持现有 agent 可用）；
+	// RequireTrigger 为真才 deny——开关方向不能反过来，否则 P1 上线即停摆整个 agent。
+	origin := originEvent
+	if strings.TrimSpace(req.TriggerEventID) == "" {
+		if s.requireTrigger {
+			writeJSON(w, http.StatusOK, policy.PolicyEvaluation{
+				Outcome:   policy.OutcomeDeny,
+				DecidedBy: []string{},
+				Reasons:   []string{reasonMissingTrigger},
+			})
+			return
+		}
+	} else if s.origin.IsRequest(req.TriggerEventID) {
+		origin = originRequest
+	}
+	writeJSON(w, http.StatusOK, s.evaluatePlan(r.Context(), plan, origin))
 }
 
 // decodePlan 把 plan 字段解成求值子集；缺省、null 与 {} 都当作「零步计划」，
@@ -414,16 +449,23 @@ func decodePlan(raw json.RawMessage) (planView, *protocol.Error) {
 
 // evaluatePlan 逐步骤求值并按 deny > approve > auto 合并出整份计划的处置。
 //
+// origin 由调用方（servePoliciesEvaluate）从宿主侧判定后传入，逐步注入
+// policy.PolicyRequest.Origin：同一份计划的所有步骤共享同一次调用的来源。
+//
 // 求值出错（规则配置坏、step 的 action 不是 <module>.<Action>）直接 fail-closed：
 // 返回 deny + POLICY_EVALUATION_FAILED。理由码与真正的「策略拒绝」（POLICY_DENY）和
 // 「无命中」（NO_POLICY_MATCH_DEFAULT_DENY）区分开，排障时不会把配置错误看成业务判定。
-func (s *Server) evaluatePlan(ctx context.Context, plan planView) policy.PolicyEvaluation {
+func (s *Server) evaluatePlan(ctx context.Context, plan planView, origin string) policy.PolicyEvaluation {
 	if len(plan.Steps) == 0 {
 		return defaultDeny()
 	}
 	evals := make([]policy.PolicyEvaluation, 0, len(plan.Steps))
 	for _, step := range plan.Steps {
-		got, err := s.policyEngine.Evaluate(ctx, policy.PolicyRequest{Action: step.Action, Args: step.Args})
+		got, err := s.policyEngine.Evaluate(ctx, policy.PolicyRequest{
+			Action: step.Action,
+			Args:   step.Args,
+			Origin: origin,
+		})
 		if err != nil {
 			log.Printf("controlplane: 策略求值失败（planId=%q stepId=%q action=%q）：%v",
 				plan.PlanID, step.StepID, step.Action, err)

@@ -195,7 +195,7 @@ func TestPolicyConditionErrors(t *testing.T) {
 	}{
 		{name: "未知算子", when: `{"arg.qty":{"between":[1,2]}}`, want: "未知算子"},
 		{name: "非法正则", when: `{"arg.sku":{"matches":"([a-z"}}`, want: "正则"},
-		{name: "未知取值前缀", when: `{"args.qty":{"eq":1}}`, want: "前缀只能是 arg 或 risk"},
+		{name: "未知取值前缀", when: `{"args.qty":{"eq":1}}`, want: "前缀只能是 arg、risk 或 origin"},
 		{name: "路径缺前缀段", when: `{"qty":{"eq":1}}`, want: "必须形如"},
 		{name: "路径段非法", when: `{"arg.q-t":{"eq":1}}`, want: "不合法"},
 		{name: "条件叶有两个字段路径", when: `{"arg.qty":{"eq":1},"arg.sku":{"eq":"x"}}`, want: "恰好一个字段路径"},
@@ -489,5 +489,55 @@ func TestPolicyCanceledContext(t *testing.T) {
 	cancel()
 	if _, err := eng.Evaluate(ctx, evalReq(defaultAction, `{}`)); err == nil {
 		t.Fatal("ctx 已取消时应返回错误")
+	}
+}
+
+// TestConditionOriginRoot 锁定 origin 是**单段路径**的取值根：条件里直接写
+// {"origin": {"eq": "request"}}，不写成 origin.xxx。
+//
+// 空 origin 表示「来源未知」，条件一律不成立——这正是「宿主没判定来源时不得靠策略
+// 猜测来源」的表达：不成立即无命中，最终由 fail-closed 兜成 deny。
+func TestConditionOriginRoot(t *testing.T) {
+	cases := []struct {
+		name   string
+		when   string
+		origin string
+		want   string
+	}{
+		{"对话发起命中", `{"origin":{"eq":"request"}}`, "request", OutcomeApprove},
+		{"事件发起不命中", `{"origin":{"eq":"request"}}`, "event", OutcomeDeny},
+		{"缺 origin 不成立", `{"origin":{"eq":"request"}}`, "", OutcomeDeny},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := NewPolicyEngine([]PolicyRule{{
+				PolicyID: "p", Priority: 1,
+				Match:   PolicyMatch{Module: "procurement", Actions: []string{"procurement.CreatePurchaseRequest"}},
+				When:    mustCond(t, tc.when),
+				Outcome: OutcomeApprove,
+			}})
+			got, err := engine.Evaluate(context.Background(), PolicyRequest{
+				Action: "procurement.CreatePurchaseRequest",
+				Origin: tc.origin,
+			})
+			if err != nil {
+				t.Fatalf("求值失败：%v", err)
+			}
+			if got.Outcome != tc.want {
+				t.Fatalf("期望 %s，得到 %s", tc.want, got.Outcome)
+			}
+		})
+	}
+}
+
+// TestParsePathRejectsOriginWithSegments 锁定 origin 不带点：origin 本身合法（零段路径），
+// origin.sub 是配置错误。若把 origin 也做成 arg.qty 那种多段形式，规则作者会写出
+// origin.requestId 这类引擎根本不提供的路径，而它只会静默永不命中。
+func TestParsePathRejectsOriginWithSegments(t *testing.T) {
+	if _, _, err := parsePath("origin.sub"); err == nil {
+		t.Fatalf("origin 是单段路径，带点多段必须被拒")
+	}
+	if root, segs, err := parsePath("origin"); err != nil || root != pathRootOrigin || len(segs) != 0 {
+		t.Fatalf("origin 单段应被接受，得到 root=%q segs=%v err=%v", root, segs, err)
 	}
 }
