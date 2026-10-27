@@ -1455,11 +1455,13 @@ git commit -m "feat(agent): skill 确定性粗筛（request 回合无事件类�
 
 ## Task 6: prompt 分流（用户请求是「指令」，事件是「事实」）
 
+**状态：✅ 已完成（commit `5947b23`）**
+
 **Files:**
 - Modify: `internal/agent/planner.go`（`PlanInput` 加字段、`userPrompt` 增块）
 - Test: `internal/agent/planner_test.go`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```go
 func TestUserPromptSeparatesRequestFromEvent(t *testing.T) {
@@ -1484,12 +1486,12 @@ func TestUserPromptSeparatesRequestFromEvent(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `go test ./internal/agent/ -run 'TestUserPromptSeparatesRequest' -count=1`
 Expected: `unknown field Request in struct literal of type PlanInput`
 
-- [ ] **Step 3: 改 `planner.go`**
+- [x] **Step 3: 改 `planner.go`**
 
 `PlanInput` 增字段：
 
@@ -1520,12 +1522,12 @@ type UserRequest struct {
 	}
 ```
 
-- [ ] **Step 4: 跑测试至全绿**
+- [x] **Step 4: 跑测试至全绿**
 
 Run: `go test ./internal/agent/ -run 'TestUserPrompt' -count=1 -v && go test ./internal/agent/ -count=1`
 Expected: 新增用例 PASS，且既有 planner 用例全绿
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add internal/agent/planner.go internal/agent/planner_test.go
@@ -1535,6 +1537,14 @@ git commit -m "feat(agent): prompt 分流（用户请求指令块与事件事实
 ---
 
 ## Task 7: `round()` 闸门重构 + `approve` 走挂起
+
+**Task 6 复核后追加的接线要求（比正文更权威）**
+
+1. **`run.go:178` 的 `PlanInput` 构造必须补 `Request: r.request`**：`runner` 需要一个 `request *UserRequest` 字段，`Run()` 从 `in.Request` 赋值。漏了这一处，Task 6 的 prompt 分流永远不生效（`PlanInput.Request` 恒 nil）。
+2. **事件回合的 `Request` 必须保持 nil**：塞一个非 nil（哪怕 `Text` 为空）的 `UserRequest`，所有事件回合 prompt 都会多出一个空指令块，`TestUserPromptOmitsRequestBlockWhenNil` 立刻红。
+3. **`suspend` 不填 `CreatedAt`/`ExpiresAt`**：`buildPending` 必须自己填 `ExpiresAt = now.Add(pendingTTL)`；`pendingTTL` 已在 `suspend.go` 声明，**不要重复声明**。漏填会让 `Expired()` 对空串 fail-closed 返回 true，下一轮自检立刻把这份 pending 归档成 `expired`。
+4. **`suspend` 失败会把 pending 归档成 `stale` 再返回 error**：调用方映射成 `needs_human`（不是 `failed`），且**不要用同一份 pending 重试**——重复调用会复用同一个 `auditId`，审计链出现重复记录。
+5. **别把整帧 `json.Unmarshal` 进 `UserRequest`**：它没有 json tag，Go 字段匹配大小写不敏感，"碰巧能 work" 靠的是意外行为。帧→`UserRequest` 的显式映射（`text→Text`、`by→By`）属于 Task 10 的 `handleInbound`；本任务只消费构造好的 `*UserRequest`。
 
 **Files:**
 - Modify: `internal/agent/run.go`（`RunInput`/`RunResult`、`round()`、`Run()`）
