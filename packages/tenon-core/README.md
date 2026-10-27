@@ -24,7 +24,18 @@ Tenon 协议的类型定义、schema 校验，以及实体寻址 / 幂等键 / �
 
 ## 阶段状态
 
-M0（当前）：只有类型骨架 `src/types.ts`，未实现。M0 计划实现 schema 校验（zod 或 ajv 选型后落地）、`EntityRef` 解析/格式化、幂等键构造、`sha256:` 哈希、HMAC-SHA256 签名与验签（含 ±300s 时钟容差）。
+M0（进行中）：
+
+- ✅ `src/types.ts`：9 类契约的 TS 类型骨架。
+- ✅ `src/entity-ref.ts`：`EntityRef` 解析/格式化 + `toEntityRef`（对象/字符串两种写法统一入口）。判据逐条镜像 Go 的 `protocol.ParseEntityRef`。
+- ✅ `src/idempotency.ts`：`tenon:<planId>/<stepId>`。
+- ✅ `src/hash.ts`：`sha256:` 规范摘要（审计 `inputHash` / `outputHash` / `prevHash`、模块 `argsHash` 共用）。
+- ✅ `src/hmac.ts`：`X-Tenon-Signature` 签名与验签，±300s 容差，`format` / `expired` / `invalid` 三类失败原因。
+- ⬜ schema 校验运行时（zod / ajv 选型未定）——这是 M0 唯一未落地的部分，选型要单独决定。
+
+**交叉校验**：`src/protocol.test.ts` 里的 HMAC 十六进制向量、幂等键、实体寻址字符串都是**用 Go 参考实现生成的**（`protocol.Sign` / `IdempotencyKey` / `EntityRef.String`），不是手算的——两个实现必须字节一致，否则协议分叉。
+
+**测试**：`pnpm --filter @tenon/core test`（先 `tsc` 再 `node --test`）；根目录 `pnpm check` 已把它纳入，CI 会跑。
 
 M1 计划实现 Grant / Policy / Approval / 审计查询报文的 schema 校验，以及 `PlanState` / `ApprovalState` / `StepState` 的合法迁移校验（§5.1）。
 

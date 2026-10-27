@@ -12,9 +12,11 @@
   "scripts": {
     "validate": "node scripts/validate-spec.mjs",
     "typecheck": "tsc -p packages/tenon-core/tsconfig.json --noEmit",
-    "check": "pnpm run validate && pnpm run typecheck"
+    "test": "pnpm --filter @tenon/core run test",
+    "check": "pnpm run validate && pnpm run typecheck && pnpm run test"
   },
   "devDependencies": {
+    "@types/node": "^22.20.5",
     "typescript": "^7.0.2"
   }
 }
