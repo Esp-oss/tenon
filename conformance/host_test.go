@@ -45,6 +45,8 @@ func newRealHost(t *testing.T) *httptest.Server {
 		}},
 		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
 		Modules:   []registry.ModuleEntry{{ID: "inventory", BaseURL: "http://127.0.0.1:8081"}},
+		// 装配期要求会话密钥；一致性套件不测登录，给个固定值即可。
+		SessionSecret: []byte("conformance-secret"),
 	})
 	if err != nil {
 		t.Fatalf("装配真实宿主失败：%v", err)

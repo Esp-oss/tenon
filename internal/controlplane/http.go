@@ -69,6 +69,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"tenon.dev/internal/controlplane/audit"
 	"tenon.dev/internal/controlplane/grant"
@@ -100,11 +101,14 @@ const (
 	frameTypeIntent  = "tenon.intent"
 	frameTypeContext = "tenon.context"
 	frameTypeConfirm = "tenon.confirm"
+	// sessionTTL 是 dev token 有效期。
+	sessionTTL = 8 * time.Hour
 )
 
 // Config 是宿主控制平面的一次装配输入。
 //
-// 零值可用：Policies/Grants 为空表示「全部拒绝」，这是 fail-closed 的空配置，不是错误。
+// Policies/Grants 为空表示「全部拒绝」，这是 fail-closed 的空配置，不是错误；
+// 但 SessionSecret 必填：它没有安全的缺省值，猜一个等于给自己发通行证。
 type Config struct {
 	// Policies 是策略规则；同 outcome 时按 priority 与顺序裁决（见 policy 包）。
 	Policies []policy.PolicyRule
@@ -118,19 +122,25 @@ type Config struct {
 	Modules []registry.ModuleEntry
 	// TestMode 为 true 时挂载 POST /tenon/admin/modules。
 	TestMode bool
+	// Users 是 dev 账号表；为空表示登录端点永远失败（fail-closed）。
+	Users []User
+	// SessionSecret 用于签发/校验 token；为空会在 New 里报错。
+	SessionSecret []byte
 }
 
 // Server 是组装好的控制平面。构造后并发安全；Handler() 与服务共享同一份状态。
 type Server struct {
-	policyEngine *policy.PolicyEngine
-	grantEngine  *grant.GrantEngine
-	auditStore   *audit.Store
-	auditPath    string
-	modules      *registry.Registry
-	testMode     bool
-	intents      Queue
-	policyCount  int
-	grantCount   int
+	policyEngine  *policy.PolicyEngine
+	grantEngine   *grant.GrantEngine
+	auditStore    *audit.Store
+	auditPath     string
+	modules       *registry.Registry
+	testMode      bool
+	intents       Queue
+	users         []User
+	sessionSecret []byte
+	policyCount   int
+	grantCount    int
 }
 
 // New 装配控制平面。审计日志打不开或策略规则自检不过都会返回错误：宿主不该带着
@@ -159,6 +169,14 @@ func New(cfg Config) (*Server, error) {
 	for _, entry := range cfg.Modules {
 		s.modules.Upsert(entry)
 	}
+	// 会话密钥没有安全缺省值：空密钥签出的 token 任何人都能伪造，宁可拒绝启动。
+	// 关掉审计句柄再返回，否则调用方拿不到 Server，文件却已经被这个失败的构造打开。
+	if len(cfg.SessionSecret) == 0 {
+		_ = store.Close()
+		return nil, errors.New("controlplane: 会话密钥不能为空（TENON_SESSION_SECRET 或 dev 缺省值）")
+	}
+	s.users = cfg.Users
+	s.sessionSecret = cfg.SessionSecret
 	if _, err := s.policyEngine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("controlplane: 策略规则自检未通过：%w", err)
@@ -196,6 +214,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.servePoliciesEvaluate(w, r)
 	case "/tenon/grants:evaluate":
 		s.serveGrantsEvaluate(w, r)
+	case "/tenon/session":
+		s.serveSession(w, r)
 	case "/tenon/audit":
 		s.serveAudit(w, r)
 	case "/tenon/modules":

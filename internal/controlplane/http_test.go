@@ -38,15 +38,21 @@ func newTestHost(t *testing.T) *Server {
 }
 
 // newTestServer 装配一个 Server 并登记清理。
+//
+// 缺省补齐测试必需的字段：会话密钥。少了它 New 会报错，
+// 而既有用例大多不关心这个字段。
 func newTestServer(t *testing.T, cfg Config) *Server {
 	t.Helper()
+	if len(cfg.SessionSecret) == 0 {
+		cfg.SessionSecret = []byte("test-secret")
+	}
 	srv, err := New(cfg)
 	if err != nil {
 		t.Fatalf("装配控制平面失败：%v", err)
 	}
 	t.Cleanup(func() {
 		if err := srv.Close(); err != nil {
-			t.Errorf("关闭审计存储失败：%v", err)
+			t.Errorf("关闭控制平面失败：%v", err)
 		}
 	})
 	return srv
@@ -880,6 +886,8 @@ func TestHealthAndReady(t *testing.T) {
 func TestNewRejectsBrokenPolicyConfig(t *testing.T) {
 	_, err := New(Config{
 		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
+		// 密钥校验在自检之前，这里必须给一个，否则测不到自检那条路径。
+		SessionSecret: []byte("test-secret"),
 		Policies: []policy.PolicyRule{{
 			PolicyID: "p-bad",
 			Match:    policy.PolicyMatch{Module: "inventory"},
