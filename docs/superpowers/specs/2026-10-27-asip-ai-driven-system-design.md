@@ -20,7 +20,7 @@
 
 **最大风险不是技术，而是产品性退化**：整套系统可能被接入方用 `on 事件 → 调 action` 的胶水代码写成规则引擎，从而丧失"AI 驱动"的全部价值。本设计把这一点作为**规范级反模式判据**，并用 CI 机械检查守住。
 
-**规模估算**：M0–M2（可用纵切面 + 治理 + 跨语言兼容）约 **5.5–6.5 人周**。
+**规模估算**：M0–M2（可用纵切面 + 治理 + 跨语言兼容）约 **5.5 人周**（M0 2 + M1 1.5 + M2 2），含 20% 缓冲约 6.5 人周。
 
 ---
 
@@ -140,7 +140,7 @@ flowchart TB
   "module": { "id": "inventory", "version": "1.4.0", "title": "库存" },
   "actions": [
     { "id": "inventory.DeductStock", "version": "1.0.0", "title": "扣减库存",
-      "risk": "medium", "reversible": true, "dryRun": true }
+      "risk": { "level": "medium", "reversible": true }, "dryRun": true }
   ],
   "events": [ { "type": "stock.deducted", "version": "1.0.0" } ],
   "transports": ["http", "mcp"],
@@ -173,7 +173,7 @@ flowchart TB
 ```
 
 字段硬约束：
-- `idempotency.idempotency.keyFields` **必填**（写 action）；重复提交必须返回首次结果，**绝不重复副作用**
+- `idempotency.keyFields` **必填**（写 action）；重复提交必须返回首次结果，**绝不重复副作用**
 - `risk.reversible=false` 的 action **不允许出现在多步 Plan 的非末位**（无法回滚）
 - `preconditions` 是**模块自校验**的说明性字段，不是给 agent 执行的；agent 不得据此短路
 - `compensation` 缺失且 `reversible=false` → 强制审批
@@ -264,6 +264,12 @@ flowchart TB
 ```
 append-only + `prevHash` 哈希链；大对象只存 hash，原文入对象存储。
 
+**两段写（WAL 语义）**：同一次调用产生两条审计记录，`stage` 字段区分——
+1. `dispatched`：**执行前**写入（含 decision、inputHash、幂等键）。写失败则**拒绝执行**。
+2. `result`：执行后补写（含 status、outputHash、实际 diff）。
+
+因此审计不是"事后补记"，而是**执行的前置条件**；崩溃恢复时凭 `dispatched` 记录能识别"已发出但结果未知"的调用，配合幂等键向模块查询真实结果。
+
 ### 4.9 错误分类与信封
 
 ```json
@@ -339,6 +345,7 @@ sequenceDiagram
     A->>P: T7 闸门① policy.evaluate(plan)
     P-->>A: auto / approve / deny
     A->>P: T8 闸门② grant 校验
+    A->>P: T9 先落 dispatched 审计 + 校验（失败即拒）
     A->>I: T9 DeductStock(Idempotency-Key)
     Note over I: T10 模块自校验前置条件<br/>→ 落地 → 自写审计 → stock.deducted
     A->>P: T11 写不可变审计
@@ -419,7 +426,7 @@ flowchart LR
 | 2 | saga 补偿 | `reversible=false` 不许出现在多步 Plan 非末位 |
 | 3 | 超时 + 熔断 | 每 action 声明 timeout；连错 N 次 → 熔断，能力清单标 unavailable |
 | 4 | 对账 | 日切比对「声称 diff」vs「模块终态」；差异即**冻结该 agent 写权限**再告警 |
-| 5 | 审计不可变 | append-only + `prevHash` 哈希链；大对象只存 hash |
+| 5 | 审计不可变 | append-only + `prevHash` 哈希链；大对象只存 hash；**两段写**：执行前 `dispatched`、执行后 `result` |
 | 6 | 双层授权 | 控制平面 + 模块侧各拒一次；webhook HMAC + 时间戳 |
 | 7 | 版本演进 | 只增不删、未知字段忽略、一致性测试进 CI 门禁 |
 | 8 | 降级 | 见下表，**全部 fail-closed** |
@@ -434,7 +441,7 @@ flowchart LR
 | 无 LLM | 事件积压可重放，不丢 |
 | 模块超时/熔断 | 从能力清单摘掉 |
 | 事件重复投递 | 幂等键吸收 |
-| 审计写失败 | **先写审计再执行**（WAL 风格） |
+| 审计写失败 | **拒绝执行**（WAL：先落 `dispatched` 再动） |
 
 ---
 
@@ -474,9 +481,9 @@ asip conformance run --target http://localhost:8080 --report out.json
 | C5 | 策略失效必须拒 | 策略服务不可达时写操作被拒（fail-closed） |
 | C6 | 事件重放 | `since=cursor` 能补齐丢失事件，消费侧不重复生效 |
 | C7 | 补偿 | 多步 Plan 中途失败 → 已执行步骤被补偿，审计标 `partially_failed` |
-| C8 | 可选能力容忍 | 模块未实现 dry-run 时用例仍 pass（但必须在 manifest 标注） |
+| C8 | 可选能力容忍 | 模块未实现 dry-run 时用例仍 pass，但运行时必须强制审批（见 §7 降级矩阵） |
 | C9 | 错误分类 | 四类错误码与 `retryable` 标志正确 |
-| C10 | 反模式扫描 | 目标仓库中不存在"事件类型 → action"映射代码（demo/接入方检查） |
+| C10 | 反模式扫描 | 事件订阅回调内**不得出现具体 action 字面量**。AST 检查：订阅处理函数的函数体内出现 `actions.<id>` 或 `invoke("<module>.<action>")` 这一类字面量 → 失败（`@asip/lint`，可对任意接入方仓库运行） |
 
 通过者获 badge：`asip-conformant-0.1`。
 
@@ -515,6 +522,10 @@ dsh_for_sys/
 | **M1 治理** | grant 矩阵 + policy 分级 + 审批 UI + 审计查询/回放 + 对账 job | 高风险路径必须人工；对账能发现人为篡改 | 1.5 人周 |
 | **M2 兼容** | HTTP sidecar SDK + MCP 双向 + Python 示例 + 一致性 badge | 非 TS 模块接入跑通全套用例 | 2 人周 |
 | **M3 知识** | skill 仓库 + 轨迹蒸馏半自动 + A2A/语音适配草案 | 新业务流程只改 skill 即可上线 | 1.5 人周 |
+
+**范围切分（给实施计划用）**：本设计覆盖 M0–M3 四个阶段，是**四个可独立交付的子系统**，不应塞进一个实施计划。
+下一份计划只针对 **M0 骨架**：`spec/0.1` schema + conformance C1–C5 + `demo/mini-erp` 三模块 + `dsh-plugin-module-host` + 「报价→扣库存」端到端。
+M1/M2/M3 各自另起计划，前置条件是上一阶段的出口判据达成。
 
 ---
 

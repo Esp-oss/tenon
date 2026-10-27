@@ -1,0 +1,11 @@
+# 统一换行与文本处理（协议仓库要求 diff 稳定、文档可跨平台）
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
