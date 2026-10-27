@@ -385,6 +385,8 @@ flowchart TB
 
 **对 pending 的影响**：`approve` 不分来源——事件驱动的大额单同样进 pending，走同一条人工批准路径；否则大额事件单就没人批了。
 
+**分阶段启用（实施期记录）**：`triggerEventId` 必填的强制行为由 `TENON_REQUIRE_TRIGGER` 控制。P1 默认关闭（缺失视为 `event`，保持既有 agent 可用）；P2 让 agent 全部带上该字段；P4 收口时把默认改为强制（缺失即 deny）并删除开关。在此之前，spec 记的「必填」是实现目标态，不是当期运行时行为。
+
 ---
 
 ## 4. 数据流：一次完整往返

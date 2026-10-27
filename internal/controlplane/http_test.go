@@ -69,8 +69,11 @@ func serveHost(t *testing.T, srv *Server) *httptest.Server {
 	return ts
 }
 
-// testPolicies 与 config/policies.dev.json 同构：DeductStock 且 qty>10 → approve，
-// CreatePurchaseRequest → approve，其余无命中即 deny。
+// testPolicies 是测试用的**简化**规则集，**与 config/policies.dev.json 不再同构**：
+// dev 配置里采购单审批已收窄成「origin=request 才 approve」（plat-request-needs-human），
+// 这里仍是两条无条件规则——用到它的用例（newTestHost 的通用面、TestHealthAndReady，
+// 后者断言 readyz 报 "policies":2）测的是「决策怎么落盘/怎么回」，不是 dev 配置的阈值语义。
+// 与 dev 配置的一致性由 TestLoadDevConfigFiles 直接加载那两份真实文件来守，不靠这份夹具。
 func testPolicies() []policy.PolicyRule {
 	return []policy.PolicyRule{
 		{

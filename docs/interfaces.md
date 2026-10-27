@@ -202,7 +202,7 @@ GET /tenon/events?direction=out&since=<cursor>&limit=100
 
 ---
 
-## 4. 宿主侧接口（`host` 容器实现这 8 个）
+## 4. 宿主侧接口（`host` 容器实现这 14 个）
 
 | # | 方法 | 路径 | 语义 | 调用方 |
 |---|---|---|---|---|
@@ -211,11 +211,19 @@ GET /tenon/events?direction=out&since=<cursor>&limit=100
 | 3 | `POST` | `/tenon/audit` | **写审计**（两段写的写入口），200 表示已落盘 | agent |
 | 4 | `GET` | `/tenon/audit?planId=&since=&limit=` | 审计查询（支撑 C4） | agent / 运维 / 外部审计方 |
 | 5 | `GET` | `/tenon/modules` | 注册表读取（**管理面视图**，§4.4） | agent |
-| 6 | `POST` | `/tenon/intents` | 共驾帧入队 | 共驾前端 / agent |
+| 6 | `POST` | `/tenon/intents` | 共驾帧入队（出站：agent → 界面） | 共驾前端 / agent |
 | 7 | `GET` | `/tenon/intents/poll?after=` | 回放未确认的帧 | 无 WS 的客户端 |
 | 8 | `POST` | `/tenon/intents/ack` | 确认到某个序号，此后不再回放 | 无 WS 的客户端 |
+| 9 | `POST` | `/tenon/session` | dev 口令换 Bearer token（§4.6） | 共驾前端 / agent 服务账号 |
+| 10 | `POST` | `/tenon/requests` | **入站**帧入队（人 → agent），需 Bearer token（§4.6） | 共驾前端 |
+| 11 | `GET` | `/tenon/requests/poll?after=` | 回放入站帧（宿主签发的 `requestId`/`syntheticEventId` 随帧返回） | agent |
+| 12 | `POST` | `/tenon/requests/ack` | 确认入站游标，此后不再回放 | agent |
+| 13 | `POST` | `/tenon/pending` | 待批公告板上推（幂等 upsert，§4.7） | agent |
+| 14 | `GET` | `/tenon/pending` | 待批公告板读取（只读 read-model） | 共驾前端 |
 
 另有测试面 `POST /tenon/admin/modules`（仅 `TENON_TEST_MODE=1`，见 §7）。
+
+另有同源静态页，**不在协议面**（不参与 `Tenon-Version` 协商、不进 §5 调用矩阵、不要求 token）：`GET /`（页面本体）与 `GET /ui/…`（页面引用的资源）。未配置 `TENON_UI_DIR`、或该目录不可用 → **503** 并写明原因（「页面没配」是可诊断的部署问题，伪装成 404 会让运维去查路由，查错方向）；已配置的目录里确实没有该文件 → 404；非 `GET`/`HEAD` → 405。P1 只做路由与目录，页面内容属 P3。
 
 **WS 升级留 M1。** `spec/0.1` 把 `/tenon/intents` 写成 WS 端点，但 Go 标准库没有 WebSocket 服务端，为 M0.5 引一个第三方依赖不值得。本实现的 `GET /tenon/intents` **一律 405**，功能由上面三个 REST 端点等价提供（能发帧、能回放、能确认，只是没有实时推送）。M1 加 WS 时与 REST 并存，**帧格式不变**。
 
@@ -247,12 +255,16 @@ POST /tenon/grants:evaluate
 
 ```
 POST /tenon/policies:evaluate
-{ "plan": { "planId": "pln_...", "steps": [ ... ] } }
+{ "plan": { "planId": "pln_...", "steps": [ ... ] },
+  "triggerEventId": "evt_01J..." }
 
 → 200 { "outcome": "deny",  "decidedBy": [],                   "reasons": ["NO_POLICY_MATCH_DEFAULT_DENY"] }
 → 200 { "outcome": "approve", "decidedBy": ["pol-stock-deduct"], "approvers": ["role:warehouse_manager"] }
+→ 200 { "outcome": "deny",  "decidedBy": [],                   "reasons": ["MISSING_TRIGGER"] }
 ```
 
+- **`triggerEventId`（可选）**：本次计划的触发事件 id，宿主拿它查 `origin` 登记表判定来源（§4.6）——命中登记表 → `origin="request"`（对话发起），缺失或未命中 → `origin="event"`（事件驱动）。请求体里若出现 `origin` 字段**一律忽略**：来源只能由宿主判定，agent 不得自报（spec §3.11）。
+- **`triggerEventId` 缺失且 `TENON_REQUIRE_TRIGGER=1`** → `200` + `outcome=deny` + `reasons:["MISSING_TRIGGER"]`，**不是 4xx**。理由：这是业务判定（缺来源凭证 ⇒ 拒），必须与「请求体格式不对」的 4xx 可区分；调用方按 deny 处理、不重试。该开关缺省关闭（P1 过渡态，见 spec §3.11「分阶段启用」）。
 - `outcome` 三值：`auto` / `approve` / `deny`。
 - **求值粒度是整份 plan**：宿主逐 step 求值后按 **deny > approve > auto** 合并；与最终处置同级的 step 的 `decidedBy`/`approvers`/`reasons` 取并集去重。
 - **无命中 = deny**（fail-closed）；**空 plan 或零步 plan 同样 deny** + `NO_POLICY_MATCH_DEFAULT_DENY`——零步计划没有可执行语义，放它过闸门等于给「什么都不做」发通行证。
@@ -334,6 +346,63 @@ REST 三端点的报文：
 - 队列是**有界内存队列（1024 帧）**，溢出丢最旧的并在 `dropped` 里累计；没有确认的帧会一直被回放。
 - 前端不接入时，`intent` 帧直接丢弃，业务结果不变（设计文档 §3.2 决定 1）。
 
+### 4.6 入站面：人 → agent（身份 / 队列 / 来源凭证）
+
+入站与出站是**两条独立队列**（`/tenon/requests` vs `/tenon/intents`）：出站的 `ack` 是累积游标，两个消费者共用一条队列会互相吞帧。
+
+| 端点 | 请求 | 响应 |
+|---|---|---|
+| `POST /tenon/requests` | `{ "type": "tenon.request", "text": "扣 12 件" }`（也收 `tenon.confirm`） | `{ "ok": true, "seq": 1, "durable": true }` |
+| `GET /tenon/requests/poll?after=<seq>` | — | `{ "frames": [ { "seq": 1, "frame": { ... } } ], "nextCursor": 1, "dropped": 0 }` |
+| `POST /tenon/requests/ack` | `{ "upto": 1 }`（省略 = 确认全部） | `{ "ok": true, "acked": 1 }` |
+
+**身份：入站三个端点全部要求 `Authorization: Bearer <token>`**（`poll` 与 `ack` 也是）。token 由 `POST /tenon/session` 用 dev 账号口令换取：
+
+```
+POST /tenon/session
+{ "user": "alice", "password": "alice-dev" }
+
+→ 200 { "token": "<payload>.<sig>", "user": "user:alice",
+        "roles": ["role:warehouse_clerk"], "exp": 1761609600 }
+→ 401 { "tenonError": { "class": "policy_denied", "code": "AUTH_INVALID", "message": "账号或口令不正确" } }
+```
+
+- 401 不区分「用户不存在」与「口令错」：dev 环境也不送可枚举的信息。缺少 `Authorization` 头同样是 401，`code` 为 `AUTH_REQUIRED`。
+- token 是无状态 HMAC-SHA256（`base64url(payload).base64url(sig)`），有效期 8 小时；`sub` 形如 `user:<name>`。
+- dev 账号表见 `config/users.dev.json`：`alice`（`role:warehouse_clerk`）/ `bob`（`role:warehouse_manager` + `role:procurement_manager`）/ `agent`（`role:agent`）。**agent 作为入站消费方用 `agent` 服务账号登录**（P2 的 `TENON_AGENT_USER`/`TENON_AGENT_PASSWORD`）。
+- 这是 **dev 认证，不是生产认证**：没有用户库、没有轮转、没有吊销，生产真认证在 M1 的反向代理与治理平面（§8）。
+
+**鉴权先于其它一切校验**：`POST` 端点在 `Content-Type` 预检之前验 token，`poll` 在解析 `after` 之前验 token。未认证的调用只拿到 `401`，拿不到「你的 Content-Type 不对」或「游标不合法」这类端点细节；401 之后请求不再被处理（不入队、不推进游标、不回放任何帧）。
+
+- 为什么 `poll` 也要 token：入站队列里装的是**用户说过的话**，未鉴权的读等于把别人的话摊开。
+- 为什么 `ack` 也要 token：未鉴权的 ack 能把还没被处理的请求直接吞掉（游标一推进，`poll` 再也回放不出来）——这是拒绝服务，不只是越权。
+
+**`durable` 的含义**：`POST /tenon/requests` 回 `{ok, seq, durable}`。`durable:false` 表示这帧**只进了内存、没落盘**（重启会丢），同时宿主日志打一条告警。**这种情况下仍回 200，不回 500**：500 会诱导客户端重试，而 `requestId`/`syntheticEventId` 由宿主签发，重试等于重发用户那句话、造出第二条请求——比「热情地告知没落盘」更坏。消费方可以对 `durable:false` 打点告警，但**不要重试**。
+
+**来源凭证（与 §4.2 的 `origin` 对接）**：收到 `tenon.request` 时宿主**签发** `requestId` 与合成 `syntheticEventId`（`evt_` 前缀）、用 token 的 `sub` 覆写 `by`、盖上 `at`，并把 `syntheticEventId → {requestId, by, at}` 登记进 `requests-index.jsonl`（**独立落盘，不依赖队列实现**）。agent **必须沿用**帧里这两个 id，不得自行生成——自行生成等于让 agent 决定自己要不要被审。客户端自报的 `by`/`requestId` 一律被覆盖。
+
+- 帧类型只收 `tenon.request` 与 `tenon.confirm`（`tenon.context` 不入站）：其它 `type` → 400 `UNKNOWN_FRAME_TYPE`；登记 origin 失败 → 400 `ORIGIN_REGISTER_FAILED`（凭证没留下就不入队）。
+- 队列是**落盘 JSONL**（`requests.jsonl` + `.meta` 序号水位）：重启续号、崩溃留下的半行被跳过、ack 后重写存活部分。容量 1024 帧，溢出丢最旧并**留日志**（入站丢的是「用户说过的话」，与出站丢界面提示不是一个量级）。
+- **重置入站队列要同时删三个文件**：`requests.jsonl`、`requests.jsonl.meta`、`requests-index.jsonl`。前两者是序号水位（只删主文件会让序号从 meta 续上、不回 1）；第三个是**治理状态而非缓存**——判定规则是「未登记即视为 `event`」，单删索引会把在途 request 静默降级成事件驱动，绕开「对话发起必须审批」。所以清索引必须与清空 pending 一起做。
+
+### 4.7 待批公告板（`/tenon/pending`）
+
+```
+POST /tenon/pending                # agent 每 tick 重推，同 planId 覆盖（幂等 upsert）
+{ "planId": "pln_01JB...", "requestId": "req_...",
+  "summary": "扣减 STD-1001 × 12 待批", "items": [ ... ],
+  "requiredRoles": ["role:warehouse_manager"], "expiresAt": "2026-10-27T10:00:00Z" }
+
+→ 200 { "ok": true }
+
+GET /tenon/pending
+→ 200 { "items": [ { ...同上, "by": "user:alice", "mine": true } ] }
+```
+
+- 两个方法**都要求 Bearer token**；`POST` 的 `by` 一律用 token 的 `sub` 覆写（条目里自报的身份只是展示文案，不构成来源凭证）。`planId` 缺失 → 400 `SCHEMA_MISMATCH`。
+- `GET` 返回**全部未过期条目**（不按角色裁剪）：过期条目在读取时剔除，按 `expiresAt` 升序返回。`mine` 只表示「当前 token 的角色与 `requiredRoles` 有交集」，供页面高亮；`requiredRoles` 为空即无人匹配。**`mine` 不是授权判定**——真正的审批权限校验在 agent 恢复时做（权威侧）。
+- 公告板是**只读 read-model，刻意不落盘**：权威状态在 agent 盘上的 pending 文件，公告板可丢、可重建（agent 每 tick 重推即自愈）。host 不判断、不执行、不授权；持久化会造出第二份「权威状态」，与 agent 盘上的文件互相漂移。
+
 ---
 
 ## 5. 调用矩阵
@@ -344,6 +413,7 @@ REST 三端点的报文：
 | agent | 宿主 | `POST /tenon/policies:evaluate`、`POST /tenon/grants:evaluate` | 内网直连 |
 | agent | 宿主 | `POST /tenon/audit`（两段）、`GET /tenon/audit` | 内网直连 |
 | agent | 宿主 | `POST /tenon/intents`（+ `poll`/`ack`） | 会话凭据（M1 定） |
+| 共驾前端 / agent | 宿主 | `POST /tenon/session` → `POST /tenon/requests`、`GET /tenon/requests/poll`、`POST /tenon/requests/ack`、`POST`/`GET /tenon/pending` | **Bearer token**（§4.6、§4.7） |
 | agent | 模块 | `GET /.well-known/tenon`、`GET /tenon/actions/{id}` | 内网直连 |
 | agent | 模块 | `POST /tenon/actions/{id}`（+ `:dry-run`） | `Idempotency-Key` + `X-Tenon-Grant` |
 | agent | 模块 | `GET /tenon/events?direction=out` | 内网直连 |
@@ -370,6 +440,13 @@ REST 三端点的报文：
 | `TENON_AUDIT_PATH` | 宿主 | 审计 JSONL 路径（缺省 `./audit-host.jsonl`），需持久化卷 |
 | `TENON_MODULES` | 宿主 | 启动时登记的模块，`id=url,id=url` |
 | `TENON_TEST_MODE` | 宿主 | 只认 `"1"`：挂载 `POST /tenon/admin/modules`；其它写法（`true`/`yes`）一律不算 |
+| `TENON_USERS_FILE` | 宿主 | dev 账号表 `[{user,password,roles}]`；**未设置 = 登录端点永远 401**（不是「跳过鉴权」） |
+| `TENON_SESSION_SECRET` | 宿主 | token 的 HMAC 密钥；未设置时用 dev 缺省值并打告警。空密钥签出的 token 谁都能伪造，所以装配期拒绝空值（**装配失败，不是「禁用登录」**） |
+| `TENON_INBOUND_DIR` | 宿主 | 入站队列与 origin 登记表目录（缺省 `out/inbound`）；重置要三文件一起删（§4.6） |
+| `TENON_SKILLS_DIR` | 宿主 | 业务级规则根目录（缺省 `skills`，**相对 cwd**，须在仓库根启动）；`skills/*/approval.json` 与平台级规则同 schema、同池合并、取更严 |
+| `TENON_STRICT_RULES` | 宿主 | 只认 `"1"`：任一份 `approval.json` 未生效即**启动失败**；缺省是「告警 + 该份不生效」 |
+| `TENON_UI_DIR` | 宿主 | 同源静态页目录；空或不可用 → `GET /` 回 503（§4） |
+| `TENON_REQUIRE_TRIGGER` | 宿主 | 只认 `"1"`：`policies:evaluate` 缺 `triggerEventId` 即 deny（§4.2）。缺省关闭（P1 过渡态） |
 | `TENON_HOST_URL` | agent | 宿主基地址（缺省 `http://127.0.0.1:8080`） |
 | `TENON_AGENT_ID` | agent | 审计 `actor.id`（缺省 `ag_tenon`，须符合 `Actor.id` 词法）。**必须与 `TENON_GRANT_FILE` 里的 `grant.agent` 对齐**：dev 授权表写的是 `ag_fulfillment`，用缺省 id 时 G3 会 fail-closed 全拒 |
 | `TENON_ON_BEHALF_OF` | agent | **必填**，形如 `user:alice`；缺了 agent **启动即失败**（已在 10:59 实测：exit 1 + 明确报错） |
