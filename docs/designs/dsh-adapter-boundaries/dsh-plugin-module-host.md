@@ -1,3 +1,5 @@
+> **状态：未实现（占位包的职责边界；M2 之后按 [ADR-0001](../../adr/0001-driver-dsh-vs-go.md) §6 重建）。**
+> 本文件原在 `packages/<pkg>/README.md`。ADR-0001 删除无 `src` 的占位包，但保留职责边界——实现时按本文件重建，不要照抄目录结构。
 # @tenon/dsh-plugin-module-host
 
 cordis 插件（参考实现#1）：把 `defineModule({ id, actions, events })` 挂进 dsh。模块一变，agent 通过能力发现就看见它，不需要为业务流程写事件处理器。
