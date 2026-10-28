@@ -9,6 +9,9 @@
 //	PORT                     监听端口或地址；未设置时用本模块约定的 8081
 //	TENON_MODULE_ID          manifest.module.id 与审计 module 字段的覆盖值
 //	TENON_HMAC_SECRET_FILE   事件投递验签密钥文件（读不到就拒绝投递）
+//	TENON_HOST               宿主基地址（如 http://127.0.0.1:8080）；设置后向宿主注册并心跳，
+//	                         未设置则不注册（本地单模块调试），启动时会打一行警告
+//	TENON_HEARTBEAT_INTERVAL 心跳间隔覆盖值（time.ParseDuration 形式，仅测试/演示用；缺省 5s）
 //	TENON_MODULE_AUDIT_PATH  模块侧审计 JSONL，缺省 ./audit-inventory.jsonl
 //	TENON_INVENTORY_SEED     初始库存，格式 SKU:qty,SKU:qty，缺省 STD-1001:120,STD-1002:3
 //
@@ -80,6 +83,12 @@ func main() {
 	addr := mod.Addr()
 	if _, ok := os.LookupEnv(module.EnvPort); !ok {
 		addr = ":" + defaultPort
+	}
+	// 注册推送先起（Start 立即返回），端口随后在 ListenAndServeAt 里绑定：宿主在
+	// 「已注册但还没 bind」的极短窗口里拨过来会失败，但那个窗口只有本函数里几行代码。
+	// 注册失败一律不阻塞业务（设计 spec §8.4）：这里只记一行日志，模块照常提供端点。
+	if _, err := mod.StartRegistry(context.Background(), module.BaseURLForAddr(addr)); err != nil {
+		log.Printf("inventory: 注册客户端未启动，宿主将看不到本模块：%v", err)
 	}
 	if err := mod.ListenAndServeAt(addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("inventory: %v", err)

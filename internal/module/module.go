@@ -843,7 +843,30 @@ func (h *handler) serveManifest(w http.ResponseWriter, r *http.Request) {
 		writeTenonError(w, *perr)
 		return
 	}
-	m := h.m
+	writeJSON(w, http.StatusOK, h.m.manifestOf())
+}
+
+// ManifestJSON 返回 GET /.well-known/tenon 的响应体字节（module-manifest.schema.json）。
+//
+// 导出是给模块侧的注册客户端用的：注册报文里的 module.manifest 必须与这个端点同形
+// 同内容，否则 host 侧的声明哈希校验会拿两份不同的东西去比（一份来自端点、一份来自
+// 注册报文）。所以这里刻意不提供「另写一个摘要生成器」的选项——摘要只有这一份实现，
+// 能力发现与注册申报才不可能分叉。
+//
+// 返回错误只会来自定义自检（与 Handler() 同一条判据）或编组失败，两者都是接入方 bug。
+func (m *Module) ManifestJSON() ([]byte, error) {
+	if err := m.prepare(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(m.manifestOf())
+}
+
+// manifestOf 组装摘要级能力清单。serveManifest 与 ManifestJSON 共用它：两条路径
+// 输出的字节必须一致，否则同一个 manifest 会算出两个声明哈希。
+//
+// 调用方必须已通过 prepare()（Handler 与 ManifestJSON 都保证了这一点）：Actions 的
+// TimeoutMs 兜底与词法校验都在那里完成。
+func (m *Module) manifestOf() manifest {
 	out := manifest{
 		Tenon:        protocol.Version,
 		Module:       moduleInfo{ID: m.id(), Version: m.Version, Title: m.Title},
@@ -863,7 +886,7 @@ func (h *handler) serveManifest(w http.ResponseWriter, r *http.Request) {
 	for _, ev := range m.Events {
 		out.Events = append(out.Events, eventSummary{Type: ev, Version: DefaultEventVersion})
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out
 }
 
 // capabilitiesOf 声明可选能力标签。dry-run 只有在「有回调且确有动作支持」时
