@@ -7,6 +7,10 @@
 #
 # 与 d1-e2e.ps1 的区别：那个跑完就杀（判定用），这个留着让人点。
 # 与 verify-ui.ps1 的区别：那个自己断言完就杀（回归用），这个不自动断言。
+#
+# R1（模块动态注册）之后：TENON_MODULES 已删除，模块靠 TENON_HOST 自注册 + 每 5s 心跳；
+# 宿主靠 TENON_HMAC_SECRET_FILE 验签（缺则拒绝启动，D7）、靠 TENON_REGISTRY_EVENTS 落
+# 注册事件链。所以「模块起好了」的判据是 GET /tenon/modules 里看得到它，不是端口通。
 [CmdletBinding()]
 param(
 	[switch]$Real,
@@ -61,6 +65,7 @@ foreach ($svc in 'host', 'agent', 'inventory', 'procurement', 'quote') {
 if ($LASTEXITCODE -ne 0) { Fail '构建 llmstub 失败' }
 
 # 模块的 /readyz 会检查 hmac_secret 与 audit_file，缺一项永远不就绪——不是可选配置。
+# 宿主与模块必须拿到**同一份**密钥：注册/心跳的验签两边取值不同就只会得到 401。
 $hmacFile = Join-Path $work 'hmac-secret'
 if (-not (Test-Path $hmacFile)) {
 	$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -68,6 +73,13 @@ if (-not (Test-Path $hmacFile)) {
 	$rng.GetBytes($buf)
 	[System.IO.File]::WriteAllText($hmacFile, [System.BitConverter]::ToString($buf).Replace('-', '').ToLowerInvariant())
 }
+
+# R1 自注册的三处接线：模块的 TENON_HOST、宿主的事件链路径、预期可见的模块集合。
+# 事件链**保留**跨会话追加（append-only 的意义就在这里）：开发期重启宿主是最常见的动作，
+# 每次都清空就看不出「模块什么时候失联过」。
+$registryEvents = Join-Path $work 'registry-events.jsonl'
+$hostURL = "http://127.0.0.1:$HostPort"
+$expectedModules = @('inventory', 'procurement', 'quote')
 
 $started = @()
 function Start-Svc([string]$name, [hashtable]$envMap) {
@@ -99,37 +111,86 @@ function Wait-Ready([string]$name, [string]$url, [int]$timeoutSec = 40) {
 	Fail "$name 未就绪（$url）。stderr：`n$tail"
 }
 
+# Get-VisibleModules 读可见模块清单（GET /tenon/modules = enabled && alive，D5 无 static 例外）。
+# $null 表示这次没读到（宿主没起/正在重启）；空数组表示读到了，但一个模块都没注册上。
+# 返回值用 `,@(...)` 包一层：PowerShell 会把空数组压成 $null，不包的话这两种情形就分不开。
+function Get-VisibleModules([string]$baseURL) {
+	try {
+		$resp = Invoke-WebRequest -Uri "$baseURL/tenon/modules" -UseBasicParsing -TimeoutSec 3
+		if ($resp.StatusCode -ne 200) { return $null }
+		return ,@(($resp.Content | ConvertFrom-Json).modules)
+	} catch {
+		return $null
+	}
+}
+
+# Wait-ModulesVisible 轮询 GET /tenon/modules 直到预期模块全部可见。
+#
+# R1 之后这是唯一的「模块在场」判据：/readyz 200 只说明模块自己活着，宿主可能完全不知道
+# 它存在（注册没发出去/签名不对/心跳还没轮到）。没有这一步，页面会打开但待批卡造不出来，
+# 排查方向会偏到前端。
+function Wait-ModulesVisible {
+	param([string]$baseURL, [string[]]$expected, [int]$timeoutSec = 40)
+	$deadline = (Get-Date).AddSeconds($timeoutSec)
+	$last = '还没读到 GET /tenon/modules'
+	while ((Get-Date) -lt $deadline) {
+		$mods = Get-VisibleModules $baseURL
+		if ($null -ne $mods) {
+			$seen = @($mods | ForEach-Object { $_.id })
+			$missing = @($expected | Where-Object { $seen -notcontains $_ })
+			if ($missing.Count -eq 0) { return $seen }
+			$last = "当前可见 [$($seen -join ', ')]，仍缺 [$($missing -join ', ')]"
+		}
+		Start-Sleep -Milliseconds 300
+	}
+	$tails = ''
+	foreach ($name in 'host', 'inventory', 'procurement', 'quote') {
+		$f = Join-Path $logDir "$name.err"
+		if (Test-Path $f) { $tails += "[$name.err]`n$((Get-Content $f -Tail 10 -Encoding UTF8 | Out-String).Trim())`n" }
+	}
+	# dev-up 的宿主不带 TEST_MODE，所以没有管理面全量视图可打——直接给可见清单与日志。
+	Fail ("等了 $timeoutSec 秒仍未在 GET /tenon/modules 里看到全部预期模块（$($expected -join ', ')）：$last`n" +
+		"注册事件链：$registryEvents`n进程日志尾部：`n$tails")
+}
+
 try {
 	Start-Svc 'llmstub' @{ PORT = '8099' } | Out-Null
 	Wait-Ready 'llmstub' 'http://127.0.0.1:8099/healthz' 20
 
 	Start-Svc 'inventory' @{
 		PORT = '8081'; TENON_MODULE_ID = 'inventory'; TENON_TEST_MODE = '1'
+		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-inventory.jsonl"
 	} | Out-Null
 	Start-Svc 'procurement' @{
 		PORT = '8082'; TENON_MODULE_ID = 'procurement'; TENON_TEST_MODE = '1'
+		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-procurement.jsonl"
 	} | Out-Null
 	Start-Svc 'quote' @{
 		PORT = '8083'; TENON_MODULE_ID = 'quote'; TENON_TEST_MODE = '1'
+		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-quote.jsonl"
 	} | Out-Null
 	Wait-Ready 'inventory' 'http://127.0.0.1:8081/readyz'
 	Wait-Ready 'procurement' 'http://127.0.0.1:8082/readyz'
 	Wait-Ready 'quote' 'http://127.0.0.1:8083/readyz'
 
-	# 模块先起、host 后起：host 加载期要拉各模块 actions 校验业务规则；STRICT_RULES=1 把
-	# 「规则没加载」变成启动失败（而不是日志里少一行）。
+	# 模块先起、host 后起：模块的注册推送会自己重试（失败每 5s 一次），所以顺序反过来也能
+	# 收敛，但先起模块能让「模块注册 → 补校验挂起规则」发生在模块**已经监听**之后，规则
+	# 一次到位。STRICT_RULES=1 仍把「规则没加载」变硬：挂起（模块还没注册）不算失败。
 	Start-Svc 'host' @{
 		PORT = "$HostPort"; TENON_STRICT_RULES = '1'
-		TENON_MODULES = 'quote=http://127.0.0.1:8083,inventory=http://127.0.0.1:8081,procurement=http://127.0.0.1:8082'
+		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_REGISTRY_EVENTS = $registryEvents
 		TENON_USERS_FILE = 'config/users.dev.json'; TENON_SESSION_SECRET = 'dev'
 		TENON_SKILLS_DIR = 'skills'; TENON_POLICY_FILE = 'config/policies.dev.json'
 		TENON_GRANT_FILE = 'config/grants.dev.json'; TENON_INBOUND_DIR = "$work/inbound"
 		TENON_AUDIT_PATH = "$work/audit-host.jsonl"; TENON_UI_DIR = 'ui'
 	} | Out-Null
 	Wait-Ready 'host' "http://127.0.0.1:$HostPort/readyz"
+	# 端口通 ≠ 注册完：等清单齐了再起 agent，否则第一张待批卡会因为「agent 看不到模块」造不出来。
+	$visible = Wait-ModulesVisible -baseURL $hostURL -expected $expectedModules -timeoutSec 40
+	Write-Host "✓ 三模块已自注册并可见：$($visible -join ', ')" -ForegroundColor Green
 
 	$agentEnv = @{
 		TENON_HOST_URL = "http://127.0.0.1:$HostPort"; TENON_AGENT_ID = 'ag_fulfillment'
