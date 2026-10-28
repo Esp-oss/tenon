@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ids 抽出 ID 序列，便于断言顺序。
@@ -169,8 +170,14 @@ func TestListOrderStableAndSorted(t *testing.T) {
 		t.Fatalf("List 应按 ID 字典序：%v，期望 %v", got, want)
 	}
 	second := r.List()
-	if !slices.Equal(first, second) {
-		t.Fatalf("两次 List 结果不一致：%+v vs %+v", first, second)
+	// ModuleEntry 含 json.RawMessage（slice），不可比较——用「字段逐一比」而不是 ==。
+	if len(first) != len(second) {
+		t.Fatalf("两次 List 长度不一致：%d vs %d", len(first), len(second))
+	}
+	for i := range first {
+		if first[i].ID != second[i].ID || first[i].BaseURL != second[i].BaseURL || first[i].Enabled != second[i].Enabled {
+			t.Fatalf("两次 List 结果不一致：%+v vs %+v", first[i], second[i])
+		}
 	}
 	// 摘除一项后剩下的顺序仍稳定（不能依赖插入顺序）。
 	if err := r.SetEnabled("inventory", false); err != nil {
@@ -209,9 +216,24 @@ func TestEmptyRegistryJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("序列化失败：%v", err)
 	}
-	const want = `[{"id":"inventory","baseURL":"http://i:8081","enabled":true}]`
-	if string(b) != want {
-		t.Fatalf("响应形状不对：%s，期望 %s", b, want)
+	// 线上形状 = id/baseURL/enabled + 存活信息。不逐字比字符串（lastSeen 是动态值），
+	// 而是断言「契约字段都在、且空声明的哈希不出现」。
+	var got []map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("响应不是合法 JSON：%s", b)
+	}
+	if len(got) != 1 {
+		t.Fatalf("应有 1 条，得到 %d", len(got))
+	}
+	e := got[0]
+	if e["id"] != "inventory" || e["baseURL"] != "http://i:8081" || e["enabled"] != true {
+		t.Fatalf("契约字段不对：%s", b)
+	}
+	if e["state"] != "alive" {
+		t.Fatalf("注册后 state 应为 alive：%s", b)
+	}
+	if _, ok := e["declarationHash"]; ok {
+		t.Fatalf("空声明哈希不应出现在线上形状里：%s", b)
 	}
 }
 
@@ -322,7 +344,7 @@ func TestParseModules(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseModules(%q) 不该报错：%v", tc.in, err)
 			}
-			if !slices.Equal(got, tc.want) {
+			if !sameModules(got, tc.want) {
 				t.Fatalf("ParseModules(%q) = %+v，期望 %+v", tc.in, got, tc.want)
 			}
 			for _, e := range got {
@@ -424,4 +446,68 @@ func TestConcurrentUpsertAndList(t *testing.T) {
 	if got, want := len(r.List()), seedCount+writers*iterations; got != want {
 		t.Fatalf("并发结束后条目数 = %d，期望 %d", got, want)
 	}
+}
+func TestRegistryLifecycle(t *testing.T) {
+	r := NewRegistry()
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://127.0.0.1:8081", DeclarationHash: "sha256:aaa"})
+
+	if got := len(r.Enabled()); got != 1 {
+		t.Fatalf("注册后应可见，得到 %d", got)
+	}
+
+	ok, reason := r.Touch("inventory", "sha256:aaa")
+	if !ok || reason != "" {
+		t.Fatalf("心跳应成功，得到 ok=%v reason=%q", ok, reason)
+	}
+
+	ok, reason = r.Touch("inventory", "sha256:bbb")
+	if ok || reason != "declaration-changed" {
+		t.Fatalf("哈希变化应要求重申报，得到 ok=%v reason=%q", ok, reason)
+	}
+
+	ok, reason = r.Touch("ghost", "sha256:aaa")
+	if ok || reason != "unknown-module" {
+		t.Fatalf("未知模块应要求重申报，得到 ok=%v reason=%q", ok, reason)
+	}
+}
+
+func TestSweepMarksLostAfterTTL(t *testing.T) {
+	r := NewRegistry()
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	r.DebugSetLastSeen("inventory", time.Now().Add(-time.Minute))
+
+	lost := r.Sweep(time.Now())
+	if len(lost) != 1 || lost[0] != "inventory" {
+		t.Fatalf("应标记 inventory 为 lost，得到 %v", lost)
+	}
+	if got := len(r.Enabled()); got != 0 {
+		t.Fatalf("lost 模块不应可见，得到 %d", got)
+	}
+}
+
+func TestManualDisableIsSticky(t *testing.T) {
+	r := NewRegistry()
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	if err := r.SetEnabled("inventory", false); err != nil {
+		t.Fatalf("disable 失败：%v", err)
+	}
+	if ok, _ := r.Touch("inventory", "sha256:aaa"); !ok {
+		t.Fatal("心跳本身应成功")
+	}
+	if got := len(r.Enabled()); got != 0 {
+		t.Fatalf("人工 disable 必须粘性，得到可见 %d", got)
+	}
+}
+
+// sameModules 比较两份模块清单的「契约字段」；ModuleEntry 含 slice 字段，不可直接比较。
+func sameModules(a, b []ModuleEntry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID || a[i].BaseURL != b[i].BaseURL || a[i].Enabled != b[i].Enabled {
+			return false
+		}
+	}
+	return true
 }

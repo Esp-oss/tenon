@@ -17,12 +17,14 @@
 package registry
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrNotFound 表示 SetEnabled 指定的模块从未登记过。
@@ -31,12 +33,29 @@ import (
 // 与「开关写入失败」（不该发生），而不是去匹配错误文本。
 var ErrNotFound = errors.New("registry: 模块未登记")
 
+// 模块存活状态。存活由心跳刷新，人工开关与它正交——两者都满足才可见。
+const (
+	StateAlive = "alive"
+	StateLost  = "lost"
+
+	// DefaultTTL 是心跳过期时间：3 个心跳周期（5s）。
+	DefaultTTL = 15 * time.Second
+)
+
 // ModuleEntry 是注册表里的一行，也是 GET /tenon/modules 的响应元素。
 // 字段标签即线上形状：{"id": ..., "baseURL": ..., "enabled": ...}。
 type ModuleEntry struct {
 	ID      string `json:"id"`
 	BaseURL string `json:"baseURL"`
 	Enabled bool   `json:"enabled"`
+	// State 由心跳决定（alive/lost）；Enabled 由人工决定。两者都满足才参与调度。
+	State string `json:"state"`
+	// DeclarationHash 是模块申报的能力摘要哈希；心跳带它来比对，不一致就要求重申报。
+	DeclarationHash string `json:"declarationHash,omitempty"`
+	// LastSeen 是最后一次心跳时刻（host 单调时钟写入），用于 TTL 清扫。
+	LastSeen time.Time `json:"lastSeen"`
+	// Manifest 是模块申报的完整摘要，供诊断与后续按能力路由。
+	Manifest json.RawMessage `json:"manifest,omitempty"`
 }
 
 // Registry 是并发安全的内存注册表。零值可直接用（内部表惰性初始化），
@@ -73,12 +92,20 @@ func (r *Registry) Upsert(e ModuleEntry) {
 	if r.entries == nil {
 		r.entries = make(map[string]ModuleEntry)
 	}
+	now := time.Now()
 	if cur, ok := r.entries[e.ID]; ok {
 		cur.BaseURL = e.BaseURL
+		cur.DeclarationHash = e.DeclarationHash
+		cur.Manifest = e.Manifest
+		// 注册即视为刚心跳过：否则模块刚起来还要等一个 TTL 才可见。
+		cur.State = StateAlive
+		cur.LastSeen = now
 		r.entries[e.ID] = cur
 		return
 	}
 	e.Enabled = true
+	e.State = StateAlive
+	e.LastSeen = now
 	r.entries[e.ID] = e
 }
 
@@ -129,13 +156,70 @@ func (r *Registry) Enabled() []ModuleEntry {
 func (r *Registry) snapshot(onlyEnabled bool) []ModuleEntry {
 	out := make([]ModuleEntry, 0, len(r.entries))
 	for _, e := range r.entries {
-		if onlyEnabled && !e.Enabled {
+		// 可见 = 人工开着 && 心跳还活着。空 State 视为 alive，兼容未经过 Upsert 的旧条目。
+		if onlyEnabled && (!e.Enabled || (e.State != "" && e.State != StateAlive)) {
 			continue
 		}
 		out = append(out, e)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// Touch 记录一次心跳。
+//
+// 返回 (true, "") 表示存活已刷新；返回 (false, reason) 表示模块必须先重申报：
+//   - "unknown-module"：host 不认识这个 id（通常是 host 重启后注册表为空）；
+//   - "declaration-changed"：申报的声明哈希与登记的不一致（模块升级了或者发错了）。
+//
+// 注意：Touch 不改变 Enabled——人工摘除是粘性的，心跳救不回来。
+func (r *Registry) Touch(id, hash string) (bool, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cur, ok := r.entries[id]
+	if !ok {
+		return false, "unknown-module"
+	}
+	if cur.DeclarationHash != "" && hash != cur.DeclarationHash {
+		return false, "declaration-changed"
+	}
+	cur.State = StateAlive
+	cur.LastSeen = time.Now()
+	r.entries[id] = cur
+	return true, ""
+}
+
+// Sweep 把超过 TTL 没心跳的模块标记为 lost，返回被标记的 id（按字典序）。
+// 只改存活状态，不动 Enabled——人工开关的语义不受 TTL 影响。
+func (r *Registry) Sweep(now time.Time) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var lost []string
+	for id, e := range r.entries {
+		if e.State == StateLost {
+			continue
+		}
+		if e.LastSeen.IsZero() || now.Sub(e.LastSeen) > DefaultTTL {
+			e.State = StateLost
+			r.entries[id] = e
+			lost = append(lost, id)
+		}
+	}
+	sort.Strings(lost)
+	return lost
+}
+
+// DebugSetLastSeen 只给测试用：把 LastSeen 拨到指定时刻，便于断言 TTL 行为。
+// 生产代码不该调用它——时间只能由心跳写入。
+func (r *Registry) DebugSetLastSeen(id string, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cur, ok := r.entries[id]
+	if !ok {
+		return
+	}
+	cur.LastSeen = at
+	r.entries[id] = cur
 }
 
 // ParseModules 解析启动配置 TENON_MODULES 的 id=url,id=url 形式，返回一份待
