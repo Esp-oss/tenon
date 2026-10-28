@@ -82,6 +82,9 @@ const (
 	// envHMACSecretFile 是注册/心跳端点的共享密钥文件。名字的唯一定义在 controlplane
 	// （EnvHMACSecretFile），那里还要用它拼 503 的报文，两处写死迟早分叉。
 	envHMACSecretFile = controlplane.EnvHMACSecretFile
+	// envRegistryEvents 是注册事件链的落盘路径（append-only + prevHash）。
+	// 未设置则注册表纯内存：链是运维产物，不是业务正确性的前提。
+	envRegistryEvents = "TENON_REGISTRY_EVENTS"
 	// envTestMode 打开测试面（admin 端点），仅限测试环境。
 	envTestMode = "TENON_TEST_MODE"
 	// envUsersFile 是 dev 账号表（例 config/users.dev.json）；未设置时登录端点永远拒绝。
@@ -123,7 +126,18 @@ func run() error {
 	// 注册表在装配前建好：加载期的业务规则校验要按模块取 baseURL，运行期的可见性
 	// （GET /tenon/modules → Enabled）也必须看同一张表——两份真相会让「规则判定在线」
 	// 与「agent 看见在线」互相矛盾。注意它**启动时是空的**（D5：只有模块自注册）。
-	modules := registry.NewRegistry()
+	// 注册事件链：设了 TENON_REGISTRY_EVENTS 就落盘（append-only + prevHash），
+	// 否则纯内存。链是运维产物，写失败不改变注册结果——所以构造失败时降级而不是拒绝启动，
+	// 但要把原因打出来（静默降级会让人以为事件在记）。
+	modules, err := openRegistry()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := modules.Close(); cerr != nil {
+			log.Printf("host: 关闭注册事件链失败：%v", cerr)
+		}
+	}()
 	cfg, err := loadConfig(modules)
 	if err != nil {
 		return err
@@ -208,6 +222,23 @@ func sweepRegistry(ctx context.Context, reg *registry.Registry, interval time.Du
 // loadConfig 从环境变量组装控制平面配置。治理数据文件用 controlplane 的加载器读，
 // 这里只负责「用哪个文件、缺失时打什么警告」。
 //
+// openRegistry 按 TENON_REGISTRY_EVENTS 决定是否给注册表挂事件链。
+//
+// 配了路径却打不开时**返回错误让进程退出**，而不是降级成纯内存：运维会以为事件在记，
+// 实际什么都没落盘——那是比「没有事件链」更坏的状态。
+func openRegistry() (*registry.Registry, error) {
+	path := strings.TrimSpace(os.Getenv(envRegistryEvents))
+	if path == "" {
+		return registry.NewRegistry(), nil
+	}
+	reg, err := registry.NewRegistryWithLog(path)
+	if err != nil {
+		return nil, fmt.Errorf("打开注册事件链 %s 失败：%w", path, err)
+	}
+	log.Printf("host: 注册事件链 → %s", path)
+	return reg, nil
+}
+
 // modules 是运行期注册表的**同一个实例**：加载期校验业务规则要按模块取 baseURL，
 // 运行期可见性看 Enabled()，两处必须是同一张表。它启动时为空——模块自注册是唯一
 // 入口（D5），没有 TENON_MODULES 之类的静态登记路径。

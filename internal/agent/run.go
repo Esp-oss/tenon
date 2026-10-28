@@ -504,7 +504,7 @@ func hasApproverRole(roles []string) bool {
 
 // ---------- 能力发现 ----------
 
-// moduleEntry 是 GET /tenon/modules 的一行。注意它是**管理面视图**，含 enabled=false。
+// moduleEntry 是 GET /tenon/modules 的一行。宿主只返回**可见**模块（enabled && alive）；enabled 字段保留是为了兼容旧宿主，新宿主不会再吐 false。
 type moduleEntry struct {
 	ID      string `json:"id"`
 	BaseURL string `json:"baseURL"`

@@ -551,7 +551,7 @@ func (o *planObserver) actionsFor(planID string) []string {
 
 // ---------- 轮询 ----------
 
-// moduleEntry 是 GET /tenon/modules 的一行（管理面视图，含 enabled=false）。
+// moduleEntry 是 GET /tenon/modules 的一行。宿主现在只返回**可见**模块（enabled && alive，见 registry），字段 enabled 保留是为了兼容旧宿主；新宿主不会再吐 false。
 type moduleEntry struct {
 	ID      string `json:"id"`
 	BaseURL string `json:"baseURL"`
