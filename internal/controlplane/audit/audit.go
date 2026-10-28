@@ -24,14 +24,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"os"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
-	"unicode/utf16"
+
+	"tenon.dev/internal/protocol"
 )
 
 // 审计两段（spec/0.1/schemas/audit-event.schema.json#/$defs/AuditStage）。
@@ -197,7 +194,7 @@ func (s *Store) Append(rec AuditRecord) error {
 	}
 	rec.Hash = hash
 	obj["hash"] = hash
-	line, err := encodeCanonical(obj)
+	line, err := protocol.CanonicalJSON(obj)
 	if err != nil {
 		return fmt.Errorf("审计记录无法规范化（auditId=%s）：%w", rec.AuditID, err)
 	}
@@ -377,7 +374,7 @@ func hashOfRecord(rec AuditRecord) (string, error) {
 
 // hashOfTree 对规范化后的 JSON 取 SHA-256，写成 sha256:<hex>。
 func hashOfTree(v any) (string, error) {
-	canon, err := encodeCanonical(v)
+	canon, err := protocol.CanonicalJSON(v)
 	if err != nil {
 		return "", err
 	}
@@ -398,171 +395,4 @@ func decodeJSON(raw []byte) (any, error) {
 		return nil, fmt.Errorf("JSON 之后还有多余内容")
 	}
 	return v, nil
-}
-
-// encodeCanonical 输出 RFC 8785（JCS）形式的紧凑 JSON：键按 UTF-16 码元序排序、无任何
-// 多余空白、字符串只做必需转义、数字按 ECMAScript Number::toString 书写。同一份语义内容
-// 只有一种字节形态，所以 hash 可以被任何第三方独立复算。
-func encodeCanonical(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := writeCanonical(&buf, v); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func writeCanonical(buf *bytes.Buffer, v any) error {
-	switch x := v.(type) {
-	case nil:
-		buf.WriteString("null")
-	case bool:
-		if x {
-			buf.WriteString("true")
-		} else {
-			buf.WriteString("false")
-		}
-	case string:
-		writeCanonicalString(buf, x)
-	case json.Number:
-		num, err := canonicalNumber(x)
-		if err != nil {
-			return err
-		}
-		buf.WriteString(num)
-	case []any:
-		buf.WriteByte('[')
-		for i, elem := range x {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			if err := writeCanonical(buf, elem); err != nil {
-				return err
-			}
-		}
-		buf.WriteByte(']')
-	case map[string]any:
-		keys := make([]string, 0, len(x))
-		for k := range x {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool { return utf16Less(keys[i], keys[j]) })
-		buf.WriteByte('{')
-		for i, k := range keys {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			writeCanonicalString(buf, k)
-			buf.WriteByte(':')
-			if err := writeCanonical(buf, x[k]); err != nil {
-				return err
-			}
-		}
-		buf.WriteByte('}')
-	default:
-		return fmt.Errorf("JSON 规范化：不支持的取值类型 %T", v)
-	}
-	return nil
-}
-
-// writeCanonicalString 按 RFC 8785 §3.2.2.2 写字符串：只做必需转义，控制字符用最短形式
-// （\b \t \n \f \r，其余 \u00xx 小写十六进制），非 ASCII 字符按 UTF-8 原样输出。
-func writeCanonicalString(buf *bytes.Buffer, s string) {
-	const hexDigits = "0123456789abcdef"
-	buf.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			buf.WriteString(`\"`)
-		case '\\':
-			buf.WriteString(`\\`)
-		case '\b':
-			buf.WriteString(`\b`)
-		case '\t':
-			buf.WriteString(`\t`)
-		case '\n':
-			buf.WriteString(`\n`)
-		case '\f':
-			buf.WriteString(`\f`)
-		case '\r':
-			buf.WriteString(`\r`)
-		default:
-			if r < 0x20 {
-				buf.WriteString(`\u00`)
-				buf.WriteByte(hexDigits[(r>>4)&0xf])
-				buf.WriteByte(hexDigits[r&0xf])
-				continue
-			}
-			buf.WriteRune(r)
-		}
-	}
-	buf.WriteByte('"')
-}
-
-// utf16Less 按 UTF-16 码元序列比较字符串，这是 RFC 8785 §3.2.3 规定的键序；它与按 UTF-8
-// 字节序只在「BMP 末尾字符（U+E000..U+FFFF）与代理对（非 BMP 字符）混排」时分歧。
-func utf16Less(a, b string) bool {
-	au, bu := utf16.Encode([]rune(a)), utf16.Encode([]rune(b))
-	for i := 0; i < len(au) && i < len(bu); i++ {
-		if au[i] != bu[i] {
-			return au[i] < bu[i]
-		}
-	}
-	return len(au) < len(bu)
-}
-
-// canonicalNumber 按 ECMAScript Number::toString（RFC 8785 §3.2.2.3）写数字：同一个数值
-// 无论原文写成 1e3、1000 还是 1000.0，规范化后都是 1000；-0 写成 0。
-//
-// 解析不成 float64 或超出其表示范围（含 ±Inf）一律报错，不静默截断：静默截断会让两条
-// 不同的记录算出同一个摘要，链就失去了「改一处即断」的性质。
-func canonicalNumber(n json.Number) (string, error) {
-	f, err := strconv.ParseFloat(n.String(), 64)
-	if err != nil {
-		return "", fmt.Errorf("数字 %q 无法表示为 float64：%w", n.String(), err)
-	}
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return "", fmt.Errorf("数字 %q 超出 float64 表示范围", n.String())
-	}
-	if f == 0 {
-		return "0", nil
-	}
-	neg := f < 0
-	if neg {
-		f = -f
-	}
-	// 'e' 格式给出最短往返有效数字，形如 d[.ddd]e±XX，满足 d.ddd × 10^exp = f。
-	sci := strconv.FormatFloat(f, 'e', -1, 64)
-	mant, expText, _ := strings.Cut(sci, "e")
-	exp, err := strconv.Atoi(expText)
-	if err != nil {
-		return "", fmt.Errorf("数字 %q 的指数部分无法解析：%w", n.String(), err)
-	}
-	digits := strings.Replace(mant, ".", "", 1)
-	k := len(digits)
-	// 与 ECMA-262 的 (s, k, n) 同构：值 = 0.<digits> × 10^n。
-	n10 := exp + 1
-	var out string
-	switch {
-	case k <= n10 && n10 <= 21:
-		out = digits + strings.Repeat("0", n10-k)
-	case 0 < n10 && n10 <= 21:
-		out = digits[:n10] + "." + digits[n10:]
-	case -6 < n10 && n10 <= 0:
-		out = "0." + strings.Repeat("0", -n10) + digits
-	default:
-		e := n10 - 1
-		sign := "+"
-		if e < 0 {
-			sign, e = "-", -e
-		}
-		if k == 1 {
-			out = digits + "e" + sign + strconv.Itoa(e)
-		} else {
-			out = digits[:1] + "." + digits[1:] + "e" + sign + strconv.Itoa(e)
-		}
-	}
-	if neg {
-		out = "-" + out
-	}
-	return out, nil
 }

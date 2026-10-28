@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"tenon.dev/internal/protocol"
 )
 
 // openTestStore 打开一个临时审计日志，并在用例结束时关闭它。
@@ -593,7 +595,7 @@ func canonicalJSONString(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	out, err := encodeCanonical(v)
+	out, err := protocol.CanonicalJSON(v)
 	if err != nil {
 		return "", err
 	}
