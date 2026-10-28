@@ -424,6 +424,9 @@ const (
 	skillNameKey     = "name"
 	skillTenonKey    = "tenon"
 	skillSubscribes  = "subscribes"
+	// skillExpectedModules 是 skill 自己声明的「它要操作哪些模块」。请求回合的 skill
+	// 粗筛用它当词表——这就是「新增业务只需加模块 + 加 skill」的关键：不再有硬编码词表。
+	skillExpectedModules = "expectedModules"
 )
 
 // Skill 是一份 skill 文档：订阅声明 + 正文。
@@ -434,7 +437,11 @@ type Skill struct {
 	Name       string
 	Path       string
 	Subscribes []string
-	Body       string
+	// ExpectedModules 是 skill 自己声明的「我要操作哪些模块」（frontmatter 的
+	// tenon.expectedModules）。请求回合的粗筛词表来自它，而不是 agent 里的硬编码列表——
+	// 新增业务只要加模块 + 加 skill，不用改 agent 代码。
+	ExpectedModules []string
+	Body            string
 }
 
 // Matches 判断该 skill 是否订阅了某事件类型。
@@ -610,11 +617,16 @@ func loadSkill(path string) (Skill, error) {
 	if name := frontValue(front, skillNameKey); name != "" {
 		skill.Name = name
 	}
-	subs, err := parseSubscribes(front)
+	subs, err := parseTenonList(front, skillSubscribes)
 	if err != nil {
 		return Skill{}, fmt.Errorf("agent: skill %q 的 %s.%s 不可用：%w", path, skillTenonKey, skillSubscribes, err)
 	}
 	skill.Subscribes = subs
+	mods, err := parseTenonList(front, skillExpectedModules)
+	if err != nil {
+		return Skill{}, fmt.Errorf("agent: skill %q 的 %s.%s 不可用：%w", path, skillTenonKey, skillExpectedModules, err)
+	}
+	skill.ExpectedModules = mods
 	return skill, nil
 }
 
@@ -653,7 +665,7 @@ func frontValue(front, key string) string {
 	return ""
 }
 
-// parseSubscribes 解析 tenon.subscribes。
+// parseTenonList 解析 tenon 块里的一个列表键（subscribes / expectedModules）。
 //
 // 只支持两种写法（不引入 YAML 依赖，也不猜第三种）：
 //
@@ -665,7 +677,7 @@ func frontValue(front, key string) string {
 //	    - quote.completed
 //
 // 其它 key（expectedModules 等）忽略：本层只关心「要不要开回合」。
-func parseSubscribes(front string) ([]string, error) {
+func parseTenonList(front, key string) ([]string, error) {
 	lines := strings.Split(front, "\n")
 	start := -1
 	for i, line := range lines {
@@ -700,7 +712,7 @@ func parseSubscribes(front string) ([]string, error) {
 		line := lines[i]
 		indent := len(line) - len(strings.TrimLeft(line, " \t"))
 		name, value, ok := strings.Cut(strings.TrimSpace(line), ":")
-		if !ok || strings.TrimSpace(name) != skillSubscribes {
+		if !ok || strings.TrimSpace(name) != key {
 			continue
 		}
 		inline := strings.TrimSpace(value)

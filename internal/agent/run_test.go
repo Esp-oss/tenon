@@ -633,9 +633,10 @@ func TestRequestTurnUsesSelectedSkills(t *testing.T) {
 		deps := env.Deps()
 		// 订阅的是一个与本次事件无关的类型：request 回合的候选集只按文本粗筛，不看订阅。
 		deps.Skills = &SkillStore{skills: []Skill{{
-			Name:       "stock-first",
-			Subscribes: []string{"quote.completed"},
-			Body:       "扣库存之前先核对 inventory 的在库数。",
+			Name:            "stock-first",
+			Subscribes:      []string{"quote.completed"},
+			ExpectedModules: []string{"inventory"},
+			Body:            "扣库存之前先核对 inventory 的在库数。",
 		}}}
 
 		res := Run(context.Background(), deps, RunInput{

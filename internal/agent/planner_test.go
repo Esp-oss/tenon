@@ -414,3 +414,40 @@ func TestPromptRendersActionTitleAndRequiredArgs(t *testing.T) {
 		t.Fatalf("无元信息时应只渲染 id：\n%s", bare)
 	}
 }
+
+// expectedModules 是请求回合粗筛的词表来源；解析坏了会让新业务的 skill 永远选不中。
+func TestLoadSkillsParsesExpectedModules(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) {
+		t.Helper()
+		sub := filepath.Join(dir, name)
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatalf("建目录失败：%v", err)
+		}
+		if err := os.WriteFile(filepath.Join(sub, "SKILL.md"), []byte(content), 0o600); err != nil {
+			t.Fatalf("写文件失败：%v", err)
+		}
+	}
+	write("warehouse", `---
+name: warehouse-replenish
+tenon:
+  subscribes: ["warehouse.low-stock"]
+  expectedModules: ["warehouse", "inventory"]
+---
+
+补货流程正文。
+`)
+
+	store, err := LoadSkills(dir)
+	if err != nil {
+		t.Fatalf("加载失败：%v", err)
+	}
+	all := store.All()
+	if len(all) != 1 {
+		t.Fatalf("应加载 1 份，得到 %d", len(all))
+	}
+	got := all[0].ExpectedModules
+	if len(got) != 2 || got[0] != "warehouse" || got[1] != "inventory" {
+		t.Fatalf("expectedModules 解析不对：%+v", got)
+	}
+}
