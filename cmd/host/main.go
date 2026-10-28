@@ -13,6 +13,9 @@
 //	                   未设置时没有任何 agent 被授权，所有调用都会被拒绝
 //	TENON_AUDIT_PATH   审计 JSONL 路径（缺省 ./audit-host.jsonl）
 //	TENON_MODULES      启动时登记的模块，形如 id=url,id=url
+//	TENON_HMAC_SECRET_FILE  模块注册/心跳端点的共享密钥文件（D7：**未设置或读不到即拒绝启动**）。
+//	                   宿主不再有「不挂注册端点」的档位——静默不可用会让运维以为注册在工作，
+//	                   实际所有模块永远上不了线
 //	TENON_TEST_MODE    =1 时额外挂载 POST /tenon/admin/modules（测试专用，启动时打警告）
 //	TENON_USERS_FILE   dev 账号表（例 config/users.dev.json）；未设置时登录端点永远拒绝
 //	TENON_SESSION_SECRET  签发/校验 token 的密钥；未设置时用 dev 缺省值并打警告，
@@ -67,6 +70,9 @@ const (
 	envGrantFile  = "TENON_GRANT_FILE"
 	// envAuditPath 覆盖审计路径；TENON_AUDIT_PATH 与模块侧同名同义。
 	envAuditPath = "TENON_AUDIT_PATH"
+	// envHMACSecretFile 是注册/心跳端点的共享密钥文件。名字的唯一定义在 controlplane
+	// （EnvHMACSecretFile），那里还要用它拼 503 的报文，两处写死迟早分叉。
+	envHMACSecretFile = controlplane.EnvHMACSecretFile
 	// envModules 是启动时的模块登记表（id=url,id=url）。
 	envModules = "TENON_MODULES"
 	// envTestMode 打开测试面（admin 端点），仅限测试环境。
@@ -182,6 +188,13 @@ func loadConfig() (controlplane.Config, error) {
 	if path := strings.TrimSpace(os.Getenv(envAuditPath)); path != "" {
 		cfg.AuditPath = path
 	}
+	// 注册/心跳的共享密钥：**读不到就返回错误**，由 main 以 log.Fatalf 收尾（D7）。
+	// 这里绝不退回缺省值：一个猜出来的密钥等于让注册端点对任何知道缺省值的人开放。
+	secretBytes, err := loadHMACSecret()
+	if err != nil {
+		return cfg, err
+	}
+	cfg.HMACSecret = secretBytes
 	if raw := strings.TrimSpace(os.Getenv(envModules)); raw != "" {
 		// 解析失败即退出：带着半份注册表上线，D1 的 A/B 轮就不再是同一个前提。
 		modules, err := registry.ParseModules(raw)
@@ -228,6 +241,39 @@ func loadConfig() (controlplane.Config, error) {
 		log.Printf("host: %s=1 —— POST /tenon/admin/modules 已挂载，仅限测试环境使用", envTestMode)
 	}
 	return cfg, nil
+}
+
+// loadHMACSecret 读模块注册/心跳端点的共享密钥文件。
+//
+// D7：缺密钥**拒绝启动**，不是「不挂端点」。区别在运维看到什么——「起不来，缺
+// TENON_HMAC_SECRET_FILE」当场可修；「宿主正常启动、模块永远上不了线」要等验收才发现。
+// 所以这里一律返回错误，由 main 的 log.Fatalf 收尾（非 0 退出、信息点名环境变量）。
+//
+// 取内容的规则刻意做得宽容又明确：允许 UTF-8 BOM（PowerShell 5.1 的 UTF8 编码会写 BOM，
+// 留着它会让密钥开头多三个字节，症状是「两边明明同一个值却验签失败」），允许行尾换行与
+// 两端空白；**不允许**多行内容——那说明文件里混进了别的东西（注释、说明、第二个密钥），
+// 替调用方猜哪一行是密钥比直接报错危险。
+func loadHMACSecret() ([]byte, error) {
+	path := strings.TrimSpace(os.Getenv(envHMACSecretFile))
+	if path == "" {
+		return nil, fmt.Errorf("未设置 %s：模块注册/心跳端点（POST /tenon/registry/register 与 "+
+			"/tenon/registry/heartbeat）靠它验签，缺密钥时宿主拒绝启动（D7）", envHMACSecretFile)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s=%s 失败：%w；注册/心跳端点没有密钥可用，宿主拒绝启动（D7）",
+			envHMACSecretFile, path, err)
+	}
+	secret := strings.TrimSpace(strings.TrimPrefix(string(raw), "\ufeff"))
+	if secret == "" {
+		return nil, fmt.Errorf("%s=%s 是空文件：注册/心跳端点需要非空共享密钥，宿主拒绝启动（D7）",
+			envHMACSecretFile, path)
+	}
+	if strings.ContainsAny(secret, "\r\n") {
+		return nil, fmt.Errorf("%s=%s 含多行内容：密钥文件应当只有一行，"+
+			"多行时无法判断哪一行是密钥，宿主拒绝启动（D7）", envHMACSecretFile, path)
+	}
+	return []byte(secret), nil
 }
 
 // loadApprovalRules 把 skills/*/approval.json 读成业务级规则并 append 进 cfg.Policies。
