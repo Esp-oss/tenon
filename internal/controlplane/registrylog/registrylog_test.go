@@ -185,6 +185,40 @@ func TestAppendWritesCanonicalRecord(t *testing.T) {
 	}
 }
 
+// TestVerifyAcceptsRecordsWrittenBeforeRuleFields 固定向后兼容：rule-dropped 给记录加了
+// ruleFile / policyId / reason 三个 omitempty 字段，**老链**（没有这三个键）必须仍能通过
+// 校验——否则升级一次就把历史事件链判成断链。
+func TestVerifyAcceptsRecordsWrittenBeforeRuleFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry-events.jsonl")
+	// 用老形状构造一条记录：新字段留零值（omitempty 不落盘），复算 hash 后写入。
+	rec := entry{
+		At:              "2026-10-27T00:00:00Z",
+		Event:           EventRegistered,
+		ModuleID:        "inventory",
+		DeclarationHash: "sha256:aaa",
+	}
+	hash, err := hashOfEntry(rec)
+	if err != nil {
+		t.Fatalf("复算 hash 失败：%v", err)
+	}
+	rec.Hash = hash
+	line, err := lineOfEntry(rec)
+	if err != nil {
+		t.Fatalf("编码失败：%v", err)
+	}
+	for _, key := range []string{"ruleFile", "policyId", "reason"} {
+		if strings.Contains(string(line), key) {
+			t.Fatalf("老形状不该带 %s：%s", key, line)
+		}
+	}
+	if err := os.WriteFile(path, append(line, '\n'), 0o600); err != nil {
+		t.Fatalf("写文件失败：%v", err)
+	}
+	if err := Verify(path); err != nil {
+		t.Fatalf("老链必须仍能通过校验：%v", err)
+	}
+}
+
 // TestOpenResumesChainFromTail 锁住「Open 从末行 hash 接链」：重启后写出的第四条必须
 // 接在第三条的 hash 上，否则重启就断链。
 func TestOpenResumesChainFromTail(t *testing.T) {

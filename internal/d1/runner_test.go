@@ -104,6 +104,14 @@ func (w *stubWorld) Config() Config {
 func (w *stubWorld) serveHost(rw http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case adminModulesPath:
+		// 管理面两个方法，语义与真宿主一致：
+		//   POST → 登记/摘除，回执给全量 List；
+		//   GET  → 全量 List（含 enabled=false 的条目），D1 的 verifyDisabled 读它。
+		if r.Method == http.MethodGet {
+			w.record("admin-modules-get")
+			writeStubJSON(rw, http.StatusOK, w.modulesView(false))
+			return
+		}
 		var req struct {
 			ID      string `json:"id"`
 			Enabled *bool  `json:"enabled"`
@@ -126,22 +134,29 @@ func (w *stubWorld) serveHost(rw http.ResponseWriter, r *http.Request) {
 		}
 		w.registry[req.ID] = enabled
 		w.mu.Unlock()
-		writeStubJSON(rw, http.StatusOK, w.modulesView())
+		writeStubJSON(rw, http.StatusOK, w.modulesView(false))
 
 	case modulesPath:
+		// 可见视图：只含 enabled 的条目（真宿主的 enabled && alive）。桩宿主刻意跟着
+		// 收紧——verifyDisabled 若退回读这个端点，被摘除的模块会「不存在」，用例会挂，
+		// 而不是悄悄通过。
 		w.record("modules")
-		writeStubJSON(rw, http.StatusOK, w.modulesView())
+		writeStubJSON(rw, http.StatusOK, w.modulesView(true))
 
 	default:
 		http.NotFound(rw, r)
 	}
 }
 
-func (w *stubWorld) modulesView() map[string]any {
+// modulesView 给出注册表视图。visibleOnly 为真时只回 enabled 的条目。
+func (w *stubWorld) modulesView(visibleOnly bool) map[string]any {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	mods := make([]map[string]any, 0, len(w.registry))
 	for id, enabled := range w.registry {
+		if visibleOnly && !enabled {
+			continue
+		}
 		mods = append(mods, map[string]any{"id": id, "baseURL": "http://stub.invalid", "enabled": enabled})
 	}
 	return map[string]any{"modules": mods}
@@ -458,6 +473,60 @@ func TestD1FailsWhenRegistryKeepsModuleEnabled(t *testing.T) {
 	}
 	if got := w.triggerCount(); got != 1 {
 		t.Fatalf("摘除没生效时不该再跑 B 轮，实际触发了 %d 次报价", got)
+	}
+}
+
+// verifyDisabled 读的是**管理面全量视图**（GET /tenon/admin/modules），不是 agent 的可见
+// 视图（GET /tenon/modules，只含 enabled && alive）。
+//
+// 这条用例的价值在于它同时钉住两件事：①admin 端点回 enabled:false 时通过；②被摘除的模块
+// 在可见视图里确实已经不存在——所以读可见视图的实现必挂（桩宿主刻意跟着收紧语义）。
+func TestVerifyDisabledReadsAdminEndpoint(t *testing.T) {
+	w := newStubWorld(t)
+	cfg, err := w.Config().normalized()
+	if err != nil {
+		t.Fatalf("配置校验失败：%v", err)
+	}
+	r := newRunner(cfg)
+	ctx := context.Background()
+
+	if err := r.registerModules(ctx); err != nil {
+		t.Fatalf("登记模块失败：%v", err)
+	}
+	if err := r.disableModules(ctx); err != nil {
+		t.Fatalf("摘除模块失败：%v", err)
+	}
+	if err := r.verifyDisabled(ctx); err != nil {
+		t.Fatalf("admin 端点回 enabled:false 时 verifyDisabled 必须通过，得到：%v", err)
+	}
+
+	calls := w.callLog()
+	if got := countOf(calls, "admin-modules-get"); got != 1 {
+		t.Fatalf("verifyDisabled 应读一次 GET %s，实际调用：%v", adminModulesPath, calls)
+	}
+	if got := countOf(calls, "modules"); got != 0 {
+		t.Fatalf("verifyDisabled 不该读可见视图 %s（被摘除的模块在那里不存在），实际调用：%v",
+			modulesPath, calls)
+	}
+
+	// 可见视图里确实已经没有 procurement：这正是不能读它的理由。
+	resp, err := http.Get(w.host.URL + modulesPath)
+	if err != nil {
+		t.Fatalf("读可见视图失败：%v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var view struct {
+		Modules []struct {
+			ID string `json:"id"`
+		} `json:"modules"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&view); err != nil {
+		t.Fatalf("可见视图不是合法 JSON：%v", err)
+	}
+	for _, m := range view.Modules {
+		if m.ID == procurementModule {
+			t.Fatalf("被摘除的模块不该出现在可见视图里：%+v", view.Modules)
+		}
 	}
 }
 

@@ -700,6 +700,123 @@ func TestAdminModulesRequiresTestMode(t *testing.T) {
 	if code := tenonError(t, body).Code; code != "UNKNOWN_ENDPOINT" {
 		t.Fatalf("错误码 = %q，期望 UNKNOWN_ENDPOINT（原文 %s）", code, body)
 	}
+	// 读同理：全量视图也是测试面，非测试态必须一起消失（否则生产能看见被摘除的模块）。
+	st, body = getJSON(t, ts.URL+"/tenon/admin/modules")
+	if st != http.StatusNotFound {
+		t.Fatalf("非测试模式下 GET 应回 404，得到 %d（原文 %s）", st, body)
+	}
+}
+
+// TestAdminModulesGetReturnsFullView 固定两个视图的分野：admin GET 给全量（含
+// enabled=false），GET /tenon/modules 只给可见（enabled && alive）。
+//
+// D1 的 B 轮靠它区分「条目还在、只是被摘除」与「条目根本不存在」——后者在可见视图里
+// 无法与前者区分。
+func TestAdminModulesGetReturnsFullView(t *testing.T) {
+	reg := registryWith(t,
+		registry.ModuleEntry{ID: "inventory", BaseURL: "http://127.0.0.1:8081"},
+		registry.ModuleEntry{ID: "procurement", BaseURL: "http://127.0.0.1:8082"},
+	)
+	srv := newTestServer(t, Config{
+		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
+		TestMode:  true,
+		Registry:  reg,
+	})
+	ts := serveHost(t, srv)
+
+	if st, body := postJSON(t, ts.URL+"/tenon/admin/modules",
+		`{"id":"procurement","enabled":false}`); st != http.StatusOK {
+		t.Fatalf("摘除失败：%d %s", st, body)
+	}
+
+	st, body := getJSON(t, ts.URL+"/tenon/admin/modules")
+	if st != http.StatusOK {
+		t.Fatalf("GET 管理面应 200，得到 %d（原文 %s）", st, body)
+	}
+	var admin modulesResponse
+	decodeInto(t, body, &admin)
+	if len(admin.Modules) != 2 {
+		t.Fatalf("管理面应给全量 2 条（含被摘除的），得到 %d：%s", len(admin.Modules), body)
+	}
+	found := false
+	for _, m := range admin.Modules {
+		if m.ID == "procurement" {
+			found = true
+			if m.Enabled {
+				t.Fatalf("procurement 在管理面应显示 enabled=false：%+v", m)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("被摘除的模块必须仍在管理面可见（摘除 ≠ 未登记）：%s", body)
+	}
+
+	// 可见视图：被摘除的那个必须消失。
+	_, body = getJSON(t, ts.URL+"/tenon/modules")
+	var visible modulesResponse
+	decodeInto(t, body, &visible)
+	if len(visible.Modules) != 1 || visible.Modules[0].ID != "inventory" {
+		t.Fatalf("可见视图应只剩 inventory，得到 %s", body)
+	}
+}
+
+// TestReplacePoliciesTakesEffect 固定「补校验通过 → 规则真的参与求值」（裁决 ①a 的
+// 最后一步）：替换后的引擎立刻生效，非法规则集不会把闸门换成一半。
+func TestReplacePoliciesTakesEffect(t *testing.T) {
+	srv := newTestServer(t, Config{
+		Policies: []policy.PolicyRule{{
+			PolicyID: "p-deny",
+			Priority: 100,
+			Match:    policy.PolicyMatch{Module: "inventory", Actions: []string{"inventory.GetStock"}},
+			Outcome:  policy.OutcomeDeny,
+		}},
+		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
+	})
+	ts := serveHost(t, srv)
+	body := planBody(`{"stepId":"s1","action":"inventory.GetStock","args":{"sku":"STD-1002"}}`)
+	outcome := func() string {
+		t.Helper()
+		st, raw := postJSON(t, ts.URL+"/tenon/policies:evaluate", body)
+		if st != http.StatusOK {
+			t.Fatalf("求值失败：%d %s", st, raw)
+		}
+		var resp policy.PolicyEvaluation
+		decodeInto(t, raw, &resp)
+		return resp.Outcome
+	}
+
+	if got := outcome(); got != policy.OutcomeDeny {
+		t.Fatalf("替换前应为 deny，得到 %q", got)
+	}
+
+	auto := []policy.PolicyRule{{
+		PolicyID: "biz-late",
+		Priority: 1,
+		Match:    policy.PolicyMatch{Module: "inventory", Actions: []string{"inventory.GetStock"}},
+		Outcome:  policy.OutcomeAuto,
+	}}
+	if err := srv.ReplacePolicies(auto); err != nil {
+		t.Fatalf("替换规则集失败：%v", err)
+	}
+	if got := outcome(); got != policy.OutcomeAuto {
+		t.Fatalf("替换后应为 auto（新规则必须真的进入求值路径），得到 %q", got)
+	}
+
+	// 非法规则集：拒绝替换，且旧引擎继续服务（不能把闸门换成一半）。
+	if err := srv.ReplacePolicies([]policy.PolicyRule{{PolicyID: "bad", Outcome: "maybe"}}); err == nil {
+		t.Fatal("非法规则集必须拒绝替换")
+	}
+	if got := outcome(); got != policy.OutcomeAuto {
+		t.Fatalf("拒绝替换后应沿用旧规则（auto），得到 %q", got)
+	}
+
+	// readyz 报告的规则条数也要跟着走（否则运维看到的是替换前的数字）。
+	_, raw := getJSON(t, ts.URL+"/readyz")
+	var ready map[string]any
+	decodeInto(t, raw, &ready)
+	if got, _ := ready["policies"].(float64); int(got) != len(auto) {
+		t.Fatalf("readyz 的 policies = %v，期望 %d（%s）", ready["policies"], len(auto), raw)
+	}
 }
 
 // TestAdminModulesEnabledSemantics 固定 enabled 的 *bool 语义：省略=不改开关，显式

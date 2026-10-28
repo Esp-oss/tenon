@@ -5,7 +5,8 @@
 //   - 注册/心跳端点（POST /tenon/registry/register|heartbeat）→ Upsert / Touch；
 //   - GET /tenon/modules 与 agent 的能力发现 → Enabled()，只看得见「活着且没被人工摘掉」的；
 //   - POST /tenon/admin/modules（仅 TENON_TEST_MODE=1）→ Upsert / SetEnabled；
-//   - cmd/host 的后台清扫循环（每 HeartbeatInterval 一次）→ Sweep，把失联的判成 lost。
+//   - cmd/host 的后台清扫循环（每 HeartbeatInterval 一次）→ Sweep，把失联的判成 lost；
+//   - cmd/host 注册的 OnRegistered 钩子 → 模块注册成功后补校验被挂起的业务规则（裁决 ①a）。
 //
 // 设计文档 §3 的 D1 靠「摘除模块」而不是「改 agent」：SetEnabled(id, false) 把条目
 // 留在表里但让它从 Enabled() 里消失，于是同一事件下 agent 能看到的模块不同，而 agent
@@ -84,6 +85,11 @@ type Registry struct {
 	// NewRegistryWithLog）；注册表不会为它加第二把锁——跃迁与写事件本来就在同一把
 	// 写锁下串行。
 	Log *registrylog.Log
+	// hookMu 保护 registeredHooks。它与 mu 分开：回调在锁外执行，注册钩子是装配期的
+	// 写、注册请求路径上的读，两件事不该共用一把锁互相拖慢。
+	hookMu sync.Mutex
+	// registeredHooks 是 Upsert 成功后的同步回调（见 OnRegistered）。
+	registeredHooks []func(ModuleEntry)
 }
 
 // NewRegistry 返回一个空注册表。
@@ -135,6 +141,57 @@ func (r *Registry) logEvent(ev registrylog.Event) {
 	}
 }
 
+// LogEvent 写一条**不属于状态跃迁**的注册事件（如 rule-dropped）。
+//
+// 注册表只决定「什么算跃迁」，不认识业务规则；业务规则补校验失败由装配方（cmd/host）
+// 判定后经由这里落链。错误处置与 logEvent 完全一致：写失败只记日志，不改变调用方的
+// 业务处置——事件链是观测面。r 或 r.Log 为 nil 时是安全的空操作。
+func (r *Registry) LogEvent(ev registrylog.Event) {
+	if r == nil {
+		return
+	}
+	r.logEvent(ev)
+}
+
+// OnRegistered 注册一个「模块登记成功后」的同步回调。
+//
+// 用途只有一个：模块注册成功时触发业务规则的补校验（裁决 ①a）。注册表刻意不认识规则
+// 引擎（不 import controlplane/policy、也不 import cmd/host），所以这里留一个通用的钩子，
+// 由装配方注入自己的动作。
+//
+// 三条约定：
+//   - **同步**：Upsert 返回前回调已经跑完。补校验的结果（规则生效/被丢弃）必须早于注册
+//     响应落地，否则模块会先看到 200，而规则还没生效。
+//   - **在写锁之外**：回调里要做 HTTP 拉动作定义（≤5s）。持锁回调会把并发的注册、心跳、
+//     可见性查询全部堵住一个网络往返，那是把观测/派生逻辑的延迟转嫁给所有人。
+//   - **不影响注册结果**：回调 panic 会被吞掉并记日志。注册已经写进表，不能因为一个
+//     观察者写坏而让模块收到 500 去重试。
+func (r *Registry) OnRegistered(fn func(ModuleEntry)) {
+	if fn == nil {
+		return
+	}
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	r.registeredHooks = append(r.registeredHooks, fn)
+}
+
+// notifyRegistered 依次调用注册钩子。调用方必须**已经**释放 mu。
+func (r *Registry) notifyRegistered(e ModuleEntry) {
+	r.hookMu.Lock()
+	hooks := append([]func(ModuleEntry){}, r.registeredHooks...)
+	r.hookMu.Unlock()
+	for _, fn := range hooks {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("registry: 模块 %q 的注册回调 panic（注册本身已生效）：%v", e.ID, rec)
+				}
+			}()
+			fn(e)
+		}()
+	}
+}
+
 // Upsert 登记一个新模块，或更新已登记模块的地址。
 //
 // 语义刻意做窄，避免同一结构体既当入参又当出参带来的歧义：
@@ -153,16 +210,20 @@ func (r *Registry) logEvent(ev registrylog.Event) {
 // re-registered（spec §7），哈希没变就什么都不记——重复注册不该把日志刷成噪声。
 // 顺带一提，注册本身就是「现在是 alive 的证据」，所以一个 lost 的模块以相同哈希重新注册
 // 只记 recovered，不额外记一条「复活」。
+//
+// 写表之后、**锁外**触发 OnRegistered 钩子（见 notifyRegistered）：钩子要发 HTTP 请求，
+// 不能持锁做 I/O。重复注册同样触发——模块重启后会重申报，补校验要能再跑一次（幂等：
+// 已经生效的规则不在 pending 里，钩子什么都不做）。
 func (r *Registry) Upsert(e ModuleEntry) {
 	if e.ID == "" {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.entries == nil {
 		r.entries = make(map[string]ModuleEntry)
 	}
 	now := time.Now()
+	var stored ModuleEntry
 	if cur, ok := r.entries[e.ID]; ok {
 		kind := ""
 		switch {
@@ -178,16 +239,20 @@ func (r *Registry) Upsert(e ModuleEntry) {
 		cur.State = StateAlive
 		cur.LastSeen = now
 		r.entries[e.ID] = cur
+		stored = cur
 		if kind != "" {
 			r.logEvent(registrylog.Event{Event: kind, ModuleID: e.ID, DeclarationHash: cur.DeclarationHash})
 		}
-		return
+	} else {
+		e.Enabled = true
+		e.State = StateAlive
+		e.LastSeen = now
+		r.entries[e.ID] = e
+		stored = e
+		r.logEvent(registrylog.Event{Event: registrylog.EventRegistered, ModuleID: e.ID, DeclarationHash: e.DeclarationHash})
 	}
-	e.Enabled = true
-	e.State = StateAlive
-	e.LastSeen = now
-	r.entries[e.ID] = e
-	r.logEvent(registrylog.Event{Event: registrylog.EventRegistered, ModuleID: e.ID, DeclarationHash: e.DeclarationHash})
+	r.mu.Unlock()
+	r.notifyRegistered(stored)
 }
 
 // SetEnabled 打开或关闭一个已登记模块。

@@ -542,3 +542,121 @@ func TestRegistryLogFailureDoesNotChangeBusinessResult(t *testing.T) {
 		t.Fatalf("空链应通过校验：%v", err)
 	}
 }
+
+// TestOnRegisteredFiresAfterWriteOutsideLock 固定注册钩子的两条约定：
+//   - 在**写锁之外**回调：钩子里读注册表必须能拿到锁（sync.RWMutex 不可重入，若 Upsert
+//     还持着写锁就回调，这里会死锁——用例超时即失败）；
+//   - 在**写表之后**回调：钩子看到的必须是落表后的条目（Enabled/State/LastSeen 已定），
+//     否则补校验会对着一个半成品状态做判断。
+func TestOnRegisteredFiresAfterWriteOutsideLock(t *testing.T) {
+	r := NewRegistry()
+	var seen []ModuleEntry
+	r.OnRegistered(func(e ModuleEntry) {
+		seen = append(seen, e)
+		// 死锁探针：读锁与写锁互斥。
+		if list := r.List(); len(list) != 1 || list[0].ID != e.ID {
+			t.Errorf("钩子里读到的注册表不对：%+v", list)
+		}
+		if on := r.Enabled(); len(on) != 1 {
+			t.Errorf("钩子里应能看见刚注册的模块：%+v", on)
+		}
+	})
+
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	if len(seen) != 1 {
+		t.Fatalf("注册应触发一次回调，得到 %d 次", len(seen))
+	}
+	if !seen[0].Enabled || seen[0].State != StateAlive || seen[0].LastSeen.IsZero() {
+		t.Fatalf("回调应拿到落表后的条目（enabled/alive/lastSeen 已定）：%+v", seen[0])
+	}
+
+	// 重复注册同样触发（模块重启后重申报要能再补校验一次），但不影响条目状态。
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://y", DeclarationHash: "sha256:aaa"})
+	if len(seen) != 2 || seen[1].BaseURL != "http://y" {
+		t.Fatalf("重复注册应触发回调并带上新地址：%+v", seen)
+	}
+
+	// 空 ID 不登记，也就不该回调。
+	r.Upsert(ModuleEntry{ID: "", BaseURL: "http://z"})
+	if len(seen) != 2 {
+		t.Fatalf("空 ID 不该触发回调，得到 %d 次", len(seen))
+	}
+}
+
+// TestOnRegisteredPanicDoesNotBreakRegistration：钩子是观察者/派生逻辑，一个写坏的钩子
+// 不能把注册变成 500（注册已经落表，模块重试也改变不了结果）。
+func TestOnRegisteredPanicDoesNotBreakRegistration(t *testing.T) {
+	r := NewRegistry()
+	called := false
+	r.OnRegistered(func(ModuleEntry) { panic("钩子写坏了") })
+	r.OnRegistered(func(ModuleEntry) { called = true })
+
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x"})
+
+	if got := len(r.Enabled()); got != 1 {
+		t.Fatalf("注册必须仍然生效，得到可见 %d", got)
+	}
+	if !called {
+		t.Fatal("前面的钩子 panic 不该阻止后面的钩子")
+	}
+}
+
+// TestLogEventWritesRuleDropped 固定「业务规则补校验失败」的事件写法：rule-dropped 落在
+// 注册事件链上（不是业务审计），带上 ruleFile/policyId/reason，且链自洽。
+func TestLogEventWritesRuleDropped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry-events.jsonl")
+	r, err := NewRegistryWithLog(path)
+	if err != nil {
+		t.Fatalf("打开注册事件链失败：%v", err)
+	}
+	t.Cleanup(func() {
+		if cerr := r.Close(); cerr != nil {
+			t.Errorf("关闭事件链失败：%v", cerr)
+		}
+	})
+
+	r.Upsert(ModuleEntry{ID: "procurement", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	r.LogEvent(registrylog.Event{
+		Event:    registrylog.EventRuleDropped,
+		ModuleID: "procurement",
+		RuleFile: "skills/s1/approval.json",
+		PolicyID: "biz-small",
+		Reason:   "拉取动作定义返回 404",
+	})
+
+	events := logRecords(t, path)
+	if len(events) != 2 {
+		t.Fatalf("期望 registered + rule-dropped 两条，得到 %+v", events)
+	}
+	last := events[len(events)-1]
+	if last["event"] != registrylog.EventRuleDropped ||
+		last["ruleFile"] != "skills/s1/approval.json" ||
+		last["policyId"] != "biz-small" ||
+		last["reason"] != "拉取动作定义返回 404" {
+		t.Fatalf("rule-dropped 事件字段不对：%+v", last)
+	}
+	if err := registrylog.Verify(path); err != nil {
+		t.Fatalf("事件链应通过校验：%v", err)
+	}
+}
+
+// logRecords 把事件链读成按字段可断言的形状（logEvents 只看 event/moduleId）。
+func logRecords(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取事件链失败：%v", err)
+	}
+	var out []map[string]any
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("事件行不是合法 JSON（%s）：%v", line, err)
+		}
+		out = append(out, rec)
+	}
+	return out
+}

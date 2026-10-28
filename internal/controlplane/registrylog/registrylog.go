@@ -42,6 +42,10 @@ const hashPrefix = "sha256:"
 
 // 事件类型（spec §7）。registered / recovered 都表示「这条走完之后模块是 alive 的」，
 // 区别只在于是首次登记还是从 lost 回来。
+//
+// event==EventRuleDropped 是 spec §7 之外新增的一条（裁决 ①a）：业务规则在加载期因为
+// 「引用的模块还没注册」被挂起，模块注册后补校验失败 → 整份丢弃。它与模块生命周期同源
+// （都由模块注册触发），所以写进这条链而不是业务审计；记录形状见 Event 的规则字段。
 const (
 	EventRegistered     = "registered"
 	EventReRegistered   = "re-registered"
@@ -49,25 +53,41 @@ const (
 	EventRecovered      = "recovered"
 	EventManualEnabled  = "manual-enabled"
 	EventManualDisabled = "manual-disabled"
+	// EventRuleDropped 表示模块注册后补校验失败的 pending 业务规则被丢弃。
+	EventRuleDropped = "rule-dropped"
 )
 
 // Event 是一条待写入的注册事件。
 //
 // 调用方只描述「什么事发生在哪个模块上」：at 由 now 参数给出，prevHash 与 hash 由 Log 按
 // 链算。DeclarationHash 可空（lost / manual-* 事件不一定有意义），空值不写进记录。
+//
+// RuleFile / PolicyID / Reason 只用于 EventRuleDropped：一条记录的语义是「模块 ModuleID
+// 注册后，规则文件 RuleFile 里（至少）PolicyID 这条规则补校验失败，整份被丢弃，原因是
+// Reason」。三个字段都 omitempty——老记录里没有它们，重新规范化后字节不变，既有链仍然可验。
 type Event struct {
 	Event           string
 	ModuleID        string
 	DeclarationHash string
+	// RuleFile 是 discarded 规则文件的路径（skills/<skill>/approval.json）。
+	RuleFile string
+	// PolicyID 是导致丢弃的规则 id；判不出具体某条时是该文件里 policyId 的逗号列表。
+	PolicyID string
+	// Reason 是人读的失败原因（拿不到动作定义、入参路径不存在……）。
+	Reason string
 }
 
 // entry 是一行的线上形状。字段名与 spec §7 一致；declarationHash 用 omitempty，因为
-// 「没有声明哈希」与「声明哈希是空串」在语义上是同一件事。
+// 「没有声明哈希」与「声明哈希是空串」在语义上是同一件事。ruleFile/policyId/reason 同理
+// （只有 rule-dropped 会带），omitempty 让这条新增不影响老记录的重算字节。
 type entry struct {
 	At              string  `json:"at"`
 	Event           string  `json:"event"`
 	ModuleID        string  `json:"moduleId"`
 	DeclarationHash string  `json:"declarationHash,omitempty"`
+	RuleFile        string  `json:"ruleFile,omitempty"`
+	PolicyID        string  `json:"policyId,omitempty"`
+	Reason          string  `json:"reason,omitempty"`
 	PrevHash        *string `json:"prevHash"`
 	Hash            string  `json:"hash"`
 }
@@ -172,6 +192,9 @@ func (l *Log) Append(ev Event, now time.Time) error {
 		Event:           ev.Event,
 		ModuleID:        ev.ModuleID,
 		DeclarationHash: ev.DeclarationHash,
+		RuleFile:        ev.RuleFile,
+		PolicyID:        ev.PolicyID,
+		Reason:          ev.Reason,
 		PrevHash:        l.tail,
 	}
 	hash, err := hashOfEntry(rec)

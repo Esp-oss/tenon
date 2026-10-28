@@ -20,6 +20,7 @@
 //	GET  /tenon/intents/poll?after=        按序回放未确认的帧
 //	POST /tenon/intents/ack                确认到某个序号，此后不再回放
 //	POST /tenon/admin/modules              登记/摘除模块（仅 TENON_TEST_MODE=1）
+//	GET  /tenon/admin/modules              注册表全量视图（仅 TENON_TEST_MODE=1，含 disabled/lost）
 //	GET  /                                 同源静态页（P1 只做路由，页面内容在 P3）
 //	GET  /ui/…                             静态页引用的资源（只读 TENON_UI_DIR 之内）
 //
@@ -44,8 +45,9 @@
 //   - **协议版本头**：host 端点全部宽松处理（缺失视为 0.1，存在且不是 0.1 则 400），
 //     响应一律带 Tenon-Version/Tenon-Min-Version。本轮只实现 0.1，不做版本协商；
 //   - **GET /tenon/modules 只返回可见条目**（registry.Enabled，`enabled && alive`，D5）：
-//     没有 static 例外——不心跳的模块就是看不见。管理面视图（含已摘除条目）只在测试面的
-//     POST /tenon/admin/modules 的回执里给，且那个端点仅 TENON_TEST_MODE=1 挂载；
+//     没有 static 例外——不心跳的模块就是看不见。管理面视图（含已摘除 / lost 条目）走
+//     测试面的 GET /tenon/admin/modules（或 POST 的回执），且那个端点仅 TENON_TEST_MODE=1
+//     挂载：D1 的 B 轮必须能区分「条目被摘除」与「条目不存在」；
 //   - **注册/心跳的鉴权失败回 401，不回 400/403**：这是「你是谁」的问题，混进报文校验
 //     （400）或权限判定（403）会让对端按错的方向修。理由再分三档（format/expired/invalid）
 //     并写进 details.reason：缺签名、密钥不一致、时钟漂移三种原因的处置完全不同；
@@ -86,6 +88,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"tenon.dev/internal/controlplane/audit"
@@ -173,7 +176,7 @@ type Config struct {
 	// 启动时拒绝（D7 缺密钥即拒绝启动），本包留这条 503 是给测试态与未来的装配方一个
 	// 「说得清原因」的出口——静默「不挂端点」会让运维以为注册在工作。
 	HMACSecret []byte
-	// TestMode 为 true 时挂载 POST /tenon/admin/modules。
+	// TestMode 为 true 时挂载 GET/POST /tenon/admin/modules。
 	TestMode bool
 	// Users 是 dev 账号表；为空表示登录端点永远失败（fail-closed）。
 	Users []User
@@ -198,6 +201,13 @@ type Config struct {
 
 // Server 是组装好的控制平面。构造后并发安全；Handler() 与服务共享同一份状态。
 type Server struct {
+	// policyMu 保护 policyEngine / policyCount：业务规则可能**在运行期**变多。
+	//
+	// 裁决 ①a 之后，business rule 的加载分两段：启动时能校验的先进引擎，引用尚未注册
+	// 模块的挂起等模块注册后补校验；补校验通过就要让新规则真的参与求值。引擎本身不可变
+	// （policy.PolicyEngine 构造后只读），所以这里换的是指针——读侧每次求值取一次快照，
+	// 保证一份 plan 的多个 step 永远看同一份规则。
+	policyMu     sync.RWMutex
 	policyEngine *policy.PolicyEngine
 	grantEngine  *grant.GrantEngine
 	auditStore   *audit.Store
@@ -212,8 +222,10 @@ type Server struct {
 	hmacSecret    []byte
 	// inbound 是落盘的入站队列（人 → agent）。它与 intents 是两条独立队列：出站的 Ack
 	// 是累积游标，两个消费者共用一条会互相吞帧。
-	inbound     Queue
-	origin      *originStore
+	inbound Queue
+	origin  *originStore
+	// policyCount 是 policyEngine 里的规则条数，随引擎一起被 policyMu 保护；
+	// /readyz 用它回答「规则加载了几条」。
 	policyCount int
 	grantCount  int
 	// requireTrigger 为 true 时缺 triggerEventId 直接 deny（TENON_REQUIRE_TRIGGER=1）。
@@ -318,6 +330,37 @@ func (s *Server) VerifyChain() error { return s.auditStore.VerifyChain() }
 // Registry 返回模块注册表，供调用方读取 Enabled()（agent 的能力发现就靠它）。
 func (s *Server) Registry() *registry.Registry { return s.modules }
 
+// policySnapshot 取当前策略引擎与规则条数的一致性快照。
+//
+// 一次 plan 求值只取一次：中途若发生 ReplacePolicies，整份 plan 仍按同一份规则判，
+// 不会出现「前三个 step 用旧规则、后两个用新规则」的半新半旧结论。
+func (s *Server) policySnapshot() (*policy.PolicyEngine, int) {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	return s.policyEngine, s.policyCount
+}
+
+// ReplacePolicies 用一批新规则替换运行期的策略引擎（裁决 ①a 的「纳入生效规则集」）。
+//
+// 只由装配侧在业务规则补校验通过后调用：规则文件引用的模块在 host 启动时还没注册，
+// 加载期只能挂起；模块注册后补校验通过，新规则必须真的进入求值，否则「生效」只是日志
+// 里的一句话。
+//
+// 先把新规则整体编译并跑一次自检，**不通过就不换**：换上一个编译不过的引擎会让之后
+// 每次 policies:evaluate 都 fail-closed 成 deny——一次补校验写坏不该把整个闸门关死。
+// 换的操作是加写锁的指针交换，在途求值只多等一次指针拷贝。
+func (s *Server) ReplacePolicies(rules []policy.PolicyRule) error {
+	engine := policy.NewPolicyEngine(rules)
+	if _, err := engine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
+		return fmt.Errorf("controlplane: 新规则集自检未通过，拒绝替换：%w", err)
+	}
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	s.policyEngine = engine
+	s.policyCount = len(rules)
+	return nil
+}
+
 // ServeHTTP 按路径分派。每个处理函数自己判定方法，好让「路径存在但方法不对」回 405
 // 而不是 404。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -414,7 +457,8 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 		missing = append(missing, "audit_file")
 		details = append(details, "audit_file: "+err.Error())
 	}
-	if _, err := s.policyEngine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
+	engine, policyCount := s.policySnapshot()
+	if _, err := engine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
 		missing = append(missing, "policy_engine")
 		details = append(details, "policy_engine: "+err.Error())
 	}
@@ -429,7 +473,7 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ready":    true,
 		"checks":   []string{"audit_file", "policy_engine"},
-		"policies": s.policyCount,
+		"policies": policyCount,
 		"grants":   s.grantCount,
 		"modules":  len(s.modules.List()),
 	})
@@ -548,8 +592,9 @@ func (s *Server) evaluatePlan(ctx context.Context, plan planView, origin string)
 		return defaultDeny()
 	}
 	evals := make([]policy.PolicyEvaluation, 0, len(plan.Steps))
+	engine, _ := s.policySnapshot()
 	for _, step := range plan.Steps {
-		got, err := s.policyEngine.Evaluate(ctx, policy.PolicyRequest{
+		got, err := engine.Evaluate(ctx, policy.PolicyRequest{
 			Action: step.Action,
 			Args:   step.Args,
 			Origin: origin,
@@ -897,8 +942,9 @@ func parseLimit(raw string) (int, *protocol.Error) {
 
 // ---------- 注册表 ----------
 
-// modulesResponse 是 GET /tenon/modules 与 admin 端点的响应体。用结构体包一层而不是
-// 直接输出数组，是为了留出后续加字段的余地（0.1 的 module-manifest 与注册表都在长）。
+// modulesResponse 是 GET /tenon/modules（可见视图）与测试面 /tenon/admin/modules
+// （全量视图：GET 回执与 POST 回执）的响应体。用结构体包一层而不是直接输出数组，
+// 是为了留出后续加字段的余地（0.1 的 module-manifest 与注册表都在长）。
 //
 // 同一个结构体承载两个视图：GET 给 Enabled()（可见），admin 给 List()（全量，含 disabled/lost），
 // 调用方按端点区分。真正的契约约束在 http.go 的端点注释里，别只看字段名。
@@ -910,7 +956,7 @@ type modulesResponse struct {
 //
 // 用的是 Enabled() 而不是 List()：不心跳的模块、以及被人工摘掉的模块，都不该出现在
 // agent 的能力发现里——「注册表里有一条」不等于「它现在在场」。管理面要看全量（含
-// disabled/lost）就走测试面的 POST /tenon/admin/modules 回执，那里编码 List()。
+// disabled/lost）就走测试面的 GET /tenon/admin/modules 或 POST 的回执，那里编码 List()。
 func (s *Server) serveModules(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
@@ -930,13 +976,27 @@ type adminModulesRequest struct {
 	Enabled *bool   `json:"enabled"`
 }
 
-// serveAdminModules 登记模块或摘除/恢复它（仅 TEST_MODE 挂载）。
+// serveAdminModules 是测试面的注册表端点（仅 TEST_MODE 挂载）：
 //
-// 顺序是有意的：先 Upsert（新条目一律 enabled）再 SetEnabled(false)，这样「登记同时
+//	GET  → 全量视图（List，含 disabled 与 lost）
+//	POST → 登记模块或摘除/恢复它
+//
+// GET 与 `GET /tenon/modules` 是**两个视图**，不能合并：后者是 agent 的可见视图
+// （enabled && alive），被人工摘掉的模块必须消失；而 D1 的 B 轮要断言的是「条目还在、
+// 只是 enabled=false」——在可见视图里那个模块根本不存在，两种情形区分不开。所以管理面
+// 单独给一条全量读路径，且与写端点同样只在测试态挂载。
+//
+// POST 的顺序是有意的：先 Upsert（新条目一律 enabled）再 SetEnabled(false)，这样「登记同时
 // 禁用」能一次请求表达完；而只给 enabled 的请求绝不动地址。
 func (s *Server) serveAdminModules(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, modulesResponse{Modules: s.modules.List()})
+		return
+	case http.MethodPost:
+		// 写端点：继续走下面的校验。
+	default:
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 		return
 	}
 	if perr := preflight(r); perr != nil {
