@@ -4,11 +4,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"tenon.dev/internal/controlplane/registrylog"
 )
 
 // ids 抽出 ID 序列，便于断言顺序。
@@ -350,5 +354,191 @@ func TestManualDisableIsSticky(t *testing.T) {
 	}
 	if got := len(r.Enabled()); got != 0 {
 		t.Fatalf("人工 disable 必须粘性，得到可见 %d", got)
+	}
+}
+
+// logEvents 读出事件链里的「事件/模块」序列。
+//
+// 断「只在跃迁时写」用序列比数行数直观：多记一次心跳就会立刻在序列里多出一个
+// registered/inventory，而不是只差一个数字。
+func logEvents(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取事件链失败：%v", err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec struct {
+			Event    string `json:"event"`
+			ModuleID string `json:"moduleId"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("事件链里有一行不是合法记录：%v（%s）", err, line)
+		}
+		out = append(out, rec.Event+"/"+rec.ModuleID)
+	}
+	return out
+}
+
+// openLoggedRegistry 起一个接了事件链的注册表。
+//
+// 测试结束前必须关掉文件句柄：Windows 上还开着的句柄会让 t.TempDir 的清理失败，
+// 于是「用例全绿、清理报错」。
+func openLoggedRegistry(t *testing.T) (*Registry, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "registry-events.jsonl")
+	r, err := NewRegistryWithLog(path)
+	if err != nil {
+		t.Fatalf("打开注册事件链失败：%v", err)
+	}
+	t.Cleanup(func() {
+		if err := r.Close(); err != nil {
+			t.Errorf("关闭注册事件链失败：%v", err)
+		}
+	})
+	return r, path
+}
+
+// TestRegistryLogsOnlyTransitions 是计划 Task 5 的核心用例：心跳不写，跃迁才写。
+func TestRegistryLogsOnlyTransitions(t *testing.T) {
+	r, path := openLoggedRegistry(t)
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://127.0.0.1:8081", DeclarationHash: "sha256:aaa"})
+	if got := logEvents(t, path); !slices.Equal(got, []string{"registered/inventory"}) {
+		t.Fatalf("首次登记应只有一条 registered，得到 %v", got)
+	}
+
+	// 连续 3 次成功心跳：状态没变，链上不能多出任何记录。
+	for i := 0; i < 3; i++ {
+		if ok, reason := r.Touch("inventory", "sha256:aaa"); !ok {
+			t.Fatalf("第 %d 次心跳应成功，得到 reason=%q", i+1, reason)
+		}
+	}
+	if got := logEvents(t, path); !slices.Equal(got, []string{"registered/inventory"}) {
+		t.Fatalf("三次成功心跳只应产生 1 条 registered，得到 %v", got)
+	}
+
+	// TTL 过期 → lost；重复清扫不重复记同一次失联。
+	r.DebugSetLastSeen("inventory", time.Now().Add(-time.Minute))
+	if lost := r.Sweep(time.Now()); !slices.Equal(lost, []string{"inventory"}) {
+		t.Fatalf("应标记 inventory 为 lost，得到 %v", lost)
+	}
+	if lost := r.Sweep(time.Now()); len(lost) != 0 {
+		t.Fatalf("已是 lost 的模块不应再被标记：%v", lost)
+	}
+
+	// lost → 心跳回来 → recovered。
+	if ok, reason := r.Touch("inventory", "sha256:aaa"); !ok {
+		t.Fatalf("复活心跳应成功，得到 reason=%q", reason)
+	}
+
+	want := []string{"registered/inventory", "lost/inventory", "recovered/inventory"}
+	if got := logEvents(t, path); !slices.Equal(got, want) {
+		t.Fatalf("事件序列 = %v，期望 %v", got, want)
+	}
+	if err := registrylog.Verify(path); err != nil {
+		t.Fatalf("事件链应自洽：%v", err)
+	}
+}
+
+// TestRegistryLogsReRegisteredOnHashChange 锁住「re-registered 只在声明变时记」。
+func TestRegistryLogsReRegisteredOnHashChange(t *testing.T) {
+	r, path := openLoggedRegistry(t)
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	// 同一份声明重复注册：哈希没变，不该记。
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	if got := logEvents(t, path); !slices.Equal(got, []string{"registered/inventory"}) {
+		t.Fatalf("同哈希重复注册不应多记，得到 %v", got)
+	}
+
+	// 模块升级（baseURL 变也算新声明）→ 哈希变 → re-registered。
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://y", DeclarationHash: "sha256:bbb"})
+	want := []string{"registered/inventory", "re-registered/inventory"}
+	if got := logEvents(t, path); !slices.Equal(got, want) {
+		t.Fatalf("事件序列 = %v，期望 %v", got, want)
+	}
+	if err := registrylog.Verify(path); err != nil {
+		t.Fatalf("事件链应自洽：%v", err)
+	}
+}
+
+// TestRegistryLogsRecoveredOnReRegister：失联的模块带着同一份声明重新注册（比如它没收到
+// 409 而是自己重启了）时，状态确实从 lost 回到 alive，链上就必须留一条 recovered——
+// 否则日志会一直宣称它失联。
+func TestRegistryLogsRecoveredOnReRegister(t *testing.T) {
+	r, path := openLoggedRegistry(t)
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	r.DebugSetLastSeen("inventory", time.Now().Add(-time.Minute))
+	r.Sweep(time.Now())
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+
+	want := []string{"registered/inventory", "lost/inventory", "recovered/inventory"}
+	if got := logEvents(t, path); !slices.Equal(got, want) {
+		t.Fatalf("事件序列 = %v，期望 %v", got, want)
+	}
+}
+
+// TestRegistryLogsManualToggle：人工开关也是跃迁，且幂等重复设置不该被记成两次决策。
+func TestRegistryLogsManualToggle(t *testing.T) {
+	r, path := openLoggedRegistry(t)
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	if err := r.SetEnabled("inventory", false); err != nil {
+		t.Fatalf("摘除失败：%v", err)
+	}
+	if err := r.SetEnabled("inventory", false); err != nil {
+		t.Fatalf("重复摘除应幂等：%v", err)
+	}
+	if err := r.SetEnabled("inventory", true); err != nil {
+		t.Fatalf("启用失败：%v", err)
+	}
+
+	want := []string{"registered/inventory", "manual-disabled/inventory", "manual-enabled/inventory"}
+	if got := logEvents(t, path); !slices.Equal(got, want) {
+		t.Fatalf("事件序列 = %v，期望 %v", got, want)
+	}
+	if err := registrylog.Verify(path); err != nil {
+		t.Fatalf("事件链应自洽：%v", err)
+	}
+}
+
+// TestRegistryLogFailureDoesNotChangeBusinessResult：观测面坏了不是业务面坏了的理由
+// （spec §7）。事件一条都写不进去时，注册/心跳/清扫/开关仍必须按语义工作。
+func TestRegistryLogFailureDoesNotChangeBusinessResult(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry-events.jsonl")
+	r, err := NewRegistryWithLog(path)
+	if err != nil {
+		t.Fatalf("打开注册事件链失败：%v", err)
+	}
+	// 关掉日志句柄，模拟「事件链写不进去」（磁盘满、权限变化都是这个后果）。
+	if err := r.Close(); err != nil {
+		t.Fatalf("关闭事件链失败：%v", err)
+	}
+
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://x", DeclarationHash: "sha256:aaa"})
+	if got := len(r.Enabled()); got != 1 {
+		t.Fatalf("注册仍应生效，得到可见 %d", got)
+	}
+	if ok, reason := r.Touch("inventory", "sha256:aaa"); !ok {
+		t.Fatalf("心跳仍应成功，得到 reason=%q", reason)
+	}
+	if err := r.SetEnabled("inventory", false); err != nil {
+		t.Fatalf("摘除仍应成功：%v", err)
+	}
+	if got := len(r.Enabled()); got != 0 {
+		t.Fatalf("摘除仍应生效，得到可见 %d", got)
+	}
+	if lost := r.Sweep(time.Now().Add(2 * DefaultTTL)); len(lost) != 1 {
+		t.Fatalf("清扫仍应把失联模块判成 lost：%v", lost)
+	}
+
+	// 事件一条也没落盘；空链本身是自洽的，所以 Verify 通过。
+	if got := logEvents(t, path); len(got) != 0 {
+		t.Fatalf("日志已失效，不应写出任何事件：%v", got)
+	}
+	if err := registrylog.Verify(path); err != nil {
+		t.Fatalf("空链应通过校验：%v", err)
 	}
 }

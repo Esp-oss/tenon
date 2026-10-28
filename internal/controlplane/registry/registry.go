@@ -14,18 +14,23 @@
 // 注册只有一条路径：模块自己 POST 申报。没有启动配置、没有 static 条目、没有环境变量
 // （D5）——不心跳的模块就是不可见，没有例外。
 //
-// 两条约束写死在这里：
+// 三条约束写死在这里：
 //   - 不持久化（D6）。进程重启即回到空表，模块在下一个心跳周期内收到 409 重申报后回来。
 //   - 并发安全。HTTP 处理、后台清扫与测试并发读写，所有方法共用一把 sync.RWMutex。
+//   - 事件链只记跃迁。表本身不落盘，但「谁在什么时候注册/失联/被摘除」要留痕：可选的
+//     registrylog 哈希链在每次状态跃迁时写一条，心跳本身不写（见 logEvent）。
 package registry
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"time"
+
+	"tenon.dev/internal/controlplane/registrylog"
 )
 
 // ErrNotFound 表示 SetEnabled 指定的模块从未登记过。
@@ -73,11 +78,61 @@ type ModuleEntry struct {
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]ModuleEntry
+	// Log 是可选的注册事件链。nil 表示不记录（单测与不需要审计面的进程）。
+	//
+	// 字段是导出的，但**必须在并发使用之前**装配好（host 启动期，或直接走
+	// NewRegistryWithLog）；注册表不会为它加第二把锁——跃迁与写事件本来就在同一把
+	// 写锁下串行。
+	Log *registrylog.Log
 }
 
 // NewRegistry 返回一个空注册表。
 func NewRegistry() *Registry {
 	return &Registry{entries: make(map[string]ModuleEntry)}
+}
+
+// NewRegistryWithLog 返回一个把注册事件写进 path 的注册表——host 的接线入口。
+//
+// 为什么由注册表自己开日志，而不是让装配方先 Open 再塞进来：注册表是唯一知道「什么算
+// 跃迁」的地方，日志跟它一起构造就不会出现「表在跳、日志没人接」的静默状态（spec D7 对
+// 「静默不可用」零容忍）。打开失败必须让它失败：宁可起不来，也不要在没有事件链的情况下
+// 跑起来冒充有审计面。
+//
+// 返回的 *Registry 持有文件句柄，进程退出前应调用 Close。
+func NewRegistryWithLog(path string) (*Registry, error) {
+	l, err := registrylog.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	r := NewRegistry()
+	r.Log = l
+	return r, nil
+}
+
+// Close 关闭事件链文件；没接日志时是空操作。表本身不落盘，关掉之后注册/心跳照常工作，
+// 只是不再有事件记录。
+func (r *Registry) Close() error {
+	if r.Log == nil {
+		return nil
+	}
+	return r.Log.Close()
+}
+
+// logEvent 把一条跃迁写进事件链。调用方必须已持有写锁。
+//
+// 在锁内写文件是刻意的：这样日志顺序与跃迁顺序一致，两个并发跃迁不会把事件写反。代价是
+// 跃迁期间写锁被 I/O 占着——但跃迁本来就稀疏（注册一次、失联一次、人工开关一次），而
+// 5s 一次的心跳路径根本不写日志。
+//
+// 写失败只记一行 stderr，不改变方法的返回值：事件链是观测面，注册/心跳的成败由注册表
+// 说了算（spec §7）。链坏了要人去修，不该让模块因此注册不上。
+func (r *Registry) logEvent(ev registrylog.Event) {
+	if r.Log == nil {
+		return
+	}
+	if err := r.Log.Append(ev, time.Now()); err != nil {
+		log.Printf("registry: 写入注册事件失败（%s/%s）：%v", ev.Event, ev.ModuleID, err)
+	}
 }
 
 // Upsert 登记一个新模块，或更新已登记模块的地址。
@@ -93,6 +148,11 @@ func NewRegistry() *Registry {
 //
 // 空 ID 被丢弃也同样是有意的：注册表不存无名条目，否则 GET /tenon/modules 会吐
 // 出 id 为空的记录。校验归 HTTP 层（应当回 400），这里只保证表本身干净。
+//
+// 事件链上，这是唯一会「让模块从无到有」的入口：新建记 registered，声明哈希变了记
+// re-registered（spec §7），哈希没变就什么都不记——重复注册不该把日志刷成噪声。
+// 顺带一提，注册本身就是「现在是 alive 的证据」，所以一个 lost 的模块以相同哈希重新注册
+// 只记 recovered，不额外记一条「复活」。
 func (r *Registry) Upsert(e ModuleEntry) {
 	if e.ID == "" {
 		return
@@ -104,6 +164,13 @@ func (r *Registry) Upsert(e ModuleEntry) {
 	}
 	now := time.Now()
 	if cur, ok := r.entries[e.ID]; ok {
+		kind := ""
+		switch {
+		case cur.DeclarationHash != e.DeclarationHash:
+			kind = registrylog.EventReRegistered
+		case cur.State != "" && cur.State != StateAlive:
+			kind = registrylog.EventRecovered
+		}
 		cur.BaseURL = e.BaseURL
 		cur.DeclarationHash = e.DeclarationHash
 		cur.Manifest = e.Manifest
@@ -111,12 +178,16 @@ func (r *Registry) Upsert(e ModuleEntry) {
 		cur.State = StateAlive
 		cur.LastSeen = now
 		r.entries[e.ID] = cur
+		if kind != "" {
+			r.logEvent(registrylog.Event{Event: kind, ModuleID: e.ID, DeclarationHash: cur.DeclarationHash})
+		}
 		return
 	}
 	e.Enabled = true
 	e.State = StateAlive
 	e.LastSeen = now
 	r.entries[e.ID] = e
+	r.logEvent(registrylog.Event{Event: registrylog.EventRegistered, ModuleID: e.ID, DeclarationHash: e.DeclarationHash})
 }
 
 // SetEnabled 打开或关闭一个已登记模块。
@@ -134,6 +205,12 @@ func (r *Registry) SetEnabled(id string, enabled bool) error {
 	if cur.Enabled != enabled {
 		cur.Enabled = enabled
 		r.entries[id] = cur
+		kind := registrylog.EventManualDisabled
+		if enabled {
+			kind = registrylog.EventManualEnabled
+		}
+		// 只有真的变了才写：重复点两次开关是同一个决策，链上留两条会让人以为发生了两次。
+		r.logEvent(registrylog.Event{Event: kind, ModuleID: id, DeclarationHash: cur.DeclarationHash})
 	}
 	return nil
 }
@@ -183,6 +260,9 @@ func (r *Registry) snapshot(onlyEnabled bool) []ModuleEntry {
 //   - "declaration-changed"：申报的声明哈希与登记的不一致（模块升级了或者发错了）。
 //
 // 注意：Touch 不改变 Enabled——人工摘除是粘性的，心跳救不回来。
+//
+// 事件链上只有 lost → alive 这一次跃迁记 recovered；已经 alive 的心跳成功什么都不写，
+// 否则 3 个模块 × 每 5s 就能把日志刷成几万行，真正的断裂埋在噪声里。
 func (r *Registry) Touch(id, hash string) (bool, string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -193,14 +273,21 @@ func (r *Registry) Touch(id, hash string) (bool, string) {
 	if cur.DeclarationHash != "" && hash != cur.DeclarationHash {
 		return false, "declaration-changed"
 	}
+	wasLost := cur.State != "" && cur.State != StateAlive
 	cur.State = StateAlive
 	cur.LastSeen = time.Now()
 	r.entries[id] = cur
+	if wasLost {
+		r.logEvent(registrylog.Event{Event: registrylog.EventRecovered, ModuleID: id, DeclarationHash: cur.DeclarationHash})
+	}
 	return true, ""
 }
 
 // Sweep 把超过 TTL 没心跳的模块标记为 lost，返回被标记的 id（按字典序）。
 // 只改存活状态，不动 Enabled——人工开关的语义不受 TTL 影响。
+//
+// 每个转 lost 的模块写一条事件；已经是 lost 的跳过，所以清扫循环每 5s 跑一次也不会
+// 重复记同一次失联。
 func (r *Registry) Sweep(now time.Time) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -216,6 +303,11 @@ func (r *Registry) Sweep(now time.Time) []string {
 		}
 	}
 	sort.Strings(lost)
+	// 排序之后才写事件：map 遍历顺序随机，日志顺序也该稳定，否则同样的状态两次清扫会
+	// 写出顺序不同的链（链本身仍然有效，但人没法比对）。
+	for _, id := range lost {
+		r.logEvent(registrylog.Event{Event: registrylog.EventLost, ModuleID: id, DeclarationHash: r.entries[id].DeclarationHash})
+	}
 	return lost
 }
 
