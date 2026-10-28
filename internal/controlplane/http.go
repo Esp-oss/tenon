@@ -13,7 +13,7 @@
 //	GET  /tenon/audit?planId=&since=&limit= 审计查询（游标是写入顺序序号）
 //	POST /tenon/registry/register          模块自注册（HMAC 验签 + 声明哈希校验）
 //	POST /tenon/registry/heartbeat         模块心跳（HMAC 验签；不同步时 409 要求重申报）
-//	GET  /tenon/modules                    注册表（管理面视图，含已摘除条目）
+//	GET  /tenon/modules                    注册表可见视图（只含 enabled && alive）
 //	GET  /healthz                          存活探针（不检查依赖）
 //	GET  /readyz                           就绪探针（审计可写 + 策略可用）
 //	POST /tenon/intents                    共驾帧入队
@@ -43,8 +43,9 @@
 //     时按 1 计（宁可多占配额，也不给「无法计量」留一个免费口子）；
 //   - **协议版本头**：host 端点全部宽松处理（缺失视为 0.1，存在且不是 0.1 则 400），
 //     响应一律带 Tenon-Version/Tenon-Min-Version。本轮只实现 0.1，不做版本协商；
-//   - **GET /tenon/modules 返回管理面视图**（registry.List，含 enabled=false 的条目）：
-//     D1 的 B 轮要能看见「被摘除」这件事。调用方（agent）按 enabled 过滤后再做能力发现；
+//   - **GET /tenon/modules 只返回可见条目**（registry.Enabled，`enabled && alive`，D5）：
+//     没有 static 例外——不心跳的模块就是看不见。管理面视图（含已摘除条目）只在测试面的
+//     POST /tenon/admin/modules 的回执里给，且那个端点仅 TENON_TEST_MODE=1 挂载；
 //   - **注册/心跳的鉴权失败回 401，不回 400/403**：这是「你是谁」的问题，混进报文校验
 //     （400）或权限判定（403）会让对端按错的方向修。理由再分三档（format/expired/invalid）
 //     并写进 details.reason：缺签名、密钥不一致、时钟漂移三种原因的处置完全不同；
@@ -159,8 +160,13 @@ type Config struct {
 	Subjects map[string][]string
 	// AuditPath 是审计 JSONL 路径，必填：审计链是宿主唯一不可省的持久状态。
 	AuditPath string
-	// Modules 是启动时登记的模块（TENON_MODULES 的解析结果）。
-	Modules []registry.ModuleEntry
+	// Registry 是模块注册表的共享实例，可为 nil（本包自建一个空表）。
+	//
+	// 装配侧（cmd/host）需要它来做加载期的业务规则校验（要按模块取 baseURL 拉动作定义），
+	// 而运行期的可见性看的是同一张表——传同一个实例，加载期与运行期就只有一份真相。
+	// 注册本身仍只有 module 自注册一条路径（D5）：这里给的是**表**，不是静态条目，
+	// 空的进来就是空的，没有任何「启动即登记」的捷径。
+	Registry *registry.Registry
 	// HMACSecret 是模块自注册/心跳两个端点的共享密钥（EnvHMACSecretFile 的内容）。
 	//
 	// 为空时这两个端点回 503 而不是 404：路径存在、只是没配密钥。生产由 cmd/host 在
@@ -229,6 +235,12 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("controlplane: %w", err)
 	}
+	// 注册表由装配方给就用它的（加载期规则校验与运行期可见性共用一份），否则自建空表。
+	// 两条路径都是**空表起步**：注册只有模块自注册一条，本包不提供任何静态登记入口。
+	modules := cfg.Registry
+	if modules == nil {
+		modules = registry.NewRegistry()
+	}
 	s := &Server{
 		policyEngine: policy.NewPolicyEngine(cfg.Policies),
 		// WithSubjects 显式装配（传空表也一样）：交集规则要求「委托人有权」，
@@ -236,7 +248,7 @@ func New(cfg Config) (*Server, error) {
 		grantEngine: grant.NewGrantEngine(cfg.Grants, grant.WithSubjects(cfg.Subjects)),
 		auditStore:  store,
 		auditPath:   cfg.AuditPath,
-		modules:     registry.NewRegistry(),
+		modules:     modules,
 		testMode:    cfg.TestMode,
 		hmacSecret:  cfg.HMACSecret,
 		intents:     newMemoryQueue(maxIntentFrames),
@@ -247,9 +259,6 @@ func New(cfg Config) (*Server, error) {
 		uiDir:          cfg.UIDir,
 		// 公告板是纯内存 read-model：可丢、可重建，重建靠 agent 每 tick 的幂等 upsert。
 		pending: newPendingBoard(),
-	}
-	for _, entry := range cfg.Modules {
-		s.modules.Upsert(entry)
 	}
 	// 会话密钥没有安全缺省值：空密钥签出的 token 任何人都能伪造，宁可拒绝启动。
 	// 关掉审计句柄再返回，否则调用方拿不到 Server，文件却已经被这个失败的构造打开。
@@ -888,19 +897,26 @@ func parseLimit(raw string) (int, *protocol.Error) {
 
 // ---------- 注册表 ----------
 
-// modulesResponse 是 GET /tenon/modules 的响应体。用结构体包一层而不是直接输出数组，
-// 是为了留出后续加字段的余地（0.1 的 module-manifest 与注册表都在长）。
+// modulesResponse 是 GET /tenon/modules 与 admin 端点的响应体。用结构体包一层而不是
+// 直接输出数组，是为了留出后续加字段的余地（0.1 的 module-manifest 与注册表都在长）。
+//
+// 同一个结构体承载两个视图：GET 给 Enabled()（可见），admin 给 List()（全量，含 disabled/lost），
+// 调用方按端点区分。真正的契约约束在 http.go 的端点注释里，别只看字段名。
 type modulesResponse struct {
 	Modules []registry.ModuleEntry `json:"modules"`
 }
 
-// serveModules 返回管理面视图：含 enabled=false 的条目（D1 的 B 轮要看得见「被摘除」）。
+// serveModules 返回**可见**条目：enabled && alive（D5，无 static 例外）。
+//
+// 用的是 Enabled() 而不是 List()：不心跳的模块、以及被人工摘掉的模块，都不该出现在
+// agent 的能力发现里——「注册表里有一条」不等于「它现在在场」。管理面要看全量（含
+// disabled/lost）就走测试面的 POST /tenon/admin/modules 回执，那里编码 List()。
 func (s *Server) serveModules(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
 		return
 	}
-	writeJSON(w, http.StatusOK, modulesResponse{Modules: s.modules.List()})
+	writeJSON(w, http.StatusOK, modulesResponse{Modules: s.modules.Enabled()})
 }
 
 // adminModulesRequest 是 POST /tenon/admin/modules 的请求体。
@@ -973,13 +989,20 @@ func (s *Server) serveAdminModules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 回执给全量（List）：D1 的 B 轮摘掉模块后要能看见「条目还在、只是不可见」，
+	// 这与 GET /tenon/modules 的可见视图是两件事。
 	writeJSON(w, http.StatusOK, modulesResponse{Modules: s.modules.List()})
 }
 
-// normalizeBaseURL 校验并规范化管理面给的模块地址。
+// normalizeBaseURL 校验并规范化模块地址（注册端点与测试面的 admin 端点共用这一份）。
 //
-// 规则与 registry 里那份一致（http/https、有主机名、无查询串或锚点、去掉结尾 '/'），
-// 但 registry 没有导出它，而管理面必须自己给出 400 的理由与字段名，所以这里重写一份。
+// 规则：只接受 http/https（模块是进程间 HTTP 调用，别的 scheme 一定是用错了）、必须有
+// 主机名、不许带查询串或锚点（地址随后要往上拼 /tenon/actions/...，带这类尾巴拼出来
+// 必然是错的）、去掉结尾的单个 '/'（避免双斜杠）。允许带路径前缀，网关部署时模块就挂在
+// /inventory 之下。
+//
+// 放在本包而不是 registry：校验失败要回 400 且点名 baseURL 字段，而 registry 只存值、
+// 不产生 HTTP 语义。TENON_MODULES 移除后这里是**唯一**一份模块地址校验实现（D5）。
 func normalizeBaseURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

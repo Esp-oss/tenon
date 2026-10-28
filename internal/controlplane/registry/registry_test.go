@@ -194,8 +194,8 @@ func TestListOrderStableAndSorted(t *testing.T) {
 	}
 }
 
-// TestEmptyRegistryJSON 锁住空注册表序列化成 []（而不是 null），
-// 因为 GET /tenon/modules 直接编码 List()。
+// TestEmptyRegistryJSON 锁住空注册表序列化成 []（而不是 null）：
+// GET /tenon/modules 直接编码 Enabled()，测试面的 admin 端点编码 List()，两个都不能是 null。
 func TestEmptyRegistryJSON(t *testing.T) {
 	r := NewRegistry()
 	for name, entries := range map[string][]ModuleEntry{
@@ -234,152 +234,6 @@ func TestEmptyRegistryJSON(t *testing.T) {
 	}
 	if _, ok := e["declarationHash"]; ok {
 		t.Fatalf("空声明哈希不应出现在线上形状里：%s", b)
-	}
-}
-
-// TestParseModules 覆盖 TENON_MODULES 的正常与各类坏输入。
-// wantErr 里的每一段都必须出现在错误信息里——「指出哪一项」是硬要求。
-func TestParseModules(t *testing.T) {
-	cases := []struct {
-		name    string
-		in      string
-		want    []ModuleEntry
-		wantErr []string
-	}{
-		{
-			name: "正常两项",
-			in:   "inventory=http://i:8081,procurement=http://p:8082",
-			want: []ModuleEntry{
-				{ID: "inventory", BaseURL: "http://i:8081", Enabled: true},
-				{ID: "procurement", BaseURL: "http://p:8082", Enabled: true},
-			},
-		},
-		{
-			name: "空串即无模块",
-			in:   "",
-			want: nil,
-		},
-		{
-			name: "只有逗号与空白",
-			in:   " , ,  ",
-			want: nil,
-		},
-		{
-			name: "多余空格与尾逗号",
-			in:   "  inventory = http://i:8081 ,  procurement=http://p:8082 , ",
-			want: []ModuleEntry{
-				{ID: "inventory", BaseURL: "http://i:8081", Enabled: true},
-				{ID: "procurement", BaseURL: "http://p:8082", Enabled: true},
-			},
-		},
-		{
-			name: "地址末尾斜杠去掉",
-			in:   "inventory=http://i:8081/",
-			want: []ModuleEntry{{ID: "inventory", BaseURL: "http://i:8081", Enabled: true}},
-		},
-		{
-			name: "保留路径前缀",
-			in:   "inventory=https://gw.example.com/inventory",
-			want: []ModuleEntry{{ID: "inventory", BaseURL: "https://gw.example.com/inventory", Enabled: true}},
-		},
-		{
-			name:    "缺等号",
-			in:      "inventory",
-			wantErr: []string{"第 1 项", "inventory", "'='"},
-		},
-		{
-			name:    "id 为空",
-			in:      "=http://i:8081",
-			wantErr: []string{"第 1 项", "id 为空"},
-		},
-		{
-			name:    "地址为空",
-			in:      "inventory=",
-			wantErr: []string{"第 1 项", "地址为空"},
-		},
-		{
-			name:    "非法 URL 指出第 2 项",
-			in:      "inventory=http://i:8081,procurement=://bad",
-			wantErr: []string{"第 2 项", "procurement=://bad", "不是合法 URL"},
-		},
-		{
-			name:    "scheme 不是 http",
-			in:      "inventory=ftp://i:8081",
-			wantErr: []string{"第 1 项", "scheme"},
-		},
-		{
-			name:    "缺主机名",
-			in:      "inventory=http://",
-			wantErr: []string{"第 1 项", "缺少主机名"},
-		},
-		{
-			name:    "带查询串",
-			in:      "inventory=http://i:8081?x=1",
-			wantErr: []string{"第 1 项", "查询串"},
-		},
-		{
-			name:    "id 重复",
-			in:      "inventory=http://i:8081, inventory=http://i:9091",
-			wantErr: []string{"第 2 项", "重复", "inventory"},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := ParseModules(tc.in)
-			if len(tc.wantErr) > 0 {
-				if err == nil {
-					t.Fatalf("ParseModules(%q) 应报错，却得到 %+v", tc.in, got)
-				}
-				for _, frag := range tc.wantErr {
-					if !strings.Contains(err.Error(), frag) {
-						t.Fatalf("错误信息缺少 %q：%v", frag, err)
-					}
-				}
-				if got != nil {
-					t.Fatalf("出错时应返回 nil 切片，得到 %+v", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("ParseModules(%q) 不该报错：%v", tc.in, err)
-			}
-			if !sameModules(got, tc.want) {
-				t.Fatalf("ParseModules(%q) = %+v，期望 %+v", tc.in, got, tc.want)
-			}
-			for _, e := range got {
-				if e.ID == "" || e.BaseURL == "" || !e.Enabled {
-					t.Fatalf("解析出的条目不应是零值：%+v", e)
-				}
-			}
-		})
-	}
-}
-
-// TestParseModulesFeedsRegistry 把启动路径与 D1 的 B 轮串起来：
-// 解析 → 登记 → 摘除 → agent 侧可见清单缩小。
-func TestParseModulesFeedsRegistry(t *testing.T) {
-	entries, err := ParseModules("procurement=http://p:8082,inventory=http://i:8081")
-	if err != nil {
-		t.Fatalf("ParseModules: %v", err)
-	}
-	r := NewRegistry()
-	for _, e := range entries {
-		r.Upsert(e)
-	}
-	if got := ids(r.Enabled()); !slices.Equal(got, []string{"inventory", "procurement"}) {
-		t.Fatalf("登记后 Enabled() = %v", got)
-	}
-
-	// D1 的 B 轮：摘掉 procurement，agent 就只剩 inventory。
-	if err := r.SetEnabled("procurement", false); err != nil {
-		t.Fatalf("摘除失败：%v", err)
-	}
-	if got := ids(r.Enabled()); !slices.Equal(got, []string{"inventory"}) {
-		t.Fatalf("摘除后 Enabled() = %v", got)
-	}
-	if got := len(r.List()); got != 2 {
-		t.Fatalf("摘除后管理面仍应看到 2 条，得到 %d", got)
 	}
 }
 
@@ -497,17 +351,4 @@ func TestManualDisableIsSticky(t *testing.T) {
 	if got := len(r.Enabled()); got != 0 {
 		t.Fatalf("人工 disable 必须粘性，得到可见 %d", got)
 	}
-}
-
-// sameModules 比较两份模块清单的「契约字段」；ModuleEntry 含 slice 字段，不可直接比较。
-func sameModules(a, b []ModuleEntry) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].ID != b[i].ID || a[i].BaseURL != b[i].BaseURL || a[i].Enabled != b[i].Enabled {
-			return false
-		}
-	}
-	return true
 }

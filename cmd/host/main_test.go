@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -9,7 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"tenon.dev/internal/controlplane/registry"
 )
 
 // setHMACSecretFile 给测试注入一份临时共享密钥文件。
@@ -55,8 +60,11 @@ func TestLoadConfigWiresInboundSurface(t *testing.T) {
 		t.Fatalf("写账号失败：%v", err)
 	}
 
-	// TENON_MODULES 的线上格式是 id=url（registry.ParseModules），不是 JSON 数组。
-	t.Setenv("TENON_MODULES", "procurement="+mod.URL)
+	// 模块不再是环境变量：注册表实例从小起，先 Upsert 再 loadConfig。
+	// 加载期校验业务规则要按模块取 baseURL（GET /tenon/actions/{id}），这正是注册表
+	// 与装配共享同一个实例的原因——生产里这张表在 host 起来时是空的，模块自注册后才满。
+	modules := registry.NewRegistry()
+	modules.Upsert(registry.ModuleEntry{ID: "procurement", BaseURL: mod.URL})
 	t.Setenv("TENON_SKILLS_DIR", filepath.Join(dir, "skills"))
 	t.Setenv("TENON_USERS_FILE", users)
 	t.Setenv("TENON_SESSION_SECRET", "test-secret")
@@ -65,7 +73,7 @@ func TestLoadConfigWiresInboundSurface(t *testing.T) {
 	t.Setenv("TENON_REQUIRE_TRIGGER", "1")
 	t.Setenv("TENON_STRICT_RULES", "1")
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfig(modules)
 	if err != nil {
 		t.Fatalf("装配失败：%v", err)
 	}
@@ -95,7 +103,7 @@ func TestLoadConfigWarnsOnRequireTrigger(t *testing.T) {
 
 	t.Setenv("TENON_REQUIRE_TRIGGER", "1")
 	t.Setenv("TENON_SESSION_SECRET", "s")
-	cfg, err := loadConfig()
+	cfg, err := loadConfig(registry.NewRegistry())
 	if err != nil {
 		t.Fatalf("装配失败：%v", err)
 	}
@@ -132,7 +140,7 @@ func TestLoadConfigFailsWithoutUsableHMACSecret(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			t.Setenv("TENON_HMAC_SECRET_FILE", c.value)
-			cfg, err := loadConfig()
+			cfg, err := loadConfig(registry.NewRegistry())
 			if err == nil {
 				t.Fatalf("缺可用密钥时必须启动失败，实际装配出了 cfg=%+v", cfg)
 			}
@@ -158,4 +166,80 @@ func TestLoadHMACSecretStripsBOMAndLineEnding(t *testing.T) {
 	if string(got) != "s3cr3t" {
 		t.Fatalf("密钥应是去 BOM、去行尾的 s3cr3t，得到 %q", got)
 	}
+}
+
+// 失联判定必须有唯一的后台判定点：注册表自己不会变旧，没人扫表的话，5 秒前就死掉的
+// 模块会永远保持 alive，agent 的能力发现就会把回合打到死地址上。
+//
+// 用例覆盖三件事：①过期条目被扫成 lost（并留一行日志，下一轮要进事件链）；②lost 不等于
+// 删除——List() 仍看得见它、只是 Enabled() 不再返回；③ctx 取消后循环真的停了，不留一个
+// 继续改状态的悬挂 goroutine。TTL 是包常量（15s），所以用 DebugSetLastSeen 把时间拨回
+// 过去，而不是真的等三个心跳。
+//
+// 注意日志是**另一个 goroutine** 写的：所以缓冲区必须带锁，并且要等到「状态变了 + 日志
+// 出现了」两个条件同时成立——只看 Enabled() 会在日志落盘之前就断言，跑 -count=5 就会闪红。
+func TestSweepRegistryMarksLostAndStopsOnCancel(t *testing.T) {
+	var buf syncBuffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	reg := registry.NewRegistry()
+	reg.Upsert(registry.ModuleEntry{ID: "inventory", BaseURL: "http://127.0.0.1:8081"})
+	reg.DebugSetLastSeen("inventory", time.Now().Add(-time.Minute))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sweepRegistry(ctx, reg, 5*time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !(len(reg.Enabled()) == 0 && strings.Contains(buf.String(), "inventory")) {
+		if time.Now().After(deadline) {
+			t.Fatalf("清扫循环没把过期模块判成 lost 并留日志：Enabled() 剩 %d 条，日志：%q",
+				len(reg.Enabled()), buf.String())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if list := reg.List(); len(list) != 1 || list[0].State != registry.StateLost {
+		t.Fatalf("List 应保留条目并标记 lost（失联不是删除）：%+v", list)
+	}
+
+	// 取消后先给它足够时间跑到 ctx.Done 分支，再投放一个同样过期的条目：
+	// 顺序是刻意的——先停干净再投放，才不会把「刚好扫了一次」误判成「循环没停」。
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+	buf.Reset()
+	reg.Upsert(registry.ModuleEntry{ID: "procurement", BaseURL: "http://127.0.0.1:8082"})
+	reg.DebugSetLastSeen("procurement", time.Now().Add(-time.Minute))
+	time.Sleep(50 * time.Millisecond)
+	if got := len(reg.Enabled()); got != 1 {
+		t.Fatalf("ctx 取消后清扫循环仍在跑：procurement 也被判成 lost（Enabled()=%d）", got)
+	}
+	if log := buf.String(); strings.Contains(log, "procurement") {
+		t.Fatalf("ctx 取消后仍在写日志：%s", log)
+	}
+}
+
+// syncBuffer 是带锁的 bytes.Buffer：清扫循环在另一个 goroutine 里写日志，测试这边同时
+// 读，裸的 bytes.Buffer 既是数据竞争，也会让「日志还没落盘」看起来像「没有日志」。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
 }

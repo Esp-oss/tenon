@@ -2,27 +2,28 @@
 //
 // 它只回答一个问题：现在有哪些模块、各自在哪、是否参与调度。消费方有四个：
 //
-//   - GET /tenon/modules（管理面）→ List()，看得见全部，含已摘除的；
-//   - agent 的能力发现 → Enabled()，只看得见还在场的模块；
+//   - 注册/心跳端点（POST /tenon/registry/register|heartbeat）→ Upsert / Touch；
+//   - GET /tenon/modules 与 agent 的能力发现 → Enabled()，只看得见「活着且没被人工摘掉」的；
 //   - POST /tenon/admin/modules（仅 TENON_TEST_MODE=1）→ Upsert / SetEnabled；
-//   - cmd/host 启动时的 TENON_MODULES → ParseModules() 后逐个 Upsert。
+//   - cmd/host 的后台清扫循环（每 HeartbeatInterval 一次）→ Sweep，把失联的判成 lost。
 //
 // 设计文档 §3 的 D1 靠「摘除模块」而不是「改 agent」：SetEnabled(id, false) 把条目
 // 留在表里但让它从 Enabled() 里消失，于是同一事件下 agent 能看到的模块不同，而 agent
 // 一行代码都不用动。
 //
+// 注册只有一条路径：模块自己 POST 申报。没有启动配置、没有 static 条目、没有环境变量
+// （D5）——不心跳的模块就是不可见，没有例外。
+//
 // 两条约束写死在这里：
-//   - 不持久化。M0.5 明确是内存态，进程重启即回到启动配置。
-//   - 并发安全。HTTP 处理与测试并发读写，所有方法共用一把 sync.RWMutex。
+//   - 不持久化（D6）。进程重启即回到空表，模块在下一个心跳周期内收到 409 重申报后回来。
+//   - 并发安全。HTTP 处理、后台清扫与测试并发读写，所有方法共用一把 sync.RWMutex。
 package registry
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -38,8 +39,17 @@ const (
 	StateAlive = "alive"
 	StateLost  = "lost"
 
-	// DefaultTTL 是心跳过期时间：3 个心跳周期（5s）。
-	DefaultTTL = 15 * time.Second
+	// HeartbeatInterval 是模块心跳间隔，也是 host 后台清扫循环的节拍。
+	//
+	// host（判定失联）与模块侧（推送心跳）共用这一个常量：两边各写一个 5 * time.Second
+	// 字面量，将来只改一处就会让「几个心跳算过期」的语义悄悄失准。
+	HeartbeatInterval = 5 * time.Second
+
+	// DefaultTTL 是心跳过期时间：3 个心跳周期。
+	//
+	// 允许连丢两次心跳才判 lost：单次丢包、一次 GC 停顿或调度抖动不该让模块从能力
+	// 清单里消失（那会让 agent 的规划凭空少一个模块）；而连丢三次基本就是进程没了。
+	DefaultTTL = 3 * HeartbeatInterval
 )
 
 // ModuleEntry 是注册表里的一行，也是 GET /tenon/modules 的响应元素。
@@ -220,73 +230,4 @@ func (r *Registry) DebugSetLastSeen(id string, at time.Time) {
 	}
 	cur.LastSeen = at
 	r.entries[id] = cur
-}
-
-// ParseModules 解析启动配置 TENON_MODULES 的 id=url,id=url 形式，返回一份待
-// Upsert 的条目（全部 enabled，登记即参与调度）。
-//
-// 容错边界都是刻意选的，宁可少猜也不要猜错：
-//   - 空串、只有逗号和空白 → 无模块，返回空切片且不报错（「没配」是合法状态）；
-//   - 空项（连续逗号、首尾逗号）跳过，不算错误；
-//   - 每项、id、url 三段的两端空白都裁掉，" a = http://x " 等价于 "a=http://x"；
-//   - 地址末尾的单个 '/' 去掉，避免后续拼 /tenon/... 时出现双斜杠；
-//   - 其余一律报错并指明「第几项」与原始文本：缺 '='、id 为空、地址为空/非法/
-//     scheme 不是 http(s)/缺主机名/带查询串或锚点、id 重复。
-//
-// 最后一条（id 重复）报错而不是后者覆盖前者：配置里同名两次基本是笔误，静默覆盖
-// 只会让排查变成猜谜。要求「部分可用」的调用方应当自己降级，而不是让解析器吞错。
-func ParseModules(s string) ([]ModuleEntry, error) {
-	out := make([]ModuleEntry, 0, strings.Count(s, ",")+1)
-	seen := make(map[string]int, cap(out))
-	for i, item := range strings.Split(s, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		pos := i + 1 // 报错用 1-based 序号，与配置文本里数第几段对齐
-		id, rawURL, ok := strings.Cut(item, "=")
-		if !ok {
-			return nil, fmt.Errorf("TENON_MODULES 第 %d 项 %q 缺少 '='", pos, item)
-		}
-		id = strings.TrimSpace(id)
-		rawURL = strings.TrimSpace(rawURL)
-		if id == "" {
-			return nil, fmt.Errorf("TENON_MODULES 第 %d 项 %q 的模块 id 为空", pos, item)
-		}
-		if first, dup := seen[id]; dup {
-			return nil, fmt.Errorf("TENON_MODULES 第 %d 项 %q 与第 %d 项重复了 id %q", pos, item, first, id)
-		}
-		base, err := parseBaseURL(rawURL)
-		if err != nil {
-			return nil, fmt.Errorf("TENON_MODULES 第 %d 项 %q：%w", pos, item, err)
-		}
-		seen[id] = pos
-		out = append(out, ModuleEntry{ID: id, BaseURL: base, Enabled: true})
-	}
-	return out, nil
-}
-
-// parseBaseURL 校验并规范化一个模块基地址。
-//
-// 只接受 http/https：模块是进程间 HTTP 调用，别的 scheme 一定是用错了。
-// 允许带路径前缀（网关部署时模块挂在 /inventory 下），但不允许查询串或锚点——
-// 基地址随后要往上拼 /tenon/actions/... ，带这类尾巴拼出来必然是错的。
-func parseBaseURL(raw string) (string, error) {
-	if raw == "" {
-		return "", errors.New("模块地址为空")
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("模块地址 %q 不是合法 URL：%w", raw, err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("模块地址 %q 的 scheme 必须是 http 或 https", raw)
-	}
-	if u.Host == "" {
-		return "", fmt.Errorf("模块地址 %q 缺少主机名", raw)
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("模块地址 %q 不应带查询串或锚点", raw)
-	}
-	return strings.TrimSuffix(u.String(), "/"), nil
 }
