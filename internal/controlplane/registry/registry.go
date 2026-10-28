@@ -233,8 +233,12 @@ func (r *Registry) Upsert(e ModuleEntry) {
 			kind = registrylog.EventRecovered
 		}
 		cur.BaseURL = e.BaseURL
-		cur.DeclarationHash = e.DeclarationHash
-		cur.Manifest = e.Manifest
+		// 空哈希表示「这次调用不携带声明」（例如管理面手工 Upsert）：保留已知声明，
+		// 否则 Touch 会因「登记哈希为空」而接受任意哈希，声明校验被静默旁路一个 TTL。
+		if e.DeclarationHash != "" {
+			cur.DeclarationHash = e.DeclarationHash
+			cur.Manifest = e.Manifest
+		}
 		// 注册即视为刚心跳过：否则模块刚起来还要等一个 TTL 才可见。
 		cur.State = StateAlive
 		cur.LastSeen = now

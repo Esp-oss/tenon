@@ -36,7 +36,6 @@ services:
       TENON_GRANT_FILE: "/etc/tenon/grants.json"
       TENON_AUDIT_PATH: "/var/lib/tenon/audit-host.jsonl"
       # 注册表初始内容，形如 id=url,id=url；agent 靠 GET /tenon/modules 读它。
-      TENON_MODULES: "quote=http://quote:8083,inventory=http://inventory:8081,procurement=http://procurement:8082"
       # 仅测试拓扑：挂载 POST /tenon/admin/modules（差异测试靠它摘掉一个模块）。
       # 生产部署必须删掉这一行——该端点能改调度面。
       TENON_TEST_MODE: "1"
@@ -117,6 +116,8 @@ services:
       TENON_MODULE_ID: "quote"
       TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
       TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-quote.jsonl"
+      # R1：模块自注册（TENON_MODULES 已删除）
+      TENON_HOST: "http://host:8080"
       # 仅测试拓扑：挂载 POST /tenon/admin/reset（D1 的 A/B 两轮靠它造同一输入）。
       # 生产必须删掉——它会把幂等记账与两张事件表一起抹掉。
       TENON_TEST_MODE: "1"
@@ -146,6 +147,8 @@ services:
       TENON_MODULE_ID: "inventory"
       TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
       TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-inventory.jsonl"
+      # R1：模块自注册（TENON_MODULES 已删除）
+      TENON_HOST: "http://host:8080"
       # 仅测试拓扑：见 quote 段的说明，生产必须删掉。
       TENON_TEST_MODE: "1"
     secrets:
@@ -174,6 +177,8 @@ services:
       TENON_MODULE_ID: "procurement"
       TENON_HMAC_SECRET_FILE: "/run/secrets/tenon_hmac"
       TENON_MODULE_AUDIT_PATH: "/var/lib/tenon/audit-procurement.jsonl"
+      # R1：模块自注册（TENON_MODULES 已删除）
+      TENON_HOST: "http://host:8080"
       # 仅测试拓扑：见 quote 段的说明。D1 的 B 轮就是先 reset 再把它摘掉。
       TENON_TEST_MODE: "1"
     secrets:

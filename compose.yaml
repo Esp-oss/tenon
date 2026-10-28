@@ -95,6 +95,8 @@ services:
       # 密钥走文件不走环境变量：/readyz 的就绪判据之一就是「读得到密钥」。
       TENON_HMAC_SECRET_FILE: /run/tenon/hmac
       TENON_MODULE_AUDIT_PATH: /app/out/audit-inventory.jsonl
+      # R1 之后模块自注册：告诉它宿主在哪，起 5s 心跳（TENON_MODULES 已删除）。
+      TENON_HOST: http://host:8080
       # 与 cmd/inventory 的缺省 seed 一致，写出来是为了让「扣 12 件后剩 108」可核对。
       TENON_INVENTORY_SEED: STD-1001:120,STD-1002:3
     configs:
@@ -130,6 +132,7 @@ services:
       TENON_MODULE_ID: procurement
       TENON_HMAC_SECRET_FILE: /run/tenon/hmac
       TENON_MODULE_AUDIT_PATH: /app/out/audit-procurement.jsonl
+      TENON_HOST: http://host:8080
     configs:
       - source: tenon_hmac
         target: /run/tenon/hmac
@@ -162,8 +165,8 @@ services:
       TENON_GRANT_FILE: /app/config/grants.dev.json
       TENON_USERS_FILE: /app/config/users.dev.json
       TENON_AUDIT_PATH: /app/out/audit-host.jsonl
-      # 容器网络里用服务名。顺序无所谓，但两个模块都得在（加载期要逐个拉清单）。
-      TENON_MODULES: inventory=http://inventory:8081,procurement=http://procurement:8082
+      # 注册事件链（append-only + prevHash）：模块上下线、人工开关、规则丢弃都记在这里。
+      TENON_REGISTRY_EVENTS: /app/out/registry-events.jsonl
       # 显式写出而不是吃缺省值：缺省会退回 dev 常量并打警告，那在生产是漏洞。
       TENON_SESSION_SECRET: ${TENON_SESSION_SECRET:-tenon-dev-session-secret}
       # 复数 skills：host 读 skills/*/approval.json（业务级规则）。

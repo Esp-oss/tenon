@@ -156,12 +156,14 @@ docs/             设计文档、接口文档与架构图
 现在能验证到的最小链路（先起模块，再起 host）：
 
 ```bash
-# 1) 先起模块（各自一个终端）
-TENON_MODULE_ID=inventory PORT=8081 go run ./cmd/inventory
-# 2) 再起 host —— 顺序反了业务规则会静默不加载
+# 1) 先起 host（模块要能找到它；模块自注册后 5s 心跳，TENON_MODULES 已删除）
 TENON_USERS_FILE=config/users.dev.json TENON_SESSION_SECRET=dev \
-TENON_INBOUND_DIR=out/inbound TENON_MODULES='inventory=http://127.0.0.1:8081' \
-TENON_SKILLS_DIR=skills go run ./cmd/host
+TENON_INBOUND_DIR=out/inbound TENON_SKILLS_DIR=skills \
+TENON_HMAC_SECRET_FILE=docker/secrets/hmac.key \
+TENON_REGISTRY_EVENTS=out/registry-events.jsonl go run ./cmd/host
+# 2) 再起模块：TENON_HOST 指宿主，模块启动即注册
+TENON_HOST=http://127.0.0.1:8080 TENON_MODULE_ID=inventory PORT=8081 \
+TENON_HMAC_SECRET_FILE=docker/secrets/hmac.key go run ./cmd/inventory
 # 3) agent（需要 LLM 凭据；无凭据时用 stub，见 .githooks 旁的说明或 compose 的 smoke profile）
 TENON_HOST_URL=http://127.0.0.1:8080 TENON_ON_BEHALF_OF=user:alice \
 TENON_AGENT_ID=ag_fulfillment TENON_AGENT_STATE_DIR=out/agent-state \
@@ -252,7 +254,7 @@ dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、�
 
 > **Go host 的接收侧与 `versioning.md` §3.2 不一致**：§3.2 要求「消费方遇到未知字段必须忽略并继续」，但 `internal/spec` 的校验入口按 `additionalProperties: false` 直接拒绝（2026-10-27 加 `requiredArgs` 时，`additional properties 'requiredArgs' not allowed` 就是现场）。TS 侧（`@tenon/core` 的 `src/validate`）已按「接收侧宽松、一致性侧严格」双视图实现；**Go 侧待对齐**，修它要动校验入口并评估既有用例，需单独评估。
 
-> **DSH 还不是业务驱动（0 实现）**：全仓**没有一行 dsh/cordis 代码**；今天操作业务的是 Go 的 `cmd/agent` + `cmd/host` + 模块。最终验收（DSH 对话页驱动业务）与模块动态注册/健康检查这三条需求已记录在 [`docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md`](docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md)（R1–R3 / Q1–Q3），**均未开始**。另有两处与「插件架构」说法不符的硬耦合待修：`TENON_MODULES` 只能启动时静态注册（改模块要重启 host）、`internal/agent/skillselect.go` 的 `knownModuleNames` 硬编码模块词表（新增模块不改这里，请求回合会静默选不中 skill）。
+> **DSH 还不是业务驱动（0 实现）**：全仓**没有一行 dsh/cordis 代码**；今天操作业务的是 Go 的 `cmd/agent` + `cmd/host` + 模块。最终验收（DSH 对话页驱动业务）与模块动态注册/健康检查这三条需求已记录在 [`docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md`](docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md)（R1–R3 / Q1–Q3），**均未开始**。模块侧硬耦合已解一半：R1 已落地动态注册 + 心跳 + 失联自动摘除（`TENON_MODULES` 已删除，见 `docs/superpowers/specs/2026-10-27-tenon-module-registration-design.md`）；仍待修的是 `internal/agent/skillselect.go` 的 `knownModuleNames` 硬编码模块词表（新增模块不改这里，请求回合会静默选不中 skill）。
 
 > **生产安全边界尚未落地**：Tenon 侧没有 `os/exec`（业务动作只有 HTTP），「在服务器留后门」的风险**全部来自 DSH 自带工具面**（`pwsh`/`bash`/`fs` 写/`web`）。当前开发环境是 `danger-full-access` + 审批关闭，**不是生产配置**。生产已定为「只挂 Tenon 业务工具」（威胁模型档位 A），门禁用 `node scripts/check-profile-capabilities.mjs <profile>` 一条命令判定（现有 `web` profile 会报 20 项、`headless` 14 项，证明它真的会红）。细节见 [`docs/superpowers/specs/2026-10-27-tenon-security-threat-model.md`](docs/superpowers/specs/2026-10-27-tenon-security-threat-model.md)。
 

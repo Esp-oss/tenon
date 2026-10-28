@@ -660,3 +660,25 @@ func logRecords(t *testing.T, path string) []map[string]any {
 	}
 	return out
 }
+
+// 管理面 Upsert 不携带声明（空哈希）时，必须保留已知声明：
+// 否则 Touch 会因「登记哈希为空」接受任意值，声明校验被静默旁路一个 TTL。
+func TestUpsertWithoutDeclarationPreservesHash(t *testing.T) {
+	r := NewRegistry()
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://a:8081", DeclarationHash: "sha256:aaa"})
+	// 模拟 POST /tenon/admin/modules（只带 id 与地址）
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://a:8081"})
+
+	if ok, reason := r.Touch("inventory", "sha256:aaa"); !ok {
+		t.Fatalf("原声明的心跳应通过，得到 ok=%v reason=%q", ok, reason)
+	}
+	if ok, reason := r.Touch("inventory", "sha256:bbb"); ok || reason != "declaration-changed" {
+		t.Fatalf("换声明仍必须被拒，得到 ok=%v reason=%q", ok, reason)
+	}
+
+	// 显式携带新声明时仍要更新（重申报路径）。
+	r.Upsert(ModuleEntry{ID: "inventory", BaseURL: "http://a:8081", DeclarationHash: "sha256:bbb"})
+	if ok, reason := r.Touch("inventory", "sha256:bbb"); !ok {
+		t.Fatalf("重申报后新哈希心跳应通过，得到 ok=%v reason=%q", ok, reason)
+	}
+}
