@@ -4,6 +4,16 @@
   "private": true,
   "description": "协议类型、schema 校验、EntityRef 寻址、幂等键、sha256 哈希与 HMAC 签名工具",
   "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schemas/*": "./schemas/*",
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist",
     "schemas"
