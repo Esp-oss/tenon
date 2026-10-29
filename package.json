@@ -11,9 +11,9 @@
   "packageManager": "pnpm@11.9.0",
   "scripts": {
     "validate": "node scripts/validate-spec.mjs",
-    "typecheck": "tsc -p packages/tenon-core/tsconfig.json --noEmit",
+    "typecheck": "pnpm --filter @tenon/core run build && tsc -p packages/dsh-plugin-module-host/tsconfig.json --noEmit",
     "schema:check": "pnpm --filter @tenon/core run sync:schemas:check",
-    "test": "pnpm --filter @tenon/core run test",
+    "test": "pnpm --filter @tenon/core run test && pnpm --filter @tenon/dsh-plugin-module-host run test",
     "check": "pnpm run validate && pnpm run typecheck && pnpm run schema:check && pnpm run test"
   },
   "devDependencies": {
