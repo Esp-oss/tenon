@@ -4,20 +4,40 @@
 // 只看返回值会把「跳过了预演」这种缺陷读成成功。
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import { TenonCallError } from './bridge.js';
 import type { ModuleHostConfig } from './config.js';
 import { startFakeHost, type FakeHandler } from './fake-host.js';
-import { runAction } from './orchestrate.js';
+import { runAction, type ApprovalOutcome, type ApprovalPort } from './orchestrate.js';
+import { loadArchived, loadPending, pendingDir } from './pending.js';
 
 const ARGS = { sku: 'STD-1001', qty: 5 };
 
-const config = (hostURL: string): ModuleHostConfig => ({
+const config = (hostURL: string, extra: Partial<ModuleHostConfig> = {}): ModuleHostConfig => ({
   hostURL,
   agentID: 'ag_dsh_test',
   onBehalfOf: 'user:alice',
   timeoutMs: 5_000,
+  ...extra,
 });
+
+/** 每个用例一份独立的状态目录：待批是盘上状态，共用目录会让用例互相污染。 */
+const freshState = (): string => mkdtempSync(path.join(tmpdir(), 'tenon-orch-'));
+
+/** 假审批端口：记录被问了几次、问了什么，并回一个固定结局。 */
+function fakeApproval(outcome: ApprovalOutcome): ApprovalPort & { calls: Array<Record<string, unknown>> } {
+  const calls: Array<Record<string, unknown>> = [];
+  return {
+    calls,
+    async request(request): Promise<ApprovalOutcome> {
+      calls.push(request as unknown as Record<string, unknown>);
+      return outcome;
+    },
+  };
+}
 
 /** 期望的 sha256 摘要写法（与 `@tenon/core` 的 sha256Digest 同形，此处按字节自算以便独立核对）。 */
 const digestOf = (text: string): string =>
@@ -32,6 +52,13 @@ async function failure(promise: Promise<unknown>): Promise<TenonCallError> {
     return error;
   }
   throw new Error('期望抛错，但调用成功了');
+}
+
+/** 从错误里取 planId（`details` 是 Json，读之前先收窄）。 */
+function planIdOf(error: TenonCallError): string {
+  const details = error.details;
+  if (typeof details !== 'object' || details === null || Array.isArray(details)) return '';
+  return String((details as Record<string, unknown>)['planId']);
 }
 
 test('1. auto：六步顺序、审计两段与执行请求的头部/摘要', async () => {
@@ -168,7 +195,7 @@ test('2. deny：只发到 policies 就抛错，没有预演/审计/执行', asyn
   }
 });
 
-test('3. approve：返回 needs_approval 且 detail 明写「未执行」，序列停在 policy', async () => {
+test('3. approve：真挂起（落盘 + 计划级审计），不预演、不执行、不提问', async () => {
   const handler: FakeHandler = (request, origin) => {
     switch (`${request.method} ${request.path}`) {
       case 'GET /tenon/modules':
@@ -183,17 +210,22 @@ test('3. approve：返回 needs_approval 且 detail 明写「未执行」，序�
             reasons: ['QUANTITY_ABOVE_AUTO_LIMIT'],
           },
         };
+      case 'POST /tenon/audit':
+        return { status: 200, body: { ok: true } };
       default:
         return undefined;
     }
   };
   const host = await startFakeHost(handler);
+  const stateDir = freshState();
   try {
+    const approval = fakeApproval('allowed-once');
     const outcome = await runAction({
-      config: config(host.origin),
+      config: config(host.origin, { stateDir }),
       module: 'inventory',
       action: 'DeductStock',
       args: { sku: 'STD-1001', qty: 12 },
+      approval,
     });
     assert.equal(outcome.status, 'needs_approval');
     assert.match(outcome.planId, /^pln_/);
@@ -201,8 +233,244 @@ test('3. approve：返回 needs_approval 且 detail 明写「未执行」，序�
     assert.match(outcome.detail, /pol-big-deduction/);
     assert.deepEqual(outcome.requiredRoles, ['role:warehouse_manager']);
     assert.equal(outcome.result, null);
-    // 停在 policy：没有预演、没有审计、没有执行。
+
+    // 序列：发现 → 策略 → 计划级审计；**没有**预演、没有动作调用。
+    assert.deepEqual(host.sequence(), [
+      'GET /tenon/modules',
+      'POST /tenon/policies:evaluate',
+      'POST /tenon/audit',
+    ]);
+
+    // 盘上真的有一条待批，且 I7 第三步已回写。
+    const pending = loadPending(stateDir, outcome.planId);
+    assert.ok(pending !== null, '待批必须落盘，否则无从续跑');
+    assert.equal(pending.auditSettled, true);
+    assert.equal(pending.module, 'inventory');
+    assert.equal(pending.action, 'DeductStock');
+    assert.deepEqual(pending.args, { sku: 'STD-1001', qty: 12 });
+    assert.deepEqual(pending.requiredRoles, ['role:warehouse_manager']);
+
+    // 计划级审计的形状（与 Go 的 suspend.go:131-154 逐字段同构）。
+    const audits = host.bodies('/tenon/audit') as Array<Record<string, unknown>>;
+    assert.equal(audits.length, 1);
+    const record = audits[0]!;
+    assert.equal(record['stage'], 'dispatched');
+    assert.equal(record['planId'], outcome.planId);
+    assert.equal(record['stepId'], null, '计划级记录的 stepId 必须是 null');
+    assert.equal(record['action'], '', '计划级记录没有具体动作');
+    assert.equal(record['inputHash'], '');
+    assert.equal(record['idempotencyKey'], null);
+    assert.deepEqual(record['decision'], {
+      outcome: 'approve',
+      policyId: null,
+      grantId: null,
+      approvedBy: null,
+    });
+    assert.equal((record['result'] as Record<string, unknown>)['status'], 'unknown');
+    assert.deepEqual(record['effects'], { entities: [] });
+    assert.equal(record['auditId'], pending.dispatchedAuditId);
+
+    // 没配 operatorRoles ⇒ 谁都不该被问（默认拒绝，不是「谁问都给」）。
+    assert.equal(approval.calls.length, 0);
+    assert.match(outcome.detail, /不持有上述任一角色/);
+  } finally {
+    await host.close();
+  }
+});
+
+test('3b. I7：计划级审计写失败 → 归档 stale，不留待批，抛 AUDIT_WRITE_FAILED', async () => {
+  const handler: FakeHandler = (request, origin) => {
+    switch (`${request.method} ${request.path}`) {
+      case 'GET /tenon/modules':
+        return { status: 200, body: { modules: [{ id: 'inventory', baseURL: origin }] } };
+      case 'POST /tenon/policies:evaluate':
+        return {
+          status: 200,
+          body: { outcome: 'approve', decidedBy: ['pol-big'], approvers: ['role:warehouse_manager'], reasons: [] },
+        };
+      case 'POST /tenon/audit':
+        return {
+          status: 500,
+          body: {
+            tenonError: { class: 'retryable', code: 'AUDIT_WRITE_FAILED', message: '存储不可写', retryable: true },
+          },
+        };
+      default:
+        return undefined;
+    }
+  };
+  const host = await startFakeHost(handler);
+  const stateDir = freshState();
+  try {
+    const error = await failure(
+      runAction({
+        config: config(host.origin, { stateDir }),
+        module: 'inventory',
+        action: 'DeductStock',
+        args: { sku: 'STD-1001', qty: 12 },
+      }),
+    );
+    assert.equal(error.code, 'AUDIT_WRITE_FAILED');
+    // 没有任何动作调用，也没有留下可续跑的卡（审计没落盘就不该有「待批」）。
+    assert.deepEqual(host.sequence(), [
+      'GET /tenon/modules',
+      'POST /tenon/policies:evaluate',
+      'POST /tenon/audit',
+    ]);
+    assert.equal(loadPending(stateDir, planIdOf(error)), null);
+  } finally {
+    await host.close();
+  }
+});
+
+test('3c. 有资格 + allowed-once：当场批准后按原计划执行，审计带 approvedBy', async () => {
+  const handler: FakeHandler = (request, origin) => {
+    switch (`${request.method} ${request.path}`) {
+      case 'GET /tenon/modules':
+        return { status: 200, body: { modules: [{ id: 'inventory', baseURL: origin }] } };
+      case 'POST /tenon/policies:evaluate':
+        return {
+          status: 200,
+          body: { outcome: 'approve', decidedBy: ['pol-big'], approvers: ['role:warehouse_manager'], reasons: [] },
+        };
+      case 'POST /tenon/actions/inventory.DeductStock:dry-run':
+        return { status: 200, body: { dryRun: { status: 'ok' } } };
+      case 'POST /tenon/audit':
+        return { status: 200, body: { ok: true } };
+      case 'POST /tenon/actions/inventory.DeductStock':
+        return { status: 200, body: { ok: true, onHand: 108 } };
+      default:
+        return undefined;
+    }
+  };
+  const host = await startFakeHost(handler);
+  const stateDir = freshState();
+  try {
+    const approval = fakeApproval('allowed-once');
+    const outcome = await runAction({
+      config: config(host.origin, { stateDir, operatorRoles: ['role:warehouse_manager'] }),
+      module: 'inventory',
+      action: 'DeductStock',
+      args: { sku: 'STD-1001', qty: 12 },
+      approval,
+      agent: { id: 'ag_test' },
+    });
+
+    assert.equal(outcome.status, 'executed');
+    assert.deepEqual(outcome.result, { ok: true, onHand: 108 });
+    assert.match(outcome.detail, /经 user:alice 批准/);
+    // 问了，且问的时候带上了资格与原因。
+    assert.equal(approval.calls.length, 1);
+    assert.equal(approval.calls[0]!['toolName'], 'tenon_action');
+    assert.match(String(approval.calls[0]!['reason']), /role:warehouse_manager/);
+
+    // 序列：计划级 dispatched → 预演 → step dispatched → 动作 → step result → 计划级 result。
+    assert.deepEqual(host.sequence(), [
+      'GET /tenon/modules',
+      'POST /tenon/policies:evaluate',
+      'POST /tenon/audit',
+      'POST /tenon/actions/inventory.DeductStock:dry-run',
+      'POST /tenon/audit',
+      'POST /tenon/actions/inventory.DeductStock',
+      'POST /tenon/audit',
+      'POST /tenon/audit',
+    ]);
+
+    const audits = host.bodies('/tenon/audit') as Array<Record<string, unknown>>;
+    assert.deepEqual(
+      audits.map((record) => `${record['stage']}/${String(record['stepId'])}`),
+      ['dispatched/null', 'dispatched/s1', 'result/s1', 'result/null'],
+    );
+    // step 级两段都写了同一个审批人。
+    for (const record of [audits[1]!, audits[2]!]) {
+      assert.equal((record['decision'] as Record<string, unknown>)['outcome'], 'approve');
+      assert.equal((record['decision'] as Record<string, unknown>)['approvedBy'], 'user:alice');
+    }
+    // 计划级 result 也带审批人，且与挂起时的 dispatched 共用 auditId。
+    assert.equal((audits[3]!['decision'] as Record<string, unknown>)['approvedBy'], 'user:alice');
+    assert.equal(audits[3]!['auditId'], audits[0]!['auditId']);
+
+    // 幂等键与挂起时一致（`tenon:<planId>/s1`），因此重复续跑会被模块幂等挡住。
+    const actionRequest = host.requests.find((request) => request.path === '/tenon/actions/inventory.DeductStock');
+    assert.equal(actionRequest?.headers['idempotency-key'], `tenon:${outcome.planId}/s1`);
+
+    // 归档 done，待批目录已清空。
+    assert.equal(loadArchived(stateDir, outcome.planId)?.state, 'done');
+    assert.equal(loadPending(stateDir, outcome.planId), null);
+  } finally {
+    await host.close();
+  }
+});
+
+test('3d. 有资格但人拒了：不执行，待批仍在（可换人续跑）', async () => {
+  const handler: FakeHandler = (request, origin) => {
+    switch (`${request.method} ${request.path}`) {
+      case 'GET /tenon/modules':
+        return { status: 200, body: { modules: [{ id: 'inventory', baseURL: origin }] } };
+      case 'POST /tenon/policies:evaluate':
+        return {
+          status: 200,
+          body: { outcome: 'approve', decidedBy: ['pol-big'], approvers: ['role:warehouse_manager'], reasons: [] },
+        };
+      case 'POST /tenon/audit':
+        return { status: 200, body: { ok: true } };
+      default:
+        return undefined;
+    }
+  };
+  const host = await startFakeHost(handler);
+  const stateDir = freshState();
+  try {
+    const approval = fakeApproval('rejected');
+    const outcome = await runAction({
+      config: config(host.origin, { stateDir, operatorRoles: ['role:warehouse_manager'] }),
+      module: 'inventory',
+      action: 'DeductStock',
+      args: { sku: 'STD-1001', qty: 12 },
+      approval,
+      agent: { id: 'ag_test' },
+    });
+
+    assert.equal(outcome.status, 'needs_approval');
+    assert.match(outcome.detail, /rejected/);
+    assert.match(outcome.detail, /未执行/);
+    // 拒批不能变成执行：只有计划级审计那一次，没有预演与动作。
+    assert.deepEqual(host.sequence(), [
+      'GET /tenon/modules',
+      'POST /tenon/policies:evaluate',
+      'POST /tenon/audit',
+    ]);
+    assert.ok(loadPending(stateDir, outcome.planId) !== null, '拒批之后待批必须还在，等换人处理');
+  } finally {
+    await host.close();
+  }
+});
+
+test('3e. approvers 为空：拒绝挂起（不制造一张谁都批不掉的卡）', async () => {
+  const handler: FakeHandler = (request, origin) => {
+    switch (`${request.method} ${request.path}`) {
+      case 'GET /tenon/modules':
+        return { status: 200, body: { modules: [{ id: 'inventory', baseURL: origin }] } };
+      case 'POST /tenon/policies:evaluate':
+        return { status: 200, body: { outcome: 'approve', decidedBy: ['pol-broken'], approvers: [], reasons: [] } };
+      default:
+        return undefined;
+    }
+  };
+  const host = await startFakeHost(handler);
+  const stateDir = freshState();
+  try {
+    const error = await failure(
+      runAction({
+        config: config(host.origin, { stateDir }),
+        module: 'inventory',
+        action: 'DeductStock',
+        args: { sku: 'STD-1001', qty: 12 },
+      }),
+    );
+    assert.equal(error.code, 'APPROVAL_UNREACHABLE');
     assert.deepEqual(host.sequence(), ['GET /tenon/modules', 'POST /tenon/policies:evaluate']);
+    assert.equal(existsSync(pendingDir(stateDir)), false, '拒绝挂起就不该建待批目录');
   } finally {
     await host.close();
   }

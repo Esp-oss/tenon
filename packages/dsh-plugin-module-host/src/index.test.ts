@@ -3,6 +3,9 @@
 // 这一组用例守的是安全性质，不是功能性质：工具的参数里**不许**出现身份字段，而且这条不许
 // 只写在文档里——模型的入参必须真的到不了「自称别人 / 伪造计划号」那一步。
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { TenonCallError } from './bridge.js';
@@ -16,6 +19,9 @@ const CONFIG: ModuleHostConfig = {
   onBehalfOf: 'user:alice',
   timeoutMs: 2_000,
 };
+
+/** 待批落盘目录：用例之间不共用（否则上一轮留下的卡会喂出假通过）。 */
+const freshState = (): string => mkdtempSync(path.join(tmpdir(), 'tenon-tool-'));
 
 /** 装一次插件，交出被注册的那一个工具定义。 */
 function registerTool(config: ModuleHostConfig = CONFIG): ToolDefinition {
@@ -162,13 +168,15 @@ test('工具层 needs_approval：返回体 detail 明写「未执行」，且没
             reasons: [],
           },
         };
+      case 'POST /tenon/audit':
+        return { status: 200, body: { ok: true } };
       default:
         return undefined;
     }
   };
   const host = await startFakeHost(handler);
   try {
-    const tool = registerTool({ ...CONFIG, hostURL: host.origin });
+    const tool = registerTool({ ...CONFIG, hostURL: host.origin, stateDir: freshState() });
     const value = (await tool.execute(
       { module: 'inventory', action: 'DeductStock', args: { sku: 'STD-1001', qty: 12 } },
       runContext(),
@@ -179,7 +187,12 @@ test('工具层 needs_approval：返回体 detail 明写「未执行」，且没
     assert.deepEqual(value.requiredRoles, ['role:warehouse_manager']);
     assert.match(value.planId, /^pln_/);
     assert.equal(value.result, null);
-    assert.deepEqual(host.sequence(), ['GET /tenon/modules', 'POST /tenon/policies:evaluate']);
+    // 挂起要落盘并写计划级审计：序列比「只报告」那版多一次 /tenon/audit，仍没有动作调用。
+    assert.deepEqual(host.sequence(), [
+      'GET /tenon/modules',
+      'POST /tenon/policies:evaluate',
+      'POST /tenon/audit',
+    ]);
   } finally {
     await host.close();
   }

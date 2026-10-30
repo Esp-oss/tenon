@@ -19,7 +19,13 @@ import {
   type Json,
   type JsonResponse,
 } from './bridge.js';
-import { DEFAULT_TIMEOUT_MS, type ModuleHostConfig } from './config.js';
+import {
+  DEFAULT_PENDING_TTL_MINUTES,
+  DEFAULT_STATE_DIR,
+  DEFAULT_TIMEOUT_MS,
+  type ModuleHostConfig,
+} from './config.js';
+import { archivePlan, rfc3339, savePending, type PendingPlan } from './pending.js';
 
 /** 单步计划里的步骤标识（最小版只有一步）。 */
 export const STEP_ID = 's1';
@@ -40,6 +46,34 @@ export interface RunActionInput {
   args: unknown;
   /** 工具的 `exec.signal`，转发给每一次 HTTP 调用。 */
   signal?: AbortSignal;
+  /**
+   * DSH 的审批端口（`ctx.approval`）。缺省时 approve 只挂起、不提问——**不猜、不假装问过**。
+   */
+  approval?: ApprovalPort;
+  /**
+   * 本轮调用的 agent（`exec.agent`）。DSH 的 `approval.request` 要求它，缺了就无法在回合内
+   * 提问（`dsh-user-approval` 的 `ApprovalRequest.agent` 是必填）。
+   */
+  agent?: unknown;
+}
+
+/** DSH 审批的四个结局，全封闭（`dsh-user-approval/lib/types/types.d.ts:26`）。 */
+export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';
+
+/**
+ * 审批端口的窄接口：本包只用到 `request` 一个方法，因此按结构类型声明，不引 cordis / dsh 依赖。
+ *
+ * 语义（照抄 `dsh-user-approval` 的契约）：`allowed-once` 是**唯一**放行值；其余三个一律
+ * 视为「没批」；`request` 必须在开着的回合内调用，否则它会直接拒绝。
+ */
+export interface ApprovalPort {
+  request(request: {
+    agent?: unknown;
+    toolName: string;
+    callId?: string;
+    reason?: string;
+    signal?: AbortSignal;
+  }): Promise<ApprovalOutcome>;
 }
 
 /** 执行成功。 */
@@ -101,6 +135,10 @@ interface AuditInput {
   inputHash: string;
   idemKey: string;
   policyId: string | null;
+  /** 这一步是怎么被允许执行的：策略判 auto，还是人批的。 */
+  decisionOutcome: 'auto' | 'approve';
+  /** 审批人（`user:<账号>`）；auto 路径为 null——没人批过，不能编一个。 */
+  approvedBy: string | null;
 }
 
 /**
@@ -115,7 +153,7 @@ interface AuditInput {
  * @throws TenonCallError 入参非法、模块未注册、策略拒绝、预演失败、审计写失败、执行失败。
  */
 export async function runAction(input: RunActionInput): Promise<ActionResult> {
-  const { config, module, action, signal } = input;
+  const { config, module, action, signal, approval, agent } = input;
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const host = config.hostURL.replace(/\/+$/, '');
 
@@ -152,20 +190,25 @@ export async function runAction(input: RunActionInput): Promise<ActionResult> {
         details: { decidedBy: evaluation.decidedBy, reasons: evaluation.reasons },
       });
     case 'approve':
-      return {
-        status: 'needs_approval',
-        planId,
+      // 真挂起（设计 §6.1）：先落盘 + 计划级审计，再按资格决定要不要当场问人。
+      return suspendAndMaybeApprove({
+        config,
+        baseURL,
         module,
         action,
-        // 「未执行」这四个字是刻意的：模型把 needs_approval 读成「完成」是设计里点名的风险。
-        detail:
-          `策略判定需要人工批准，**未执行**（planId=${planId}）：` +
-          `decidedBy=${evaluation.decidedBy.join(',') || '∅'}` +
-          `${evaluation.approvers.length > 0 ? `，需要 ${evaluation.approvers.join('/')}` : ''}。` +
-          '本轮只报告待批，不挂起、不重试、不得换路绕过。',
-        result: null,
-        requiredRoles: evaluation.approvers,
-      };
+        actionId,
+        planId,
+        args,
+        argsBody,
+        inputHash,
+        idemKey,
+        policyId: firstNonEmpty(evaluation.decidedBy),
+        evaluation,
+        timeoutMs,
+        signal,
+        approval,
+        agent,
+      });
     case 'auto':
       break;
     default:
@@ -177,19 +220,231 @@ export async function runAction(input: RunActionInput): Promise<ActionResult> {
       });
   }
 
+  return executePlan({
+    config,
+    baseURL,
+    planId,
+    module,
+    action,
+    actionId,
+    args,
+    argsBody,
+    inputHash,
+    idemKey,
+    policyId: firstNonEmpty(evaluation.decidedBy),
+    decisionOutcome: 'auto',
+    approvedBy: null,
+    timeoutMs,
+    signal,
+  });
+}
+
+// ---------- 挂起（approve 分支）与执行（auto / 已批准共用） ----------
+
+/** 走到 approve 分支时手上已有的全部上下文（都是前面几步算出来的，不重新求值）。 */
+interface ApprovalContext {
+  config: ModuleHostConfig;
+  baseURL: string;
+  module: string;
+  action: string;
+  actionId: string;
+  planId: string;
+  args: Json;
+  argsBody: string;
+  inputHash: string;
+  idemKey: string;
+  policyId: string | null;
+  evaluation: PolicyEvaluation;
+  timeoutMs: number;
+  signal?: AbortSignal;
+  approval?: ApprovalPort;
+  agent?: unknown;
+}
+
+/** 一次执行所需的全部材料（auto 与「已批准」两条路径的唯一差别是 decision 与 pending）。 */
+interface ExecutionInput {
+  config: ModuleHostConfig;
+  baseURL: string;
+  planId: string;
+  module: string;
+  action: string;
+  actionId: string;
+  args: Json;
+  argsBody: string;
+  inputHash: string;
+  idemKey: string;
+  policyId: string | null;
+  decisionOutcome: 'auto' | 'approve';
+  approvedBy: string | null;
+  /** 挂起时落盘的那份计划；auto 路径没有它，因此不写计划级审计、也不归档。 */
+  pending?: PendingPlan;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * approve 分支：**先挂起，再按资格决定要不要当场问人**（设计 §6.1）。
+ *
+ * 顺序是刻意的：落盘与计划级审计在提问**之前**。反过来的话，人在审批框上犹豫的几十秒里
+ * 盘上什么都没有——审批人一刷新、进程一重启，这一单就凭空消失了。
+ */
+async function suspendAndMaybeApprove(ctx: ApprovalContext): Promise<ActionResult> {
+  const { config, module, action, actionId, planId, evaluation, timeoutMs, signal } = ctx;
+  const requiredRoles = evaluation.approvers;
+
+  // 与 Go 侧同一条铁律（internal/agent/run.go:432-435）：**不挂一张谁都批不掉的卡**。
+  // 策略给了 approve 却没给 approvers，等于让人去点一个必然 403 的按钮。
+  if (requiredRoles.length === 0) {
+    throw new TenonCallError({
+      code: 'APPROVAL_UNREACHABLE',
+      errorClass: 'contract_violation',
+      retryable: false,
+      message:
+        `策略判定 ${actionId} 需要人工批准，但 approvers 为空：没人能批的卡不挂起。` +
+        '请在策略里补齐 approvers（例 role:warehouse_manager）',
+      details: { planId, module, action },
+    });
+  }
+
+  const ttlMinutes = config.pendingTTLMinutes ?? DEFAULT_PENDING_TTL_MINUTES;
+  const now = Date.now();
+  const draft: PendingPlan = {
+    planId,
+    module,
+    action,
+    args: ctx.args,
+    inputHash: ctx.inputHash,
+    idempotencyKey: ctx.idemKey,
+    requiredRoles,
+    policyId: ctx.policyId,
+    createdAt: rfc3339(new Date(now)),
+    expiresAt: rfc3339(new Date(now + ttlMinutes * 60_000)),
+    state: 'awaiting_approval',
+    auditSettled: false,
+    dispatchedAuditId: randomToken('aud_', 20),
+  };
+  const stateDir = stateDirOf(config);
+
+  // ---- I7 三次落盘（与 internal/agent/suspend.go:108-163 同序）----
+  // ① 先写待批：下一步就算崩，盘上也有一条完整可读的待批记录。
+  savePending(stateDir, draft);
+
+  // ② 计划级 dispatched：stepId=null / action="" / inputHash="" / approvedBy=null。
+  //    形状与 Go 侧逐字段同形（suspend.go:131-154）；它不满足 schema 完整 required 集是
+  //    既有的刻意取舍（README:265），不要顺手补成 step 形状。
+  try {
+    await postAudit(
+      hostOf(config),
+      buildPlanAuditRecord(config, draft, 'dispatched', {
+        outcome: 'approve',
+        approvedBy: null,
+      }, { status: 'unknown', outputHash: null, errorClass: null }),
+      timeoutMs,
+      signal,
+    );
+  } catch (error) {
+    // 审计写不进去 ⇒ 不留卡：一张来源不明的待批卡比没有卡更糟。
+    archivePlan(stateDir, draft, 'stale', { note: '计划级 dispatched 审计写失败，拒绝挂起' });
+    throw auditFailed(actionId, planId, error, '拒绝挂起');
+  }
+
+  // ③ 回写 auditSettled。
+  const settled: PendingPlan = { ...draft, auditSettled: true };
+  try {
+    savePending(stateDir, settled);
+  } catch (error) {
+    archivePlan(stateDir, draft, 'stale', { note: 'I7 第三步回写失败' });
+    throw auditFailed(actionId, planId, error, '拒绝挂起');
+  }
+
+  const head =
+    `策略判定需要人工批准，**未执行**（planId=${planId}）：` +
+    `decidedBy=${evaluation.decidedBy.join(',') || '∅'}，需要 ${requiredRoles.join('/')}。`;
+
+  // 资格：本会话操作员是否真的持有需要的角色（部署配置，模型不可见 —— 设计 §3.2 裁决 A）。
+  const operatorRoles = config.operatorRoles ?? [];
+  if (!rolesIntersect(operatorRoles, requiredRoles)) {
+    return needsApproval(ctx, `${head} 本会话操作员（${config.onBehalfOf}）不持有上述任一角色，` +
+      '因此不会向任何人提问；需由持有该角色的人在自己的会话里续跑（tenon_resume），' +
+      `或在该 profile 配置 operatorRoles。待批已落盘，${draft.expiresAt} 前有效。`);
+  }
+  if (ctx.approval === undefined || typeof ctx.approval.request !== 'function') {
+    return needsApproval(ctx, `${head} 宿主没有提供审批服务（ctx.approval 未装载），已挂起，` +
+      '可用 tenon_resume 续跑。');
+  }
+  if (ctx.agent === undefined) {
+    return needsApproval(ctx, `${head} 拿不到本轮 agent，无法在回合内发起审批` +
+      '（DSH 的 approval.request 要求 agent），已挂起，可用 tenon_resume 续跑。');
+  }
+
+  // 回合内问人。`allowed-once` 是唯一放行值；其余三个一律当「没批」。
+  const outcome = await ctx.approval.request({
+    agent: ctx.agent,
+    toolName: 'tenon_action',
+    reason: `Tenon 需要人工批准：${actionId}，角色 ${requiredRoles.join('/')}（planId=${planId}）`,
+    signal,
+  });
+  if (outcome !== 'allowed-once') {
+    return needsApproval(ctx, `${head} DSH 审批结局=${outcome}，仍未执行；待批仍然有效，` +
+      `可换人/换回合用 tenon_resume 续跑（${draft.expiresAt} 前）。`);
+  }
+
+  return executePlan({
+    config,
+    baseURL: ctx.baseURL,
+    planId,
+    module,
+    action,
+    actionId,
+    args: ctx.args,
+    argsBody: ctx.argsBody,
+    inputHash: ctx.inputHash,
+    idemKey: ctx.idemKey,
+    policyId: ctx.policyId,
+    decisionOutcome: 'approve',
+    approvedBy: config.onBehalfOf,
+    pending: settled,
+    timeoutMs,
+    signal,
+  });
+}
+
+/** 构造 `needs_approval` 的返回体（三条拒绝分支共用，避免形状漂移）。 */
+function needsApproval(ctx: ApprovalContext, detail: string): NeedsApprovalAction {
+  return {
+    status: 'needs_approval',
+    planId: ctx.planId,
+    module: ctx.module,
+    action: ctx.action,
+    detail,
+    result: null,
+    requiredRoles: ctx.evaluation.approvers,
+  };
+}
+
+/**
+ * 执行一段已定下 decision 的计划：预演 → dispatched 审计 → 执行 → result 审计
+ * （设计 §6.2，与 Go 的闸门 3..6 同序）。auto 与「已批准」共用这一条路径——两条路各写一份
+ * 执行逻辑，正是闸门顺序漂移的开始。
+ */
+async function executePlan(input: ExecutionInput): Promise<ExecutedAction> {
+  const { config, baseURL, planId, module, action, actionId, argsBody, timeoutMs, signal } = input;
+  const host = hostOf(config);
+
   // ---- 3. 预演：模块自己说这一步会不会成 ----
   await dryRun(baseURL, actionId, argsBody, timeoutMs, signal);
 
   // ---- 4. I7：dispatched 审计必须先落盘，写不进去就绝不执行 ----
-  const auditId = randomToken('aud_', 20);
   const auditInput: AuditInput = {
     config,
     actionId,
     planId,
-    auditId,
-    inputHash,
-    idemKey,
-    policyId: firstNonEmpty(evaluation.decidedBy),
+    auditId: randomToken('aud_', 20),
+    inputHash: input.inputHash,
+    idemKey: input.idemKey,
+    policyId: input.policyId,
+    decisionOutcome: input.decisionOutcome,
+    approvedBy: input.approvedBy,
   };
   try {
     await postAudit(
@@ -204,14 +459,7 @@ export async function runAction(input: RunActionInput): Promise<ActionResult> {
     );
   } catch (error) {
     // 这条分支是本项目最重要的一行语义：**宁可这次不做，也不能做了一次没人记得的事**。
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new TenonCallError({
-      code: 'AUDIT_WRITE_FAILED',
-      errorClass: 'contract_violation',
-      retryable: false,
-      message: `dispatched 审计写失败，**未执行任何动作**（${actionId}）：${reason}`,
-      details: { planId, module, action },
-    });
+    throw auditFailed(actionId, planId, error, '未执行任何动作');
   }
 
   // ---- 5. 执行 ----
@@ -220,7 +468,7 @@ export async function runAction(input: RunActionInput): Promise<ActionResult> {
     response = await fetchJSON(`${baseURL}/tenon/actions/${actionId}`, {
       method: 'POST',
       body: argsBody,
-      headers: { [HEADER_IDEMPOTENCY_KEY]: idemKey },
+      headers: { [HEADER_IDEMPOTENCY_KEY]: input.idemKey },
       timeoutMs,
       signal,
     });
@@ -235,12 +483,13 @@ export async function runAction(input: RunActionInput): Promise<ActionResult> {
       timeoutMs,
       signal,
     );
+    const planNote = await finishPlan(input, { status: 'unknown', outputHash: null, errorClass: 'retryable' }, 'stale');
     throw new TenonCallError({
       code: 'ACTION_UNKNOWN_OUTCOME',
       errorClass: 'retryable',
       retryable: true,
-      message: `${actionId} 的调用结果未定（已写 result 审计 status=unknown）：${reason}`,
-      details: { planId, module, action, idempotencyKey: idemKey },
+      message: `${actionId} 的调用结果未定（已写 result 审计 status=unknown）：${reason}${planNote}`,
+      details: { planId, module, action, idempotencyKey: input.idemKey },
     });
   }
 
@@ -253,7 +502,8 @@ export async function runAction(input: RunActionInput): Promise<ActionResult> {
       timeoutMs,
       signal,
     );
-    throw failure;
+    const planNote = await finishPlan(input, { status: 'error', outputHash: null, errorClass: failure.errorClass }, 'stale');
+    throw withNote(failure, planNote);
   }
 
   // ---- 6. 收尾：result 审计无论成败都写；它写不进去**不改业务结局**（调用已经发生了）----
@@ -264,6 +514,7 @@ export async function runAction(input: RunActionInput): Promise<ActionResult> {
     timeoutMs,
     signal,
   );
+  const planNote = await finishPlan(input, { status: 'ok', outputHash: sha256Digest(response.text), errorClass: null }, 'done');
 
   return {
     status: 'executed',
@@ -271,11 +522,134 @@ export async function runAction(input: RunActionInput): Promise<ActionResult> {
     module,
     action,
     detail:
-      `已执行 ${actionId}（planId=${planId}，幂等键 ${idemKey}）` +
-      (auditNote === null ? '' : `；**警告**：${auditNote}`),
+      `已执行 ${actionId}（planId=${planId}，幂等键 ${input.idemKey}` +
+      `${input.approvedBy === null ? '' : `，经 ${input.approvedBy} 批准`}）` +
+      (auditNote === null ? '' : `；**警告**：${auditNote}`) +
+      planNote,
     result: parseBodyOrNull(response.text),
     requiredRoles: [],
   };
+}
+
+/**
+ * 收尾「计划级」：写计划级 result 审计 + 归档。
+ *
+ * 只在有 pending 时生效（auto 路径没有挂起这回事，因此不产生计划级记录）。
+ * **审计写失败不改业务结局**——调用已经发生了；但要把这件事说出来，所以返回一句可拼接的告警。
+ */
+async function finishPlan(
+  input: ExecutionInput,
+  result: AuditResult,
+  terminal: 'done' | 'stale',
+): Promise<string> {
+  const pending = input.pending;
+  if (pending === undefined) return '';
+
+  const notes: string[] = [];
+  try {
+    await postAudit(
+      hostOf(input.config),
+      buildPlanAuditRecord(
+        input.config,
+        pending,
+        'result',
+        { outcome: input.decisionOutcome, approvedBy: input.approvedBy },
+        result,
+      ),
+      input.timeoutMs,
+      input.signal,
+    );
+  } catch (error) {
+    notes.push(`计划级 result 审计写失败（${error instanceof Error ? error.message : String(error)}）`);
+  }
+  try {
+    archivePlan(stateDirOf(input.config), pending, terminal, {
+      approvedBy: input.approvedBy,
+      result: { status: result.status },
+      note: notes.length === 0 ? null : notes.join('；'),
+    });
+  } catch (error) {
+    notes.push(`归档失败（${error instanceof Error ? error.message : String(error)}）`);
+  }
+  return notes.length === 0 ? '' : `；**警告**：${notes.join('；')}`;
+}
+
+/**
+ * 计划级审计记录。
+ *
+ * 与 step 级刻意不同（`internal/agent/suspend.go:131-154` 同形）：`stepId` 为 null、
+ * `action`/`inputHash` 为空串、`idempotencyKey` 为 null、`decision.policyId` 为 null——
+ * 人工批准的对象是**整份 plan**，不是某一步，因此这些 step 字段在这里没有意义。
+ */
+function buildPlanAuditRecord(
+  config: ModuleHostConfig,
+  pending: PendingPlan,
+  stage: 'dispatched' | 'result',
+  decision: { outcome: 'auto' | 'approve'; approvedBy: string | null },
+  result: AuditResult,
+): Json {
+  return {
+    auditId: pending.dispatchedAuditId,
+    stage,
+    at: timestamp(),
+    actor: { type: 'agent', id: config.agentID, onBehalfOf: config.onBehalfOf },
+    trigger: { eventId: null, correlationId: null },
+    planId: pending.planId,
+    stepId: null,
+    action: '',
+    inputHash: '',
+    idempotencyKey: null,
+    decision: {
+      outcome: decision.outcome,
+      policyId: null,
+      grantId: null,
+      approvedBy: decision.approvedBy,
+    },
+    result,
+    effects: { entities: [] },
+    tokenUsage: { in: 0, out: 0 },
+  };
+}
+
+/** 两个角色集合是否有交集。`need` 为空即无人匹配（与宿主 `rolesIntersect` 同义）。 */
+function rolesIntersect(have: readonly string[], need: readonly string[]): boolean {
+  if (need.length === 0) return false;
+  return need.some((role) => have.includes(role));
+}
+
+/** 状态目录（配置缺省时与 Schemastery 的 default 一致）。 */
+function stateDirOf(config: ModuleHostConfig): string {
+  return config.stateDir ?? DEFAULT_STATE_DIR;
+}
+
+/** 宿主根地址（去掉尾部斜杠）。 */
+function hostOf(config: ModuleHostConfig): string {
+  return config.hostURL.replace(/\/+$/, '');
+}
+
+/** 审计写失败的统一错误（挂起与执行两条路径共用同一个码）。 */
+function auditFailed(actionId: string, planId: string, error: unknown, what: string): TenonCallError {
+  const reason = error instanceof Error ? error.message : String(error);
+  return new TenonCallError({
+    code: 'AUDIT_WRITE_FAILED',
+    errorClass: 'contract_violation',
+    retryable: false,
+    message: `dispatched 审计写失败，${what}（${actionId}, planId=${planId}）：${reason}`,
+    details: { planId },
+  });
+}
+
+/** 给已有的协议错误追加一句计划级告警（不改 code / class / retryable）。 */
+function withNote(error: TenonCallError, note: string): TenonCallError {
+  if (note.length === 0) return error;
+  return new TenonCallError({
+    code: error.code,
+    errorClass: error.errorClass,
+    retryable: error.retryable,
+    message: `${error.message}${note}`,
+    details: error.details,
+    status: error.status,
+  });
 }
 
 // ---------- 各步的实现 ----------
@@ -482,13 +856,13 @@ function buildAuditRecord(input: AuditInput, stage: 'dispatched' | 'result', res
     inputHash: input.inputHash,
     idempotencyKey: input.idemKey,
     decision: {
-      outcome: 'auto',
+      outcome: input.decisionOutcome,
       policyId: input.policyId,
       // 本轮不调 grants:evaluate（M0.5 没有 grant 签发，见设计 §2）：没有授权依据就写 null，
       // 不伪造一个 grantId。
       grantId: null,
-      // auto 路径没有人按批准。审批人只能由闸门结论带进来，不能凭配置编。
-      approvedBy: null,
+      // auto 路径没有人按批准；approve 路径写真实的审批人（部署配置里的操作员，见设计 §3.2）。
+      approvedBy: input.approvedBy,
     },
     result,
     effects: { entities: [] },
