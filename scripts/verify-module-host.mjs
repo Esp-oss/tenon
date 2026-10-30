@@ -326,6 +326,37 @@ async function auditFor(hostURL, planId) {
   return body.records
 }
 
+/** 用 dev 账号换一个 token（公告板的读与写都要它）。 */
+async function loginAs(hostURL, user, password) {
+  const { status, text } = await httpJSON(`${hostURL}/tenon/session`, {
+    method: 'POST',
+    body: JSON.stringify({ user, password }),
+  })
+  if (status !== 200) throw new Error(`登录 ${user} 失败：HTTP ${status} ${text.slice(0, 200)}`)
+  const body = JSON.parse(text)
+  if (typeof body?.token !== 'string') throw new Error(`登录 ${user} 的响应里没有 token`)
+  return body.token
+}
+
+/** 带 Bearer 的 GET（公告板读取侧要 token）。 */
+async function getJSONAuth(url, token) {
+  const { status, text } = await httpJSON(url, { headers: { authorization: `Bearer ${token}` } })
+  if (status !== 200) throw new Error(`GET ${url} → HTTP ${status}：${text.slice(0, 200)}`)
+  return JSON.parse(text)
+}
+
+/**
+ * 从公告板读回某一张卡。
+ *
+ * 这是「卡片真的上去了」的**唯一**证据：不是看 adapter 发了什么，而是看宿主的 read-model 里
+ * 有没有这一行——推失败但断言发过请求，等于没验。
+ */
+async function boardCard(hostURL, token, planId) {
+  const body = await getJSONAuth(`${hostURL}/tenon/pending`, token)
+  const items = Array.isArray(body?.items) ? body.items : []
+  return items.find((item) => item?.planId === planId) ?? null
+}
+
 /**
  * 读盘上的待批（或归档）记录。
  *
@@ -459,6 +490,22 @@ async function main() {
   const grantsPath = path.join(RUN_DIR, 'grants.json')
   writeFileSync(grantsPath, '{"grants":[],"subjects":{}}\n', 'utf8')
 
+  // dev 账号表：公告板的写入侧只允许 role:agent，读取侧要一个真 token，
+  // 所以这里造两个账号——agent（推卡片）与 bob（仓管，读公告板）。
+  const usersPath = path.join(RUN_DIR, 'users.json')
+  writeFileSync(
+    usersPath,
+    `${JSON.stringify(
+      [
+        { user: 'agent', password: 'agent-dev', roles: ['role:agent'] },
+        { user: 'bob', password: 'bob-dev', roles: ['role:warehouse_manager'] },
+      ],
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  )
+
   console.log('\n构建：')
   buildPlugin()
   const hostBin = goBuild('tenon-host.exe', './cmd/host')
@@ -477,6 +524,8 @@ async function main() {
     TENON_SKILLS_DIR: path.join(REPO, 'skills'),
     // 显式给出会话密钥：不给的话 host 会用 dev 缺省值并告警，日志里多一句噪音。
     TENON_SESSION_SECRET: 'verify-module-host-e2e',
+    // dev 账号表：agent 用来推公告板，bob 用来读公告板（两者都需要真 token）。
+    TENON_USERS_FILE: usersPath,
   }
   const inventoryEnv = {
     ...baseEnv,
@@ -502,6 +551,9 @@ async function main() {
     await waitForModule(hostURL, 'inventory', inventoryProc)
     console.log('  inventory 已自注册（GET /tenon/modules 可见）')
 
+    // 公告板读取侧要一个真 token：用仓管 bob 的身份读——他正是能批这张卡的人。
+    const bobToken = await loginAs(hostURL, 'bob', 'bob-dev')
+
     const config = {
       hostURL,
       agentID: AGENT_ID,
@@ -511,6 +563,9 @@ async function main() {
       stateDir: STATE_DIR,
       // 挂起时**不给**审批资格：这一段只验「真挂起」，提问与续跑留给 e) 段。
       operatorRoles: [],
+      // 公告板写入要 role:agent：这里用 dev 账号换 token（与 Go 的 cmd/agent 同一条路）。
+      agentUser: 'agent',
+      agentPassword: 'agent-dev',
     }
     const { runAction } = await import(pathToFileURL(path.join(PLUGIN_DIR, 'dist', 'orchestrate.js')).href)
     const { canonicalJSON } = await import(pathToFileURL(path.join(PLUGIN_DIR, 'dist', 'bridge.js')).href)
@@ -634,6 +689,16 @@ async function main() {
       eq('I7 第三步已回写 auditSettled', stored?.auditSettled, true)
       eq('落盘记录保留了审批角色', stored?.requiredRoles, ['role:warehouse_manager'])
       eq('没有审批资格时不会向任何人提问', /不持有上述任一角色/.test(outcome?.detail ?? ''), true)
+
+      // 公告板：从宿主的 read-model 里真的读回这一张卡（不是看 adapter 发了什么请求）。
+      const card = await boardCard(hostURL, bobToken, outcome?.planId)
+      ok('公告板上能看见这张待批卡', card !== null)
+      if (card !== null) {
+        eq('卡片 state = awaiting_approval', card.state, 'awaiting_approval')
+        eq('卡片带着需要的角色', card.requiredRoles, ['role:warehouse_manager'])
+        ok('卡片摘要是给人看的', /inventory\.DeductStock/.test(String(card.summary)), show(card.summary))
+        eq('卡片与待批同一有效期', card.expiresAt, stored?.expiresAt)
+      }
     })
 
     await section('c) 编排层 · 未登记动作 inventory.NoSuchAction（fail-closed 默认拒绝）', async () => {
@@ -817,6 +882,10 @@ async function main() {
       eq('归档终态是 done', archived?.state, 'done')
       eq('归档记录了审批人', archived?.approvedBy, ON_BEHALF_OF)
       eq('归档后待批目录里没有这一单', readPendingFile(planId), null)
+
+      // 公告板上的那张卡被终态覆盖（否则会一直挂到 expiresAt）。
+      const doneCard = await boardCard(hostURL, bobToken, planId)
+      eq('公告板卡片被终态覆盖成 done', doneCard?.state, 'done')
 
       // ④ 再续一次：幂等返回，库存不再动。
       const again = await resumePlan({

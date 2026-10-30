@@ -19,12 +19,8 @@ import {
   type Json,
   type JsonResponse,
 } from './bridge.js';
-import {
-  DEFAULT_PENDING_TTL_MINUTES,
-  DEFAULT_STATE_DIR,
-  DEFAULT_TIMEOUT_MS,
-  type ModuleHostConfig,
-} from './config.js';
+import { DEFAULT_PENDING_TTL_MINUTES, DEFAULT_STATE_DIR, DEFAULT_TIMEOUT_MS, type ModuleHostConfig } from './config.js';
+import { pendingCard, pushBoardCard, terminalCard } from './board.js';
 import {
   archivePlan,
   assertPlanId,
@@ -366,9 +362,14 @@ async function suspendAndMaybeApprove(ctx: ApprovalContext): Promise<ActionResul
     throw auditFailed(actionId, planId, error, '拒绝挂起');
   }
 
+  // 推公告板：**可丢的 read-model**，失败只做告警（真相在盘上的 pending 文件）。
+  // 这一步刻意放在 I7 之后：审计已经落盘了才对，卡片先于审计出现会诱导人去批一单还没记账的请求。
+  const boardNote = await pushBoardCard(config, pendingCard(settled), signal);
+
   const head =
     `策略判定需要人工批准，**未执行**（planId=${planId}）：` +
-    `decidedBy=${evaluation.decidedBy.join(',') || '∅'}，需要 ${requiredRoles.join('/')}。`;
+    `decidedBy=${evaluation.decidedBy.join(',') || '∅'}，需要 ${requiredRoles.join('/')}。` +
+    (boardNote === null ? '' : ` ${boardNote}。`);
 
   // 资格：本会话操作员是否真的持有需要的角色（部署配置，模型不可见 —— 设计 §3.2 裁决 A）。
   const operatorRoles = config.operatorRoles ?? [];
@@ -580,6 +581,15 @@ async function finishPlan(
   } catch (error) {
     notes.push(`归档失败（${error instanceof Error ? error.message : String(error)}）`);
   }
+
+  // 终态卡：同 planId 幂等覆盖那张待批卡（宿主不按 state 过滤，覆盖就是它的设计）。
+  const boardNote = await pushBoardCard(
+    input.config,
+    terminalCard(pending, terminal, notes.length === 0 ? null : notes.join('；')),
+    input.signal,
+  );
+  if (boardNote !== null) notes.push(boardNote);
+
   return notes.length === 0 ? '' : `；**警告**：${notes.join('；')}`;
 }
 
@@ -924,6 +934,8 @@ async function finishTerminal(
     // 见函数注释：归档优先。
   }
   archivePlan(stateDirOf(config), pending, terminal, { result: { status: result.status }, note });
+  // 终态也要覆盖到公告板，否则卡片会一直挂到 expiresAt（Go 侧自检归档时有同样的缺口）。
+  await pushBoardCard(config, terminalCard(pending, terminal, note), undefined);
 }
 
 // ---------- 各步的实现 ----------

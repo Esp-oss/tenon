@@ -45,6 +45,22 @@ export const Config = z.object({
     .min(1)
     .default(15)
     .description('待批计划的有效期（分钟）。过期后只写结局、绝不执行（与 Go 侧 15 分钟缺省一致）'),
+  agentUser: z
+    .string()
+    .description(
+      '可选：宿主的 agent 服务账号（入站消费与公告板写入需要 role:agent）。' +
+        '与 agentPassword 一起配，adapter 会用 POST /tenon/session 换 token；' +
+        '**不配就等于关闭公告板推送**——业务流程完全不受影响，只是待批卡片在公告板上看不见',
+    ),
+  agentPassword: z
+    .string()
+    .description('可选：agent 服务账号的口令。它只用于换 token，不会进日志、审计或工具参数'),
+  agentToken: z
+    .string()
+    .description(
+      '可选：现成的 agent token（与 agentUser/agentPassword 二选一）。' +
+        '注意它有自己的有效期，过期后公告板推送会收到 401 并在返回值里明说',
+    ),
 });
 
 /** 与 {@link Config} 同形的普通接口，供纯函数与单测直接构造。 */
@@ -59,6 +75,12 @@ export interface ModuleHostConfig {
   stateDir?: string;
   /** 待批有效期（分钟）。 */
   pendingTTLMinutes?: number;
+  /** 可选的 agent 服务账号（公告板写入/入站消费要 `role:agent`）。 */
+  agentUser?: string;
+  /** 可选的 agent 口令（用于换 token）。 */
+  agentPassword?: string;
+  /** 可选的现成 agent token（与账号口令二选一）。 */
+  agentToken?: string;
 }
 
 /** 默认超时（`timeoutMs` 省略时的取值，与 Schemastery 的 default 保持一致）。 */
