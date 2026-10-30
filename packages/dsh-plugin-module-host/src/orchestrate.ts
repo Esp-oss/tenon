@@ -681,6 +681,14 @@ export interface ResumePlanInput {
   approval?: ApprovalPort;
   agent?: unknown;
   signal?: AbortSignal;
+  /**
+   * 已经在别处拿到的批准：`by` 与 `roles` **必须**来自宿主验过的来源（confirm 帧里由宿主
+   * 用提交者 token 覆写过，`internal/controlplane/inbound.go:193-204`）。
+   *
+   * 给了它就**不再问 DSH**——人已经在公告板那边批过了，再问一次等于让同一个人批两遍。
+   * 角色仍然要校验：宿主验的是「他是谁、他有什么角色」，不是「他够不够格批这一单」。
+   */
+  grant?: { approvedBy: string; roles: string[] };
 }
 
 /**
@@ -815,22 +823,32 @@ export async function resumePlan(input: ResumePlanInput): Promise<ActionResult> 
     });
   }
 
-  // ---- 5. 资格与审批（与 approve 分支同一套判定）----
-  const operatorRoles = config.operatorRoles ?? [];
-  if (!rolesIntersect(operatorRoles, requiredRoles)) {
+  // ---- 5. 资格与审批 ----
+  //
+  // 两条批准来源，**同一套角色校验**：
+  //   a) 外部 grant（来自 confirm 帧）：`by`/`roles` 是宿主用提交者 token 覆写过的，
+  //      因此不再问 DSH——人已经在公告板那边批过了；
+  //   b) 本回合内问人（ctx.approval）：身份来自部署配置（Q2 未定前的临时绑定）。
+  const approverId = input.grant !== undefined ? input.grant.approvedBy : config.onBehalfOf;
+  const approverRoles: readonly string[] =
+    input.grant !== undefined ? input.grant.roles : (config.operatorRoles ?? []);
+
+  if (!rolesIntersect(approverRoles, requiredRoles)) {
     return {
       status: 'needs_approval',
       planId,
       module: pending.module,
       action: pending.action,
       detail:
-        `续跑需要人工批准，但本会话操作员（${config.onBehalfOf}）不持有 ${requiredRoles.join('/')} ` +
-        `中的任一角色：未向任何人提问、未执行。待批仍有效（${pending.expiresAt} 前）。`,
+        `续跑需要人工批准，但批准人 ${approverId} 不持有 ${requiredRoles.join('/')} 中的任一角色：` +
+        `**未执行**。待批仍有效（${pending.expiresAt} 前），需换有该角色的人处理。`,
       result: null,
       requiredRoles,
     };
   }
-  if (approval === undefined || typeof approval.request !== 'function' || agent === undefined) {
+
+  // 只有「需要当场问人」这条路才要求宿主提供审批服务；外部 grant 不需要。
+  if (input.grant === undefined && (approval === undefined || typeof approval.request !== 'function' || agent === undefined)) {
     return {
       status: 'needs_approval',
       planId,
@@ -838,38 +856,41 @@ export async function resumePlan(input: ResumePlanInput): Promise<ActionResult> 
       action: pending.action,
       detail:
         `续跑需要人工批准，但宿主没有提供可用的审批服务（ctx.approval 未装载或拿不到本轮 agent）：` +
-        `未执行。待批仍有效（${pending.expiresAt} 前）。`,
+        `**未执行**。待批仍有效（${pending.expiresAt} 前）。`,
       result: null,
       requiredRoles,
     };
   }
 
-  // 抢锁：先标记 resuming 再问人，避免两个并行续跑各自问一遍、各执行一次。
+  // 抢锁：先标记 resuming 再问人/执行，避免两个并行续跑各自问一遍、各执行一次。
   const locked: PendingPlan = { ...pending, state: 'resuming' };
   savePending(stateDir, locked);
-  let outcome: ApprovalOutcome;
-  try {
-    outcome = await approval.request({
-      agent,
-      toolName: 'tenon_action',
-      reason: `续跑 Tenon 计划 ${planId}（${actionId}），需要 ${requiredRoles.join('/')}`,
-      signal,
-    });
-  } catch (error) {
-    releaseLock(stateDir, pending);
-    throw error;
-  }
-  if (outcome !== 'allowed-once') {
-    releaseLock(stateDir, pending);
-    return {
-      status: 'needs_approval',
-      planId,
-      module: pending.module,
-      action: pending.action,
-      detail: `DSH 审批结局=${outcome}，仍未执行；待批仍有效（${pending.expiresAt} 前），可换人再续。`,
-      result: null,
-      requiredRoles,
-    };
+
+  if (input.grant === undefined) {
+    let outcome: ApprovalOutcome;
+    try {
+      outcome = await approval!.request({
+        agent,
+        toolName: 'tenon_action',
+        reason: `续跑 Tenon 计划 ${planId}（${actionId}），需要 ${requiredRoles.join('/')}`,
+        signal,
+      });
+    } catch (error) {
+      releaseLock(stateDir, pending);
+      throw error;
+    }
+    if (outcome !== 'allowed-once') {
+      releaseLock(stateDir, pending);
+      return {
+        status: 'needs_approval',
+        planId,
+        module: pending.module,
+        action: pending.action,
+        detail: `DSH 审批结局=${outcome}，仍未执行；待批仍有效（${pending.expiresAt} 前），可换人再续。`,
+        result: null,
+        requiredRoles,
+      };
+    }
   }
 
   // ---- 6. 执行（与原挂起的 planId / 幂等键完全一致）----
@@ -887,7 +908,7 @@ export async function resumePlan(input: ResumePlanInput): Promise<ActionResult> 
       idemKey: pending.idempotencyKey,
       policyId: pending.policyId,
       decisionOutcome: 'approve',
-      approvedBy: config.onBehalfOf,
+      approvedBy: approverId,
       pending: locked,
       timeoutMs,
       signal,
@@ -911,6 +932,40 @@ function releaseLock(stateDir: string, pending: PendingPlan): void {
 }
 
 /**
+ * 驳回一条待批计划（公告板上「驳回」的落点）。
+ *
+ * 驳回**不执行**、写一条计划级 result 审计后归档 `rejected`，并把终态覆盖到公告板卡片上。
+ * 已经终结过的计划（含 done）一律不动：同一个人点两次、或重启后重放旧帧，都不该改变既成事实。
+ *
+ * @returns `rejected` 表示这次真的驳回了；`gone` 表示这一单已经不在待批里（已处理/已过期/不存在）。
+ */
+export async function rejectPendingPlan(
+  config: ModuleHostConfig,
+  planId: string,
+  by: string,
+  signal?: AbortSignal,
+): Promise<'rejected' | 'gone'> {
+  assertIdentity(config);
+  assertPlanId(planId);
+
+  const stateDir = stateDirOf(config);
+  if (loadArchived(stateDir, planId) !== null) return 'gone';
+  const pending = loadPending(stateDir, planId);
+  if (pending === null) return 'gone';
+  if (pending.state === 'resuming') return 'gone';
+
+  await finishTerminal(
+    config,
+    pending,
+    'rejected',
+    { status: 'error', outputHash: null, errorClass: 'policy_denied' },
+    `由 ${by} 驳回，未执行`,
+    signal,
+  );
+  return 'rejected';
+}
+
+/**
  * 给一条计划写终态：计划级 result 审计 + 归档。
  *
  * 用于「过期/策略改判」这类**不执行**的终结路径。审计写失败不改归档结果——结局必须落下，
@@ -922,20 +977,21 @@ async function finishTerminal(
   terminal: 'expired' | 'stale' | 'rejected',
   result: AuditResult,
   note: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   try {
     await postAudit(
       hostOf(config),
       buildPlanAuditRecord(config, pending, 'result', { outcome: 'approve', approvedBy: null }, result),
       config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      undefined,
+      signal,
     );
   } catch {
     // 见函数注释：归档优先。
   }
   archivePlan(stateDirOf(config), pending, terminal, { result: { status: result.status }, note });
   // 终态也要覆盖到公告板，否则卡片会一直挂到 expiresAt（Go 侧自检归档时有同样的缺口）。
-  await pushBoardCard(config, terminalCard(pending, terminal, note), undefined);
+  await pushBoardCard(config, terminalCard(pending, terminal, note), signal);
 }
 
 // ---------- 各步的实现 ----------

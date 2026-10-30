@@ -345,6 +345,17 @@ async function getJSONAuth(url, token) {
   return JSON.parse(text)
 }
 
+/** 带 Bearer 的 POST（提交 confirm 帧要 token）。 */
+async function postJSONAuth(url, token, body) {
+  const { status, text } = await httpJSON(url, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { authorization: `Bearer ${token}` },
+  })
+  if (status !== 200) throw new Error(`POST ${url} → HTTP ${status}：${text.slice(0, 200)}`)
+  return JSON.parse(text)
+}
+
 /**
  * 从公告板读回某一张卡。
  *
@@ -897,6 +908,65 @@ async function main() {
       eq('重复续跑返回 executed（归档结论回放）', again?.status, 'executed')
       ok('重复续跑不重复执行', /不重复执行/.test(again?.detail ?? ''), show(again?.detail))
       eq('重复续跑库存不变', await moduleOnHand(moduleURL, SKU), before - 12)
+    })
+    await section('f) 公告板批准 · 人点批准 → 入站 confirm → 轮询器执行（且从不 ack）', async () => {
+      if (!assertAlive(hostProc) || !assertAlive(inventoryProc)) return
+
+      const { createConfirmPoller } = await import(
+        pathToFileURL(path.join(PLUGIN_DIR, 'dist', 'confirm.js')).href
+      )
+
+      const before = await moduleOnHand(moduleURL, SKU)
+      const suspended = await runAction({
+        config,
+        module: 'inventory',
+        action: 'DeductStock',
+        args: { sku: SKU, qty: 12, referenceNo: ref('G') },
+      })
+      eq('待批已生成', suspended?.status, 'needs_approval')
+      const planId = suspended?.planId
+
+      // 人在公告板上点「批准」：宿主用 bob 的 token 覆写 by/roles 之后才入队。
+      const enqueued = await postJSONAuth(`${hostURL}/tenon/requests`, bobToken, {
+        type: 'tenon.confirm',
+        confirmId: `cfm_e2e_${stamp}`,
+        planId,
+        decision: 'approve',
+      })
+      eq('confirm 帧已入队', enqueued?.ok, true)
+
+      const poller = createConfirmPoller({ config, log: (line) => console.log(`    ${line}`) })
+      const ticked = await poller.tick()
+      eq('轮询器读到并处理了一条 confirm', [ticked.confirms, ticked.applied], [1, 1])
+      eq('公告板批准后库存真减：103 → 91', await moduleOnHand(moduleURL, SKU), before - 12)
+
+      const records = await auditFor(hostURL, planId)
+      const stepDispatched = records.find(
+        (record) => record.stage === 'dispatched' && record.stepId === 's1',
+      )
+      eq(
+        '审计里的批准人来自宿主验过的 token（不是部署配置 operatorRoles）',
+        stepDispatched?.decision?.approvedBy,
+        'user:bob',
+      )
+      eq('计划级两段仍然共用挂起时的 auditId', records.at(-1)?.auditId, records[0]?.auditId)
+
+      const doneCard = await boardCard(hostURL, bobToken, planId)
+      eq('公告板卡片被覆盖成 done', doneCard?.state, 'done')
+
+      // ---- 「只读不 ack」的直接证据：帧还在队列里（ack 过就会消失）----
+      const agentToken = await loginAs(hostURL, 'agent', 'agent-dev')
+      const inbox = await getJSONAuth(`${hostURL}/tenon/requests/poll?after=0`, agentToken)
+      const stillThere = Array.isArray(inbox?.frames)
+        ? inbox.frames.some((entry) => entry?.frame?.planId === planId)
+        : false
+      ok('confirm 帧仍留在入站队列里（证明从未 ack）', stillThere)
+
+      // ---- 重放：新轮询器 = 新进程，游标归零再读一遍，靠归档幂等挡住 ----
+      const replay = createConfirmPoller({ config })
+      const again = await replay.tick()
+      eq('重放不产生动作', again.applied, 0)
+      eq('重放后库存不变', await moduleOnHand(moduleURL, SKU), before - 12)
     })
   } finally {
     await Promise.all(processes.map((record) => stopProcess(record)))

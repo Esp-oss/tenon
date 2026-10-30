@@ -13,6 +13,8 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import { invalidArguments, TenonCallError, type Json } from './bridge.js';
 import { Config, type ModuleHostConfig } from './config.js';
+import { createConfirmPoller } from './confirm.js';
+import { hasAgentCredentials } from './host-auth.js';
 import { resumePlan, rolesIntersect, runAction, type ApprovalPort } from './orchestrate.js';
 import { assertPlanId, listPending } from './pending.js';
 
@@ -110,6 +112,12 @@ export interface ToolHostContext {
    * 也刻意不写进 `inject`：那会让整个插件在该服务缺失时**装不上**——待批与续跑并不需要它。
    */
   approval?: ApprovalPort;
+  /**
+   * cordis 的生命周期钩子：`ctx.effect(execute,label)`，`execute` 返回 disposer。
+   *
+   * 声明成可选：没有它就**不启动**后台确认轮询（定时器没人收会泄漏），工具面照常可用。
+   */
+  effect?: (execute: () => (() => void) | void, label?: string) => unknown;
 }
 
 /** 工具执行所需的入参形状（已是 JSON 对象）。 */
@@ -377,6 +385,19 @@ export function apply(ctx: ToolHostContext, config: ModuleHostConfig): void {
       },
     }),
   );
+
+  // 公告板上的「批准」要有人消费，否则它只是躺在入站队列里。
+  // 三个前提缺一不可：配了 agent 凭据（缺省关闭）、宿主给了生命周期钩子、且没在测试里禁用。
+  if (hasAgentCredentials(config) && typeof ctx.effect === 'function') {
+    ctx.effect(() => {
+      const poller = createConfirmPoller({
+        config,
+        log: (line) => console.warn(line),
+      });
+      poller.start();
+      return () => poller.stop();
+    }, 'tenon-confirm-poller');
+  }
 }
 
 /**
