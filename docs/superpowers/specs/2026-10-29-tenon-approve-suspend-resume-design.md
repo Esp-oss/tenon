@@ -157,3 +157,39 @@
 | 两份 pending（adapter 与 Go agent）互相漂移 | 状态目录分开（`stateDir` 默认 `out/module-host-state`），不共用、不互相读取 |
 | 公告板上看不到卡片 | 记为已知缺口，`tenon_pending` 是唯一入口 |
 | 模型反复续跑耗尽模块配额 | 归档后幂等返回；过期硬失败；额度由模块侧配额控制（本轮不引入新闸门） |
+
+## 10. 追加：公告板可见性（已实现）与「消费 confirm」的治理问题（未实现）
+
+### 10.1 已实现：可选 agent 身份 + 公告板上推
+
+- 配置新增 `agentUser`/`agentPassword`（换 token）或 `agentToken`（现成 token）；**都不配 = 功能关闭**，业务路径完全不受影响；
+- 挂起成功后推一张 `awaiting_approval` 卡，终态（done/rejected/expired/stale）用同 planId 覆盖（宿主 `Upsert` 幂等，`pending.go:52-59`）；
+- 推送失败**不升级为业务失败**，只把原因拼进 `detail`/归档 note——公告板是可丢的 read-model（`pending.go:34-38`）；
+- 实测：`node scripts/verify-module-host.mjs` 用真 host + dev 账号表，以 bob（`role:warehouse_manager`）的 token 从 `GET /tenon/pending` **读回**卡片，续跑后再读回终态 `done`（83 条断言）。
+
+**这也是一条权限**：配置了 agent 身份，adapter 就能以 `role:agent` 写公告板。这是显式配置、缺省关闭的。
+
+### 10.2 未实现：消费 `tenon.confirm` 让批准真正落地
+
+今天的批准只能发生在**DSH 回合内**（`ctx.approval`）。而公告板那套异步批准——人在页面上点「批准」→ 宿主入队 `tenon.confirm` → 被消费 → 执行——在 DSH 路径上**没有任何人消费这个队列**（`cmd/agent` 已冻结）。要让它通，需要 adapter 轮询：
+
+```
+GET  /tenon/requests/poll?after=<cursor>   # role:agent
+POST /tenon/requests/ack {upto}            # role:agent
+帧：{ type:'tenon.confirm', planId, decision:'approve'|'reject', by, roles }
+     by/roles 由宿主用提交者 token 的 claims **覆写**（inbound.go:152）⇒ 这是可信身份
+```
+
+收益是决定性的：`approvedBy` 与角色校验都来自宿主验过的 token，而不是部署配置——**这条路径能真正解掉 Q2**，而不只是绕过它。技术上也已摸清：`Agent.followup(message)` 可唤醒会话，`agent/status` 等事件可取。
+
+**但有一个必须先裁决的治理问题**：`poll` 返回的是**该 agent 的全部入站帧**，包括 `tenon.request`（用户说的话）。adapter 一旦消费，就同时具备「读所有提交给这个 agent 的用户原话」与「ack 掉它们」的能力——而 ack 之后 Go agent 再也拿不到。这不是加个 token 就完事的小改动，是**把入站队列的所有权从 agent 转到 adapter**。
+
+三条可选路径：
+
+| 选项 | 含义 | 代价 |
+|---|---|---|
+| **A. 只读不 ack**（建议先做） | adapter 轮询并处理 confirm，但**从不 ack**；游标只在内存里，重启从头读 | 会重复读到旧帧 → 必须靠 `archived/done` 幂等挡住；队列无界增长（宿主侧无 GC） |
+| B. 接管整条入站队列 | adapter 成为该 agent 的唯一消费者，ack 交还 | Go agent 若同时运行会互相抢帧；所有权变更要写进 ADR |
+| C. 宿主新增「confirm 专用只读端点」 | 只回 confirm 帧、不 ack | 要动已冻结的控制平面（ADR §2），但边界最干净 |
+
+**建议 A 先行**（零治理变更、可回退），把 B/C 留给 ADR 决定。唤醒则用「挂起时把 `exec.agent` 存在内存 Map 里」：同一进程存活期内可 `followup` 唤醒，重启后没有 handle ⇒ 只执行不唤醒（业务完成，聊天里看不到），这条限制要写进 README。
