@@ -11,7 +11,8 @@ import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { TenonCallError } from './bridge.js';
 import type { ModuleHostConfig } from './config.js';
 import { startFakeHost, type FakeHandler } from './fake-host.js';
-import { apply, inject, name as pluginName, parameters, readActionArgs } from './index.js';
+import { apply, inject, name as pluginName, parameters, readActionArgs, readResumeArgs } from './index.js';
+import type { ApprovalPort } from './orchestrate.js';
 
 const CONFIG: ModuleHostConfig = {
   hostURL: 'http://127.0.0.1:9',
@@ -23,8 +24,8 @@ const CONFIG: ModuleHostConfig = {
 /** 待批落盘目录：用例之间不共用（否则上一轮留下的卡会喂出假通过）。 */
 const freshState = (): string => mkdtempSync(path.join(tmpdir(), 'tenon-tool-'));
 
-/** 装一次插件，交出被注册的那一个工具定义。 */
-function registerTool(config: ModuleHostConfig = CONFIG): ToolDefinition {
+/** 装一次插件，交出全部被注册的工具定义。 */
+function registerTools(config: ModuleHostConfig = CONFIG, approval?: ApprovalPort): ToolDefinition[] {
   const registered: ToolDefinition[] = [];
   apply(
     {
@@ -34,35 +35,69 @@ function registerTool(config: ModuleHostConfig = CONFIG): ToolDefinition {
           return () => undefined;
         },
       },
+      ...(approval === undefined ? {} : { approval }),
     },
     config,
   );
-  assert.equal(registered.length, 1, '本包只注册一个工具（设计 §6）');
-  const tool = registered[0];
-  assert.ok(tool);
+  assert.equal(registered.length, 3, '本包注册三个工具：action / pending / resume（设计 §6）');
+  return registered;
+}
+
+/** 取出某一个工具定义。 */
+function toolNamed(
+  name: string,
+  config: ModuleHostConfig = CONFIG,
+  approval?: ApprovalPort,
+): ToolDefinition {
+  const tool = registerTools(config, approval).find((definition) => definition.name === name);
+  assert.ok(tool, `没有注册 ${name}`);
   return tool;
 }
 
-/** 最小可用的执行上下文：本工具只用它的 signal。 */
-function runContext(): ToolRunContext {
-  return { signal: new AbortController().signal } as unknown as ToolRunContext;
+/** 最小可用的执行上下文：本工具只用 signal 与 agent。 */
+function runContext(agent: unknown = { id: 'ag_test' }): ToolRunContext {
+  return { signal: new AbortController().signal, agent } as unknown as ToolRunContext;
 }
 
-test('注册面：只注册 tenon_action，inject 只要 tools，description 写死「未执行」', () => {
+/** 假审批端口：记录问了几次，回固定结局。 */
+function fakeApproval(outcome: string): ApprovalPort & { calls: number } {
+  const port = {
+    calls: 0,
+    async request(): Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'> {
+      port.calls += 1;
+      return outcome as 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';
+    },
+  };
+  return port;
+}
+
+test('注册面：三个工具、inject 只要 tools、description 写死「未执行」', () => {
   assert.equal(pluginName, 'tenon-module-host');
   assert.deepEqual([...inject], ['tools']);
 
-  const tool = registerTool();
+  assert.deepEqual(registerTools().map((definition) => definition.name).sort(), [
+    'tenon_action',
+    'tenon_pending',
+    'tenon_resume',
+  ]);
+
+  const tool = toolNamed('tenon_action');
   assert.equal(tool.name, 'tenon_action');
   // 模型必须被提前告知「needs_approval 不是完成」——这是设计 §8 点名的风险。
   assert.match(tool.description, /needs_approval/);
   assert.match(tool.description, /未执行/);
   assert.match(tool.description, /module/);
   assert.match(tool.description, /action/);
+
+  // 续跑的描述必须同样说清「needs_approval 仍然是未执行」，且不把批准说成模型能做的事。
+  const resume = toolNamed('tenon_resume');
+  assert.match(resume.description, /未执行/);
+  assert.match(resume.description, /approvedBy/);
+  assert.match(toolNamed('tenon_pending').description, /只读/);
 });
 
 test('参数形状：只有 module/action/args 三个必填项，没有任何身份字段', () => {
-  const tool = registerTool();
+  const tool = toolNamed('tenon_action');
   const schema = tool.parameters as {
     type?: string;
     properties?: Record<string, unknown>;
@@ -105,7 +140,7 @@ test('参数形状：只有 module/action/args 三个必填项，没有任何身
 test('参数白名单：多出的身份字段在发出任何请求之前就被拒', async () => {
   const host = await startFakeHost(() => undefined);
   try {
-    const tool = registerTool({ ...CONFIG, hostURL: host.origin });
+    const tool = toolNamed('tenon_action', { ...CONFIG, hostURL: host.origin });
     await assert.rejects(
       () =>
         tool.execute(
@@ -176,7 +211,7 @@ test('工具层 needs_approval：返回体 detail 明写「未执行」，且没
   };
   const host = await startFakeHost(handler);
   try {
-    const tool = registerTool({ ...CONFIG, hostURL: host.origin, stateDir: freshState() });
+    const tool = toolNamed('tenon_action', { ...CONFIG, hostURL: host.origin, stateDir: freshState() });
     const value = (await tool.execute(
       { module: 'inventory', action: 'DeductStock', args: { sku: 'STD-1001', qty: 12 } },
       runContext(),
@@ -214,7 +249,7 @@ test('工具层错误：消息以协议码开头，且带上可判定的属性',
   };
   const host = await startFakeHost(handler);
   try {
-    const tool = registerTool({ ...CONFIG, hostURL: host.origin });
+    const tool = toolNamed('tenon_action', { ...CONFIG, hostURL: host.origin });
     await assert.rejects(
       () =>
         tool.execute(
@@ -230,6 +265,143 @@ test('工具层错误：消息以协议码开头，且带上可判定的属性',
         return true;
       },
     );
+  } finally {
+    await host.close();
+  }
+});
+
+/** 一个能完成「挂起 → 续跑」全链路的假宿主。 */
+function approveHost(): FakeHandler {
+  return (request, origin) => {
+    switch (`${request.method} ${request.path}`) {
+      case 'GET /tenon/modules':
+        return { status: 200, body: { modules: [{ id: 'inventory', baseURL: origin }] } };
+      case 'POST /tenon/policies:evaluate':
+        return {
+          status: 200,
+          body: { outcome: 'approve', decidedBy: ['pol-big'], approvers: ['role:warehouse_manager'], reasons: [] },
+        };
+      case 'POST /tenon/actions/inventory.DeductStock:dry-run':
+        return { status: 200, body: { dryRun: { status: 'ok' } } };
+      case 'POST /tenon/audit':
+        return { status: 200, body: { ok: true } };
+      case 'POST /tenon/actions/inventory.DeductStock':
+        return { status: 200, body: { ok: true, onHand: 108 } };
+      default:
+        return undefined;
+    }
+  };
+}
+
+test('tenon_resume 参数白名单：身份与 approvedBy 进不来，且在发请求之前被拒', async () => {
+  for (const extra of [
+    { approvedBy: 'user:mallory' },
+    { onBehalfOf: 'user:mallory' },
+    { operatorRoles: ['role:warehouse_manager'] },
+    { roles: ['role:warehouse_manager'] },
+  ]) {
+    assert.throws(
+      () => readResumeArgs({ planId: 'pln_AAAAAAAAAAAAAAAA', ...extra }),
+      (error: unknown) => error instanceof TenonCallError && error.code === 'INVALID_ARGUMENTS',
+      `应拒绝多余字段 ${Object.keys(extra).join(',')}`,
+    );
+  }
+  // planId 会被拼进文件路径：词法不对即拒绝。
+  assert.throws(
+    () => readResumeArgs({ planId: '../../etc/passwd' }),
+    (error: unknown) => error instanceof TenonCallError && error.code === 'INVALID_PLAN_ID',
+  );
+
+  // 工具层同样在**任何请求之前**拒（假宿主的 handler 永远返回 undefined，一旦发出请求就会 500）。
+  const host = await startFakeHost(() => undefined);
+  try {
+    const tool = toolNamed('tenon_resume', { ...CONFIG, hostURL: host.origin });
+    await assert.rejects(
+      () => tool.execute({ planId: 'pln_AAAAAAAAAAAAAAAA', approvedBy: 'user:mallory' }, runContext()),
+      /approvedBy/,
+    );
+    assert.deepEqual(host.sequence(), []);
+  } finally {
+    await host.close();
+  }
+});
+
+test('tenon_pending：清单里的 canApprove 由部署配置的角色决定，模型改不了', async () => {
+  const host = await startFakeHost(approveHost());
+  const stateDir = freshState();
+  try {
+    const action = toolNamed('tenon_action', { ...CONFIG, hostURL: host.origin, stateDir });
+    await action.execute(
+      { module: 'inventory', action: 'DeductStock', args: { sku: 'STD-1001', qty: 12 } },
+      runContext(),
+    );
+
+    type Board = { summary: string; pending: Array<Record<string, unknown>> };
+    const sales = (await toolNamed('tenon_pending', {
+      ...CONFIG,
+      hostURL: host.origin,
+      stateDir,
+      operatorRoles: ['role:sales'],
+    }).execute({}, runContext())) as Board;
+    assert.equal(sales.pending.length, 1);
+    assert.equal(sales.pending[0]!['canApprove'], false, '销售不该能批超额扣减');
+    assert.equal(sales.pending[0]!['expired'], false);
+    assert.match(sales.summary, /1 条待批/);
+
+    const manager = (await toolNamed('tenon_pending', {
+      ...CONFIG,
+      hostURL: host.origin,
+      stateDir,
+      operatorRoles: ['role:warehouse_manager'],
+    }).execute({}, runContext())) as Board;
+    assert.equal(manager.pending[0]!['canApprove'], true);
+    assert.match(manager.summary, /1 条本会话操作员可批/);
+
+    // 空目录是一个正常答案，不是错误。
+    const empty = (await toolNamed('tenon_pending', {
+      ...CONFIG,
+      hostURL: host.origin,
+      stateDir: freshState(),
+    }).execute({}, runContext())) as Board;
+    assert.deepEqual(empty.pending, []);
+    assert.match(empty.summary, /没有待批/);
+  } finally {
+    await host.close();
+  }
+});
+
+test('tenon_resume：挂起后经人批 → 工具层返回 executed，审计带 approvedBy', async () => {
+  const host = await startFakeHost(approveHost());
+  const stateDir = freshState();
+  try {
+    const config: ModuleHostConfig = {
+      ...CONFIG,
+      hostURL: host.origin,
+      stateDir,
+      operatorRoles: ['role:warehouse_manager'],
+    };
+    const suspended = (await toolNamed('tenon_action', config).execute(
+      { module: 'inventory', action: 'DeductStock', args: { sku: 'STD-1001', qty: 12 } },
+      runContext(),
+    )) as { status: string; planId: string; detail: string };
+    assert.equal(suspended.status, 'needs_approval');
+    assert.match(suspended.detail, /未执行/);
+
+    const approval = fakeApproval('allowed-once');
+    const resumed = (await toolNamed('tenon_resume', config, approval).execute(
+      { planId: suspended.planId },
+      runContext(),
+    )) as { status: string; detail: string; result: unknown };
+    assert.equal(resumed.status, 'executed');
+    assert.deepEqual(resumed.result, { ok: true, onHand: 108 });
+    assert.equal(approval.calls, 1);
+
+    // 工具层没有把身份/审批人的东西漏进返回值形状之外的地方：审计里的 approvedBy 来自配置。
+    const audits = host.bodies('/tenon/audit') as Array<Record<string, unknown>>;
+    const stepDispatched = audits.find(
+      (record) => record['stage'] === 'dispatched' && record['stepId'] === 's1',
+    );
+    assert.equal((stepDispatched?.['decision'] as Record<string, unknown>)['approvedBy'], 'user:alice');
   } finally {
     await host.close();
   }

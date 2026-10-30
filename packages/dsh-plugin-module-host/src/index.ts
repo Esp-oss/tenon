@@ -1,15 +1,20 @@
-// cordis 插件：向 DSH 注册唯一一个工具 `tenon_action(module, action, args)`。
+// cordis 插件：向 DSH 注册三个工具——
+//   `tenon_action(module, action, args)`   走闸门执行一次业务动作
+//   `tenon_pending()`                       列出本 adapter 的待批（只读）
+//   `tenon_resume(planId)`                  续跑一条已获人批的待批计划
 //
-// 安全边界（设计 §6，档位 A）：
-//   - 本包只注册这一个工具，不 import 任何 shell / fs / web 能力；
-//   - 工具参数只有 `module` / `action` / `args` —— **没有** `onBehalfOf`、`planId`、`userId`。
-//     身份与计划号来自部署配置与宿主，模型既不能自称别人，也不能伪造计划号；
-//   - `approve` 只**报告待批**，不执行、不挂起（设计 §1「本轮不做」）。
+// 安全边界（设计 §6、§7，档位 A）：
+//   - 本包只注册这三个工具，不 import 任何 shell / fs / web / subagent 能力；
+//   - 工具参数里**没有** `onBehalfOf` / `operatorRoles` / `approvedBy`：身份与资格只来自部署配置，
+//     模型既不能自称别人，也不能自报「我批准了」；
+//   - `tenon_resume` 能指定的只有 `planId`（续哪一单），批准本身只能由 DSH 回合内的**人**给出。
+import { DEFAULT_STATE_DIR } from './config.js';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
-import { invalidArguments, TenonCallError } from './bridge.js';
+import { invalidArguments, TenonCallError, type Json } from './bridge.js';
 import { Config, type ModuleHostConfig } from './config.js';
-import { runAction } from './orchestrate.js';
+import { resumePlan, rolesIntersect, runAction, type ApprovalPort } from './orchestrate.js';
+import { assertPlanId, listPending } from './pending.js';
 
 /** 插件名（cordis 的 `name` 导出）。 */
 export const name = 'tenon-module-host';
@@ -98,6 +103,13 @@ export interface ToolHostContext {
   tools: {
     register(definition: ToolDefinition): () => void;
   };
+  /**
+   * DSH 的审批服务（`ctx.approval`，`dsh-user-approval`）。
+   *
+   * **声明成可选**：没装载审批插件的部署里它不存在，此时 approve 一律只挂起、不提问。
+   * 也刻意不写进 `inject`：那会让整个插件在该服务缺失时**装不上**——待批与续跑并不需要它。
+   */
+  approval?: ApprovalPort;
 }
 
 /** 工具执行所需的入参形状（已是 JSON 对象）。 */
@@ -168,11 +180,81 @@ function toToolError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+/** `tenon_resume` 的参数：只有「续哪一单」，没有「我是谁」「我批准了」。 */
+export const RESUME_PARAMETERS = {
+  planId: {
+    type: 'string',
+    required: true,
+    description:
+      '要续跑的计划号（pln_…），来自 tenon_action 的 needs_approval 返回或 tenon_pending 的清单。' +
+      '续跑会重新过策略并**向人提问**，批准不是这个参数能表达的东西。',
+  },
+} as const;
+
+/** `tenon_resume` 允许的入参键（白名单的实际执行点，见 {@link readResumeArgs}）。 */
+export const RESUME_ARGUMENT_KEYS = ['planId'] as const;
+
+/** `tenon_pending` 的返回声明：清单是自由形状，整体按 JSON 交给渲染器。 */
+const pendingOutputSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    summary: {
+      type: 'string',
+      required: true,
+      description: '一句话概况（几条待批、几条已过期、本会话能批几条）。',
+    },
+    pending: {
+      type: 'json',
+      required: true,
+      description: '待批清单数组：planId / module / action / args / requiredRoles / expiresAt / expired / canApprove。',
+    },
+  },
+} as const;
+
 /**
- * 注册 `tenon_action`。
+ * 解析并收窄 `tenon_resume` 的入参。
  *
- * @param ctx 携带工具注册表的宿主上下文。
- * @param config 部署配置（身份只进审计，见 config.ts）。
+ * 与 {@link readActionArgs} 同一个信任边界：多余字段在**任何文件或网络操作之前**被拒。
+ * `planId` 走 {@link assertPlanId} 的词法（它会被拼进文件路径，不能有 `..`）。
+ */
+export function readResumeArgs(raw: unknown): { planId: string } {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw invalidArguments('tenon_resume 的入参必须是对象 {planId}');
+  }
+  const record = raw as Record<string, unknown>;
+  const unexpected = Object.keys(record).filter(
+    (key) => !(RESUME_ARGUMENT_KEYS as readonly string[]).includes(key),
+  );
+  if (unexpected.length > 0) {
+    throw invalidArguments(
+      `tenon_resume 只接受 planId，收到多余字段：${unexpected.join(', ')}。` +
+        '审批人（approvedBy）与身份（onBehalfOf）由宿主与部署配置给出，模型不能自报',
+    );
+  }
+  assertPlanId(record['planId']);
+  return { planId: record['planId'] };
+}
+
+/** `tenon_pending` 的工具描述。 */
+export const PENDING_DESCRIPTION =
+  '列出本 adapter 上的待批计划（只读）：每条给出计划号、动作、入参、需要的角色、有效期，' +
+  '以及「本会话操作员能不能批」（canApprove，按部署配置里声明的角色算，模型改不了它）。' +
+  '要真的推进，用 tenon_resume(planId)——它会重新过策略并向人提问。';
+
+/** `tenon_resume` 的工具描述。 */
+export const RESUME_DESCRIPTION =
+  '续跑一条挂起的 Tenon 计划：重跑策略 → 校验本会话是否持有审批角色 → 经 DSH 审批**问人** → ' +
+  '批准后按原计划与同一幂等键执行，审计写明 approvedBy。' +
+  '返回 status=executed 表示真的执行了；status=needs_approval 表示**仍未执行**' +
+  '（没人批、没资格、或审批服务不可用），此时待批仍然有效，可换人再续。' +
+  '已归档的计划会幂等返回结论而不重复执行。';
+
+/**
+ * 注册三个工具。
+ *
+ * @param ctx 携带工具注册表（以及可选的审批服务）的宿主上下文。
+ * @param config 部署配置（身份与审批资格只来自这里，见 config.ts）。
  */
 export function apply(ctx: ToolHostContext, config: ModuleHostConfig): void {
   ctx.tools.register(
@@ -200,6 +282,8 @@ export function apply(ctx: ToolHostContext, config: ModuleHostConfig): void {
             action: call.action,
             args: call.args,
             signal: exec?.signal,
+            approval: ctx.approval,
+            agent: exec?.agent,
           });
           return {
             status: outcome.status,
@@ -216,6 +300,117 @@ export function apply(ctx: ToolHostContext, config: ModuleHostConfig): void {
       },
     }),
   );
+
+  ctx.tools.register(
+    defineTool({
+      name: 'tenon_pending',
+      description: PENDING_DESCRIPTION,
+      parameters: {},
+      output: {
+        schema: pendingOutputSchema,
+        render: (_args, value) => {
+          const rows = Array.isArray(value.pending) ? value.pending : [];
+          const lines = rows.map((row) => {
+            const item = row as Record<string, unknown>;
+            const flags = [
+              item['expired'] === true ? '已过期' : '有效',
+              item['canApprove'] === true ? '本会话可批' : '本会话不可批',
+            ].join('／');
+            return `- ${String(item['planId'])}｜${String(item['module'])}.${String(item['action'])}｜${flags}`;
+          });
+          return [
+            {
+              type: 'text',
+              text: lines.length === 0 ? value.summary : `${value.summary}\n${lines.join('\n')}`,
+            },
+          ];
+        },
+      },
+      async execute() {
+        try {
+          return readPendingBoard(config);
+        } catch (error) {
+          throw toToolError(error);
+        }
+      },
+    }),
+  );
+
+  ctx.tools.register(
+    defineTool({
+      name: 'tenon_resume',
+      description: RESUME_DESCRIPTION,
+      parameters: RESUME_PARAMETERS,
+      output: {
+        schema: outputSchema,
+        render: (_args, value) => [
+          {
+            type: 'text',
+            text:
+              `${value.status === 'needs_approval' ? '仍待人工批准（未执行）' : '已执行'}` +
+              `｜${value.detail}`,
+          },
+        ],
+      },
+      async execute(rawArgs, exec) {
+        try {
+          const call = readResumeArgs(rawArgs);
+          const outcome = await resumePlan({
+            config,
+            planId: call.planId,
+            approval: ctx.approval,
+            agent: exec?.agent,
+            signal: exec?.signal,
+          });
+          return {
+            status: outcome.status,
+            planId: outcome.planId,
+            module: outcome.module,
+            action: outcome.action,
+            detail: outcome.detail,
+            result: outcome.result,
+            requiredRoles: outcome.requiredRoles,
+          };
+        } catch (error) {
+          throw toToolError(error);
+        }
+      },
+    }),
+  );
+}
+
+/**
+ * 待批清单（`tenon_pending` 的实现）。
+ *
+ * `canApprove` 由部署配置里的 `operatorRoles` 现算——**它不是授权，只是提示**；真正的校验在
+ * 续跑时做（`rolesIntersect` 只在那里决定「要不要问人」）。
+ */
+export function readPendingBoard(config: ModuleHostConfig): { summary: string; pending: Json } {
+  const stateDir = config.stateDir ?? DEFAULT_STATE_DIR;
+  const entries = listPending(stateDir);
+  const operatorRoles = config.operatorRoles ?? [];
+
+  const rows = entries.map(({ plan, expired }) => ({
+    planId: plan.planId,
+    module: plan.module,
+    action: plan.action,
+    args: plan.args,
+    requiredRoles: plan.requiredRoles,
+    createdAt: plan.createdAt,
+    expiresAt: plan.expiresAt,
+    expired,
+    canApprove: rolesIntersect(operatorRoles, plan.requiredRoles),
+  }));
+
+  const expiredCount = rows.filter((row) => row.expired).length;
+  const approvable = rows.filter((row) => row.canApprove && !row.expired).length;
+  const summary =
+    rows.length === 0
+      ? '当前没有待批计划。'
+      : `共 ${rows.length} 条待批（${expiredCount} 条已过期），其中 ${approvable} 条本会话操作员可批` +
+        `（operatorRoles=${operatorRoles.join(',') || '∅'}）。`;
+
+  return { summary, pending: rows as unknown as Json };
 }
 
 export { Config };

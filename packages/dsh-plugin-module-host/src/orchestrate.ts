@@ -621,7 +621,7 @@ function buildPlanAuditRecord(
 }
 
 /** 两个角色集合是否有交集。`need` 为空即无人匹配（与宿主 `rolesIntersect` 同义）。 */
-function rolesIntersect(have: readonly string[], need: readonly string[]): boolean {
+export function rolesIntersect(have: readonly string[], need: readonly string[]): boolean {
   if (need.length === 0) return false;
   return need.some((role) => have.includes(role));
 }
