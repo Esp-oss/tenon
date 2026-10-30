@@ -25,7 +25,16 @@ import {
   DEFAULT_TIMEOUT_MS,
   type ModuleHostConfig,
 } from './config.js';
-import { archivePlan, rfc3339, savePending, type PendingPlan } from './pending.js';
+import {
+  archivePlan,
+  assertPlanId,
+  isExpired,
+  loadArchived,
+  loadPending,
+  rfc3339,
+  savePending,
+  type PendingPlan,
+} from './pending.js';
 
 /** 单步计划里的步骤标识（最小版只有一步）。 */
 export const STEP_ID = 's1';
@@ -650,6 +659,271 @@ function withNote(error: TenonCallError, note: string): TenonCallError {
     details: error.details,
     status: error.status,
   });
+}
+
+// ---------- 续跑（tenon_resume） ----------
+
+/** {@link resumePlan} 的入参。 */
+export interface ResumePlanInput {
+  config: ModuleHostConfig;
+  /** 要续哪一单（模型只能指定计划号，不能指定自己是谁）。 */
+  planId: string;
+  approval?: ApprovalPort;
+  agent?: unknown;
+  signal?: AbortSignal;
+}
+
+/**
+ * 续跑一条挂起的计划（设计 §6.2）。
+ *
+ * 与「当场批准」共用 {@link executePlan}，差别只在**续跑前要重新确认三件事**：
+ * 已归档？过期了？策略还同意吗？——挂起可能隔了几小时，期间策略改过、库存变过，
+ * 拿挂起时的结论直接执行就是拿旧结论做新决定。
+ *
+ * 结局：真的执行 → `executed`；仍需人批（无资格/拒批/无审批服务）→ `needs_approval`；
+ * 已归档 `done` 再续 → 幂等返回归档结论。其余（未找到/已终态/过期/策略改判拒绝）一律抛错，
+ * 因为那些都不是「还可以再试」的状态。
+ */
+export async function resumePlan(input: ResumePlanInput): Promise<ActionResult> {
+  const { config, planId, approval, agent, signal } = input;
+  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const host = hostOf(config);
+  const stateDir = stateDirOf(config);
+
+  assertIdentity(config);
+  assertPlanId(planId);
+
+  // ---- 1. 已归档：done 幂等返回结论，其它终态明确拒绝（绝不重放副作用）----
+  const archived = loadArchived(stateDir, planId);
+  if (archived !== null) {
+    if (archived.state === 'done') {
+      return {
+        status: 'executed',
+        planId,
+        module: archived.module,
+        action: archived.action,
+        detail:
+          `计划 ${planId} 已归档为 done（${archived.finishedAt}），**不重复执行**；` +
+          '下面是从归档读回的结论。',
+        result: archived.result,
+        requiredRoles: [],
+      };
+    }
+    throw new TenonCallError({
+      code: 'PLAN_ALREADY_FINISHED',
+      errorClass: 'business_rejection',
+      retryable: false,
+      message:
+        `计划 ${planId} 已归档为 ${archived.state}（${archived.note ?? '无说明'}），不会再执行；` +
+        '需要的话请重新发起。',
+      details: { planId, state: archived.state },
+    });
+  }
+
+  // ---- 2. 读回待批 ----
+  const pending = loadPending(stateDir, planId);
+  if (pending === null) {
+    throw new TenonCallError({
+      code: 'PENDING_NOT_FOUND',
+      errorClass: 'business_rejection',
+      retryable: false,
+      message: `没有找到待批计划 ${planId}（可能已处理、已过期或从未挂起）；可用 tenon_pending 查当前待批。`,
+      details: { planId },
+    });
+  }
+  if (pending.state === 'resuming') {
+    throw new TenonCallError({
+      code: 'PENDING_BUSY',
+      errorClass: 'business_rejection',
+      retryable: true,
+      message: `计划 ${planId} 正在处理中（state=resuming），不重复发起；若上一次是崩溃中断，需人工确认后再处理。`,
+      details: { planId },
+    });
+  }
+
+  // ---- 3. 过期：只写结局，绝不执行 ----
+  if (isExpired(pending)) {
+    await finishTerminal(config, pending, 'expired', { status: 'error', outputHash: null, errorClass: 'policy_denied' }, '计划已过期，未执行');
+    throw new TenonCallError({
+      code: 'PENDING_EXPIRED',
+      errorClass: 'policy_denied',
+      retryable: false,
+      message: `计划 ${planId} 已于 ${pending.expiresAt} 过期，**未执行**；已归档 expired，需要的话请重新发起。`,
+      details: { planId },
+    });
+  }
+
+  // ---- 4. 重跑策略：不信任挂起时的结论（与 internal/agent/resume.go 同构）----
+  const actionId = `${pending.module}.${pending.action}`;
+  const evaluation = await evaluatePolicy(host, planId, actionId, pending.args, timeoutMs, signal);
+  const requiredRoles = evaluation.approvers.length > 0 ? evaluation.approvers : pending.requiredRoles;
+
+  if (evaluation.outcome === 'deny') {
+    await finishTerminal(config, pending, 'stale', { status: 'error', outputHash: null, errorClass: 'policy_denied' }, '续跑时策略拒绝，未执行');
+    throw new TenonCallError({
+      code: 'TENON_POLICY_DENIED',
+      errorClass: 'policy_denied',
+      retryable: false,
+      message:
+        `续跑时策略拒绝 ${actionId}（planId=${planId}）：` +
+        `${evaluation.reasons.join('；') || '无理由码'}；已归档 stale，**未执行**。`,
+      details: { planId, decidedBy: evaluation.decidedBy, reasons: evaluation.reasons },
+    });
+  }
+
+  const baseURL = await discoverModule(host, pending.module, timeoutMs, signal);
+
+  // 策略在挂起之后被改成 auto：门已经不需要人守了，按原计划直接执行（不重规划）。
+  if (evaluation.outcome === 'auto') {
+    return executePlan({
+      config,
+      baseURL,
+      planId,
+      module: pending.module,
+      action: pending.action,
+      actionId,
+      args: pending.args,
+      argsBody: canonicalJSON(pending.args),
+      inputHash: pending.inputHash,
+      idemKey: pending.idempotencyKey,
+      policyId: firstNonEmpty(evaluation.decidedBy),
+      decisionOutcome: 'auto',
+      approvedBy: null,
+      pending,
+      timeoutMs,
+      signal,
+    });
+  }
+
+  if (evaluation.outcome !== 'approve') {
+    throw new TenonCallError({
+      code: 'MALFORMED_POLICY_OUTCOME',
+      errorClass: 'contract_violation',
+      retryable: false,
+      message: `policies:evaluate 的 outcome=${JSON.stringify(evaluation.outcome)} 非法（只能是 auto/approve/deny）`,
+      details: { planId },
+    });
+  }
+
+  // ---- 5. 资格与审批（与 approve 分支同一套判定）----
+  const operatorRoles = config.operatorRoles ?? [];
+  if (!rolesIntersect(operatorRoles, requiredRoles)) {
+    return {
+      status: 'needs_approval',
+      planId,
+      module: pending.module,
+      action: pending.action,
+      detail:
+        `续跑需要人工批准，但本会话操作员（${config.onBehalfOf}）不持有 ${requiredRoles.join('/')} ` +
+        `中的任一角色：未向任何人提问、未执行。待批仍有效（${pending.expiresAt} 前）。`,
+      result: null,
+      requiredRoles,
+    };
+  }
+  if (approval === undefined || typeof approval.request !== 'function' || agent === undefined) {
+    return {
+      status: 'needs_approval',
+      planId,
+      module: pending.module,
+      action: pending.action,
+      detail:
+        `续跑需要人工批准，但宿主没有提供可用的审批服务（ctx.approval 未装载或拿不到本轮 agent）：` +
+        `未执行。待批仍有效（${pending.expiresAt} 前）。`,
+      result: null,
+      requiredRoles,
+    };
+  }
+
+  // 抢锁：先标记 resuming 再问人，避免两个并行续跑各自问一遍、各执行一次。
+  const locked: PendingPlan = { ...pending, state: 'resuming' };
+  savePending(stateDir, locked);
+  let outcome: ApprovalOutcome;
+  try {
+    outcome = await approval.request({
+      agent,
+      toolName: 'tenon_action',
+      reason: `续跑 Tenon 计划 ${planId}（${actionId}），需要 ${requiredRoles.join('/')}`,
+      signal,
+    });
+  } catch (error) {
+    releaseLock(stateDir, pending);
+    throw error;
+  }
+  if (outcome !== 'allowed-once') {
+    releaseLock(stateDir, pending);
+    return {
+      status: 'needs_approval',
+      planId,
+      module: pending.module,
+      action: pending.action,
+      detail: `DSH 审批结局=${outcome}，仍未执行；待批仍有效（${pending.expiresAt} 前），可换人再续。`,
+      result: null,
+      requiredRoles,
+    };
+  }
+
+  // ---- 6. 执行（与原挂起的 planId / 幂等键完全一致）----
+  try {
+    return await executePlan({
+      config,
+      baseURL,
+      planId,
+      module: pending.module,
+      action: pending.action,
+      actionId,
+      args: pending.args,
+      argsBody: canonicalJSON(pending.args),
+      inputHash: pending.inputHash,
+      idemKey: pending.idempotencyKey,
+      policyId: pending.policyId,
+      decisionOutcome: 'approve',
+      approvedBy: config.onBehalfOf,
+      pending: locked,
+      timeoutMs,
+      signal,
+    });
+  } catch (error) {
+    // 执行没走完（且没归档）：把状态还原成待批，别让一单卡死在 resuming。
+    releaseLock(stateDir, pending);
+    throw error;
+  }
+}
+
+/** 释放 `resuming` 锁：只有「既没有归档、待批还在」时才还原，绝不复活已归档的计划。 */
+function releaseLock(stateDir: string, pending: PendingPlan): void {
+  try {
+    if (loadArchived(stateDir, pending.planId) !== null) return;
+    if (loadPending(stateDir, pending.planId) === null) return;
+    savePending(stateDir, pending);
+  } catch {
+    // 还原失败不该盖掉原始错误：调用方拿到的应当是「为什么没执行成」。
+  }
+}
+
+/**
+ * 给一条计划写终态：计划级 result 审计 + 归档。
+ *
+ * 用于「过期/策略改判」这类**不执行**的终结路径。审计写失败不改归档结果——结局必须落下，
+ * 否则这一单会一直挂在待批列表里，比审计缺一段更糟。
+ */
+async function finishTerminal(
+  config: ModuleHostConfig,
+  pending: PendingPlan,
+  terminal: 'expired' | 'stale' | 'rejected',
+  result: AuditResult,
+  note: string,
+): Promise<void> {
+  try {
+    await postAudit(
+      hostOf(config),
+      buildPlanAuditRecord(config, pending, 'result', { outcome: 'approve', approvedBy: null }, result),
+      config.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      undefined,
+    );
+  } catch {
+    // 见函数注释：归档优先。
+  }
+  archivePlan(stateDirOf(config), pending, terminal, { result: { status: result.status }, note });
 }
 
 // ---------- 各步的实现 ----------
