@@ -47,6 +47,9 @@ const INVENTORY_PORT_WANTED = Number(process.env.TENON_E2E_INVENTORY_PORT ?? 809
 const AGENT_ID = 'ag_dsh_e2e'
 const ON_BEHALF_OF = 'user:alice'
 
+/** 待批计划的落盘目录（在本次运行目录内，脚本每次运行先清空）。 */
+const STATE_DIR = path.join(RUN_DIR, 'module-host-state')
+
 /** 库存种子（与 inventory 的缺省种子一致，断言 120→115 才有意义）。 */
 const SKU = 'STD-1001'
 const SEED_ON_HAND = 120
@@ -67,6 +70,15 @@ function show(value) {
     return String(value)
   }
 }
+
+/**
+ * 「语义为空」的归一化。
+ *
+ * 宿主的审计**读模型**会把空串与 null 归成 null 或干脆省略（实测：计划级记录的
+ * `action:""`、`inputHash:""` 读回来是 null，`stepId:null`、`idempotencyKey:null` 读回来没有这个键）。
+ * 写侧仍是逐字段照发，这里只按「有没有值」判语义，避免脚本把宿主的读投影当成我们的写入形状。
+ */
+const norm = (value) => (value === undefined || value === '' ? null : value)
 
 function pass(label) {
   tally.pass += 1
@@ -314,6 +326,27 @@ async function auditFor(hostURL, planId) {
   return body.records
 }
 
+/**
+ * 读盘上的待批（或归档）记录。
+ *
+ * 续跑的证据必须来自**盘上文件**，而不是从返回值反推：否则「到底落盘了没有」这件事
+ * 永远没被验证过，而这正是本段要钉的东西。
+ *
+ * @param planId 计划号（词法不对直接返回 null，不拼路径）。
+ * @param sub 子目录（`'archived'` 读归档；缺省读待批）。
+ */
+function readPendingFile(planId, sub = null) {
+  if (typeof planId !== 'string' || !/^pln_[A-Za-z0-9_-]{4,64}$/.test(planId)) return null
+  const dir = sub === null ? path.join(STATE_DIR, 'pending') : path.join(STATE_DIR, 'pending', sub)
+  const file = path.join(dir, `${planId}.json`)
+  if (!existsSync(file)) return null
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
 /** 全量审计条数：用来证明「待批」与「策略拒绝」一次都没写审计。 */
 async function auditTotal(hostURL) {
   const body = await getJSON(`${hostURL}/tenon/audit`)
@@ -469,7 +502,16 @@ async function main() {
     await waitForModule(hostURL, 'inventory', inventoryProc)
     console.log('  inventory 已自注册（GET /tenon/modules 可见）')
 
-    const config = { hostURL, agentID: AGENT_ID, onBehalfOf: ON_BEHALF_OF, timeoutMs: 10_000 }
+    const config = {
+      hostURL,
+      agentID: AGENT_ID,
+      onBehalfOf: ON_BEHALF_OF,
+      timeoutMs: 10_000,
+      // 待批落盘目录放在本次运行目录里：RUN_DIR 每次运行先清空，待批集合因此每次都是全新的。
+      stateDir: STATE_DIR,
+      // 挂起时**不给**审批资格：这一段只验「真挂起」，提问与续跑留给 e) 段。
+      operatorRoles: [],
+    }
     const { runAction } = await import(pathToFileURL(path.join(PLUGIN_DIR, 'dist', 'orchestrate.js')).href)
     const { canonicalJSON } = await import(pathToFileURL(path.join(PLUGIN_DIR, 'dist', 'bridge.js')).href)
 
@@ -547,7 +589,7 @@ async function main() {
       eq('审计链连续（第二段的 prevHash = 第一段的 hash）', result.prevHash, dispatched.hash)
     })
 
-    await section('b) 编排层 · DeductStock qty=12（approve 只报告待批，绝不执行）', async () => {
+    await section('b) 编排层 · DeductStock qty=12（真挂起：落盘 + 计划级审计，绝不执行）', async () => {
       if (!assertAlive(hostProc) || !assertAlive(inventoryProc)) return
 
       const before = await moduleOnHand(moduleURL, SKU)
@@ -568,9 +610,30 @@ async function main() {
       const after = await moduleOnHand(moduleURL, SKU)
       eq('库存不变：115 → 115', `${before}→${after}`, '115→115')
 
+      // 挂起写**一条**计划级 dispatched 审计：stepId 为空、没有动作、没人批过。
       const records = await auditFor(hostURL, outcome?.planId)
-      eq('待批不写审计（approve 在审计之前就返回）', records.length, 0)
-      eq('全量审计条数不变（一次请求都没发到模块）', await auditTotal(hostURL), totalBefore)
+      eq('挂起写且只写一条审计', records.map((record) => record.stage), ['dispatched'])
+      const planDispatched = records[0]
+      if (planDispatched !== undefined) {
+        eq('计划级记录没有 step', [norm(planDispatched.stepId), norm(planDispatched.action), norm(planDispatched.inputHash)], [
+          null,
+          null,
+          null,
+        ])
+        eq('计划级记录没有幂等键（批准的是整份 plan）', norm(planDispatched.idempotencyKey), null)
+        eq('计划级记录的 decision.outcome = approve', planDispatched.decision?.outcome, 'approve')
+        eq('挂起这一刻还没人批：approvedBy 为 null', planDispatched.decision?.approvedBy, null)
+        eq('计划级记录的 result.status = unknown', planDispatched.result?.status, 'unknown')
+      }
+      eq('全量审计条数 +1（只多了这条计划级记录）', await auditTotal(hostURL), totalBefore + 1)
+
+      // 盘上真的有一条待批，且 I7 第三步已回写。
+      const stored = readPendingFile(outcome?.planId)
+      ok('待批已落盘（没有落盘就无从续跑）', stored !== null, show(outcome?.planId))
+      eq('落盘记录与返回的 planId 一致', stored?.planId, outcome?.planId)
+      eq('I7 第三步已回写 auditSettled', stored?.auditSettled, true)
+      eq('落盘记录保留了审批角色', stored?.requiredRoles, ['role:warehouse_manager'])
+      eq('没有审批资格时不会向任何人提问', /不持有上述任一角色/.test(outcome?.detail ?? ''), true)
     })
 
     await section('c) 编排层 · 未登记动作 inventory.NoSuchAction（fail-closed 默认拒绝）', async () => {
@@ -619,13 +682,23 @@ async function main() {
         config,
       )
 
-      eq('本包只注册一个工具', registered.length, 1)
-      const tool = registered[0]
+      eq('本包注册三个工具（action / pending / resume）', registered.map((item) => item.name).sort(), [
+        'tenon_action',
+        'tenon_pending',
+        'tenon_resume',
+      ])
+      const tool = registered.find((item) => item.name === 'tenon_action')
       eq('工具名是 tenon_action', tool?.name, 'tenon_action')
       eq(
         '参数面仍然只有 module/action/args（构建产物与源码一致）',
         Object.keys(tool?.parameters?.properties ?? {}).sort(),
         ['action', 'args', 'module'],
+      )
+      const resumeTool = registered.find((item) => item.name === 'tenon_resume')
+      eq(
+        '续跑工具只接受 planId（身份与批准不可由模型传入）',
+        Object.keys(resumeTool?.parameters?.properties ?? {}),
+        ['planId'],
       )
 
       const exec = { signal: new AbortController().signal }
@@ -646,13 +719,115 @@ async function main() {
       eq('工具层 qty=12 没有改动库存', await moduleOnHand(moduleURL, SKU), before - 5)
       ok('工具层待批同样明写「未执行」', /未执行/.test(pending?.detail ?? ''), show(pending?.detail))
 
-      // 工具层走的是同一套闸门：执行那次有两段审计，待批那次一条都没有。
+      // 工具层走的是同一套闸门：执行那次两段 step 级审计；待批那次只有一条计划级记录。
       const executedAudit = await auditFor(hostURL, executed?.planId)
       eq('工具层执行的那次也有完整两段审计', executedAudit.map((record) => record.stage), [
         'dispatched',
         'result',
       ])
-      eq('工具层待批的那次没有审计', (await auditFor(hostURL, pending?.planId)).length, 0)
+      const pendingAudit = await auditFor(hostURL, pending?.planId)
+      eq('工具层待批的那次是计划级一条（stepId 为空）', pendingAudit.map((record) => record.stage), [
+        'dispatched',
+      ])
+      eq('工具层待批的计划级记录没有 step', norm(pendingAudit[0]?.stepId), null)
+      ok('工具层待批的那次也已落盘', readPendingFile(pending?.planId) !== null)
+    })
+
+    await section('e) 续跑 · 真 host + 真 inventory + 假 answerer（批准后才执行）', async () => {
+      if (!assertAlive(hostProc) || !assertAlive(inventoryProc)) return
+
+      const { resumePlan } = await import(
+        pathToFileURL(path.join(PLUGIN_DIR, 'dist', 'orchestrate.js')).href
+      )
+
+      // 先挂起一单（用本段自己的 referenceNo，避免与前面几次撞业务幂等键）。
+      const before = await moduleOnHand(moduleURL, SKU)
+      const suspended = await runAction({
+        config,
+        module: 'inventory',
+        action: 'DeductStock',
+        args: { sku: SKU, qty: 12, referenceNo: ref('F') },
+      })
+      eq('续跑前置：先挂起', suspended?.status, 'needs_approval')
+      const planId = suspended?.planId
+      ok('待批已落盘', readPendingFile(planId) !== null)
+
+      // ① 本会话没有仓管角色 → 不提问、不执行，待批仍在。
+      let asked = 0
+      const noQualification = await resumePlan({
+        config: { ...config, operatorRoles: [] },
+        planId,
+        approval: {
+          async request() {
+            asked += 1
+            return 'allowed-once'
+          },
+        },
+        agent: { id: AGENT_ID },
+      })
+      eq('无资格时结局仍是 needs_approval', noQualification?.status, 'needs_approval')
+      eq('无资格时不向任何人提问', asked, 0)
+      eq('无资格时库存不变', await moduleOnHand(moduleURL, SKU), before)
+      ok('无资格时待批仍然在盘上', readPendingFile(planId) !== null)
+
+      // ② 有资格但人拒了 → 不执行，状态还原成待批。
+      const rejected = await resumePlan({
+        config: { ...config, operatorRoles: ['role:warehouse_manager'] },
+        planId,
+        approval: { async request() { return 'rejected' } },
+        agent: { id: AGENT_ID },
+      })
+      eq('拒批结局是 needs_approval', rejected?.status, 'needs_approval')
+      ok('拒批明写结局', /rejected/.test(rejected?.detail ?? ''), show(rejected?.detail))
+      eq('拒批后库存不变', await moduleOnHand(moduleURL, SKU), before)
+      eq('拒批后状态还原成 awaiting_approval', readPendingFile(planId)?.state, 'awaiting_approval')
+
+      // ③ 有资格 + allowed-once → 真执行，审计带 approvedBy。
+      const approved = await resumePlan({
+        config: { ...config, operatorRoles: ['role:warehouse_manager'] },
+        planId,
+        approval: { async request() { return 'allowed-once' } },
+        agent: { id: AGENT_ID },
+      })
+      eq('批准后真执行', approved?.status, 'executed')
+      eq('批准后库存真减：115 → 103', await moduleOnHand(moduleURL, SKU), before - 12)
+
+      const records = await auditFor(hostURL, planId)
+      eq('四段审计：计划级 dispatched + step 两段 + 计划级 result', records.map((record) => `${record.stage}/${String(record.stepId ?? null)}`), [
+        'dispatched/null',
+        'dispatched/s1',
+        'result/s1',
+        'result/null',
+      ])
+      const stepRecords = records.filter((record) => record.stepId === 's1')
+      eq('step 级两段都写了审批人', stepRecords.map((record) => record.decision?.approvedBy), [
+        'user:alice',
+        'user:alice',
+      ])
+      eq('step 级两段的幂等键沿用挂起时的', stepRecords.map((record) => record.idempotencyKey), [
+        `tenon:${planId}/s1`,
+        `tenon:${planId}/s1`,
+      ])
+      eq('计划级两段共用挂起时的 auditId', [records[0]?.auditId, records[3]?.auditId], [
+        records[0]?.auditId,
+        records[0]?.auditId,
+      ])
+
+      const archived = readPendingFile(planId, 'archived')
+      eq('归档终态是 done', archived?.state, 'done')
+      eq('归档记录了审批人', archived?.approvedBy, ON_BEHALF_OF)
+      eq('归档后待批目录里没有这一单', readPendingFile(planId), null)
+
+      // ④ 再续一次：幂等返回，库存不再动。
+      const again = await resumePlan({
+        config: { ...config, operatorRoles: ['role:warehouse_manager'] },
+        planId,
+        approval: { async request() { return 'allowed-once' } },
+        agent: { id: AGENT_ID },
+      })
+      eq('重复续跑返回 executed（归档结论回放）', again?.status, 'executed')
+      ok('重复续跑不重复执行', /不重复执行/.test(again?.detail ?? ''), show(again?.detail))
+      eq('重复续跑库存不变', await moduleOnHand(moduleURL, SKU), before - 12)
     })
   } finally {
     await Promise.all(processes.map((record) => stopProcess(record)))
