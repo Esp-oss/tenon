@@ -193,3 +193,13 @@ POST /tenon/requests/ack {upto}            # role:agent
 | C. 宿主新增「confirm 专用只读端点」 | 只回 confirm 帧、不 ack | 要动已冻结的控制平面（ADR §2），但边界最干净 |
 
 **建议 A 先行**（零治理变更、可回退），把 B/C 留给 ADR 决定。唤醒则用「挂起时把 `exec.agent` 存在内存 Map 里」：同一进程存活期内可 `followup` 唤醒，重启后没有 handle ⇒ 只执行不唤醒（业务完成，聊天里看不到），这条限制要写进 README。
+
+### 10.3 已按 A 实现（2026-10-29）
+
+- `createConfirmPoller`：`GET /tenon/requests/poll?after=<内存游标>` → 只处理 `tenon.confirm`，**从不调 `/tenon/requests/ack`**；`tenon.request` 帧一律不碰，但游标照样前进（否则每轮重读同一批）；
+- confirm 帧的 `by`/`roles` 直接作为批准依据：`resumePlan` 新增 `grant` 入参，给了就**不再问 DSH**（人已经批过），但仍校验 `roles ∩ requiredRoles`——宿主验的是「他是谁、有什么角色」，不是「他够不够格批这一单」；
+- 幂等：没有 ack ⇒ 重启后从头读，靠「已归档就跳过」挡住重放（不依赖模块业务幂等键兜底，但那个也在）；
+- 生命周期：只有配了 agent 凭据**且**宿主给了 `ctx.effect` 才启动定时器（缺一个都不起，避免定时器泄漏）；
+- 实测：`node scripts/verify-module-host.mjs` 的 f) 段——以 bob 的 token 提交 `tenon.confirm` → 轮询器执行 → 库存 103→91、审计 `approvedBy=user:bob`（**来自宿主 token，不是配置**）→ 卡片覆盖成 done → 再用 agent token 读队列，**帧仍在**（证明从未 ack）→ 新轮询器重放不产生动作。合计 93 条断言。
+
+**仍未做：唤醒**。`agent.followup(message)` 需要一个 `UserMessage` 对象，本包不引 `@deepseek-ai/dsh-llm`（计划约束只允许 dsh-tools/schemastery），而按结构猜一个消息形状属于「没验证过的能力」——不猜。因此公告板批准后**业务会完成，但聊天里不会自动出现一句话**；要知道结果得问 `tenon_pending` 或再续一次（`resumePlan` 会返回归档结论）。
