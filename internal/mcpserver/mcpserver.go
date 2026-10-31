@@ -48,7 +48,7 @@ type Server struct {
 
 	mu    sync.Mutex
 	token string
-	HTTP       *http.Client
+	HTTP  *http.Client
 	// Log 是诊断输出（stderr）。默认丢弃，由 cmd 接上 os.Stderr。
 	Log io.Writer
 }

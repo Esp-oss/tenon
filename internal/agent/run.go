@@ -24,7 +24,7 @@
 //   - 预演判 unsafe：模块算出这一步在当前状态下不成立，裁决回填后重规划（maxReplans）；
 //   - 一整轮只有只读动作：事实已到手但处置还没开始，把事实回填后重规划
 //     （maxObservationRounds）；用尽仍无写动作则转人工——读结果不是完成。
-//	9 发 Intent 帧（open + highlight；没有前端接入时帧丢失而业务结果不变）
+//     9 发 Intent 帧（open + highlight；没有前端接入时帧丢失而业务结果不变）
 //
 // 三条 fail-closed 规则贯穿全文件：
 //   - 宿主不可达 → 不做任何写，结局 failed（宁可不做，也不要做出没有审计的写）；
@@ -91,15 +91,15 @@ const (
 
 	// 以下取值来自 spec/0.1 的 schema（policy / plan / frames），本文件只引用字符串，
 	// 不复制它们的语义定义。
-	outcomeAuto     = "auto"     // policy.schema.json 的 outcome：可自动执行
-	outcomeApprove  = "approve"  // policy.schema.json 的 outcome：等人工批准，agent 只能挂起
-	outcomeDeny     = "deny"     // policy.schema.json 的 outcome：转人工，不得换路
-	kindRead        = "read"     // plan.schema.json 的 kind
-	kindWrite       = "write"    // plan.schema.json 的 kind
-	dryRunVerified  = "verified" // plan.schema.json 的 DryRunStatus：唯一允许自动执行的值
+	outcomeAuto    = "auto"     // policy.schema.json 的 outcome：可自动执行
+	outcomeApprove = "approve"  // policy.schema.json 的 outcome：等人工批准，agent 只能挂起
+	outcomeDeny    = "deny"     // policy.schema.json 的 outcome：转人工，不得换路
+	kindRead       = "read"     // plan.schema.json 的 kind
+	kindWrite      = "write"    // plan.schema.json 的 kind
+	dryRunVerified = "verified" // plan.schema.json 的 DryRunStatus：唯一允许自动执行的值
 	// dryRunUnsafe 是「这一步在当前状态下不成立」——事实性裁决，不是治理拒绝。
 	// 它值得回填一轮：模块刚刚算出了新的信息（DAG 里没有任何别的途径能拿到它）。
-	dryRunUnsafe = "unsafe"
+	dryRunUnsafe    = "unsafe"
 	frameTypeIntent = "tenon.intent"
 	// auditStage* 与 internal/controlplane/audit 的两段写一致（dispatched / result）。
 	auditStageDispatched = "dispatched"
@@ -454,8 +454,8 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, replanFeed
 			// 所以给一次带裁决的重新规划（预算与业务拒绝共用）。为什么这不是「绕路」：
 			// 换出来的写动作要自己再过一遍预演，没有哪一步能跳过它。
 			return RunResult{Outcome: OutcomeNeedsHuman,
-				Detail: fmt.Sprintf("预演结论为 unsafe：动作 %s 在当前状态下不成立，本轮一步未执行，重新规划",
-					step.Action)},
+					Detail: fmt.Sprintf("预演结论为 unsafe：动作 %s 在当前状态下不成立，本轮一步未执行，重新规划",
+						step.Action)},
 				replanFeedback{kind: replanBlocked,
 					text: fmt.Sprintf("动作 %s 的预演结论是 unsafe：模块判定它在当前状态下不成立"+
 						"（这一步没有被执行过，也没有留下任何副作用）。", step.Action)}
@@ -553,7 +553,7 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, replanFeed
 		}
 		r.observationRounds++
 		return RunResult{Outcome: OutcomeNeedsHuman,
-			Detail: fmt.Sprintf("第 %d 轮只有只读动作（%d 步），进入下一轮规划", r.observationRounds, len(ordered))},
+				Detail: fmt.Sprintf("第 %d 轮只有只读动作（%d 步），进入下一轮规划", r.observationRounds, len(ordered))},
 			replanFeedback{kind: replanObservation,
 				text: fmt.Sprintf("上一轮（planId=%s）执行的全部是只读动作，清单里的写动作一个都没用到。",
 					plan.PlanID)}

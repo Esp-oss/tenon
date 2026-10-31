@@ -64,8 +64,8 @@ func main() {
 			createPurchaseRequestAction(),
 			listPurchaseRequestsAction(),
 		},
-		Events:   []string{"purchase.requested"},
-		Handle:   store.handle,
+		Events: []string{"purchase.requested"},
+		Handle: store.handle,
 		// DryRun 刻意留空：C8 要的是「模块没实现预演」这个真实状态，
 		// 而不是实现了却报告 unsupported。
 		DryRun: nil,

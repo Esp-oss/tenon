@@ -224,10 +224,10 @@ func getQuoteAction() module.Action {
 // 仍是动作协议的一部分（不是页面专用接口）：页面显示的值与 agent 读到的是同一份状态。
 func listQuotesAction() module.Action {
 	return module.Action{
-		ID:      actionListQuotes,
-		Version: "0.1.0",
-		Title:   "报价单列表",
-		Kind:    "read",
+		ID:          actionListQuotes,
+		Version:     "0.1.0",
+		Title:       "报价单列表",
+		Kind:        "read",
 		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{}}`),
 		OutputSchema: json.RawMessage(`{
   "type": "object",
