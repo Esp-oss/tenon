@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -406,5 +407,46 @@ func TestRegistryEndpointsRejectGet(t *testing.T) {
 		if resp.StatusCode != http.StatusMethodNotAllowed {
 			t.Fatalf("GET %s 应 405，得到 %d", path, resp.StatusCode)
 		}
+	}
+}
+
+// lastSeen 必须是带偏移的 RFC3339。
+//
+// 这条用例的由来：我曾把 `/tenon/modules` 的输出 `11/01/2026 00:54:30` 当成「本地时间
+// 不带时区」，据此差点改动序列化。实际那是 PowerShell `ConvertFrom-Json` 把字符串转成
+// DateTime 后的本地化显示，线上字段是 `time.Time` 的标准 JSON。改它反而会撞契约，
+// 所以这里只加断言：消费方（含非 +08:00 的）能直接解析出心跳年龄。
+func TestModulesLastSeenIsRFC3339WithOffset(t *testing.T) {
+	host := newRegistryHost(t, []byte(testHMACSecret))
+	defer host.Close()
+	manifest := testManifest()
+	registerModule(t, host, manifest, declarationHash(t, manifest))
+
+	resp, err := http.Get(host.URL + "/tenon/modules")
+	if err != nil {
+		t.Fatalf("读取模块视图失败：%v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+
+	var view struct {
+		Modules []struct {
+			LastSeen string `json:"lastSeen"`
+		} `json:"modules"`
+	}
+	if err := json.Unmarshal(raw, &view); err != nil {
+		t.Fatalf("视图不是 JSON：%v（%s）", err, raw)
+	}
+	if len(view.Modules) == 0 {
+		t.Fatalf("注册后应可见：%s", raw)
+	}
+
+	pattern := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$`)
+	seen := view.Modules[0].LastSeen
+	if !pattern.MatchString(seen) {
+		t.Fatalf("lastSeen = %q，不是带偏移的 RFC3339（消费方会读错心跳年龄）", seen)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, seen); err != nil {
+		t.Fatalf("lastSeen 无法按 RFC3339 解析：%v", err)
 	}
 }

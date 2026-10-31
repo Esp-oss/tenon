@@ -112,3 +112,29 @@ func TestStaticRejectsNonGet(t *testing.T) {
 		t.Fatalf("POST / 应 405，得到 %d", resp.StatusCode)
 	}
 }
+
+// 静态资源必须带 no-cache：只有 Last-Modified 时浏览器会启发式复用旧副本，
+// 于是页面 HTML 换了、app.js 没换，现象是「功能点了没反应」而日志全是 200。
+func TestStaticAssetsRevalidate(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<h1>x</h1>"), 0o600); err != nil {
+		t.Fatalf("写 index 失败：%v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app.js"), []byte("console.log(1)"), 0o600); err != nil {
+		t.Fatalf("写脚本失败：%v", err)
+	}
+	s := newTestServer(t, Config{AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"), UIDir: dir})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	for _, path := range []string{"/", "/ui/app.js"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s 失败：%v", path, err)
+		}
+		_ = resp.Body.Close()
+		if got := resp.Header.Get("Cache-Control"); got != "no-cache" {
+			t.Fatalf("GET %s 的 Cache-Control = %q，期望 no-cache", path, got)
+		}
+	}
+}

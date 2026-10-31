@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>注册中心 · Tenon</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2024; --muted:#6b7280; --line:#e3e6ea;
+          --accent:#2f6fed; --ok:#15803d; --warn:#b45309; --err:#b91c1c;
+          --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{background:var(--card);border-bottom:1px solid var(--line);padding:12px 20px;
+         display:flex;align-items:baseline;gap:18px;flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:650}
+  header .sub{color:var(--muted);font-size:12px}
+  nav{margin-left:auto;display:flex;gap:4px}
+  nav a{color:var(--muted);text-decoration:none;padding:4px 10px;border-radius:6px;font-size:13px}
+  nav a:hover{background:#eef1f5;color:var(--ink)}
+  nav a.on{background:#e8efff;color:var(--accent);font-weight:600}
+  main{max-width:1100px;margin:20px auto 60px;padding:0 20px;display:grid;gap:16px}
+  section.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  section.card>h2{margin:0 0 6px;font-size:13px;font-weight:650;color:var(--muted);
+                  letter-spacing:.4px;text-transform:uppercase}
+  .caveat{color:var(--muted);font-size:12px;margin:0 0 12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px}
+  tr:last-child td{border-bottom:0}
+  code{font-family:var(--mono);font-size:12px;background:#f2f4f7;padding:1px 5px;border-radius:4px}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;
+        background:#eef1f5;color:var(--muted);margin:0 4px 4px 0}
+  .pill.ok{background:#e7f6ec;color:var(--ok)}
+  .pill.warn{background:#fdf3e3;color:var(--warn)}
+  .pill.read{background:#eef4ff;color:#2f6fed}
+  .pill.write{background:#fdf0ea;color:#b45309}
+  .age{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .acts{display:flex;flex-direction:column;gap:3px}
+  footer{text-align:center;color:var(--muted);font-size:12px}
+  #error{display:none;border:1px solid #f3c9c9;background:#fdf1f1;color:var(--err);
+         border-radius:8px;padding:10px 12px;font-size:13px;white-space:pre-wrap}
+
+  /* 对话已全部迁到 dsh（127.0.0.1:3080）：本页只做注册中心视图，不再挂对话组件。 */
+  .goto{display:inline-block;margin-top:4px;font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Tenon 注册中心</h1>
+  <span class="sub">模块自注册 · HMAC 心跳 · 能力来自 GET /.well-known/tenon</span>
+  <nav>
+    <a href="http://127.0.0.1:8081/">库存</a>
+    <a href="http://127.0.0.1:8082/">备货</a>
+    <a href="http://127.0.0.1:8083/">报价</a>
+    <a href="http://127.0.0.1:3080/" target="_blank" rel="noreferrer">Agent 对话（dsh）</a>
+    <a class="on" href="/ui/registry.html">注册中心</a>
+  </nav>
+</header>
+
+<main>
+  <div id="error"></div>
+
+  <section class="card">
+    <h2>已注册模块</h2>
+    <p class="caveat">
+      这里<strong>只列出 <code>enabled &amp;&amp; alive</code> 的模块</strong>。掉线的模块不会显示成 lost，而是从表里消失——
+      看不到不等于没问题，看到少了一行才是问题。心跳年龄每 5 秒刷新。
+    </p>
+    <table>
+      <thead>
+        <tr><th>模块</th><th>状态</th><th>心跳</th><th>声明能力</th><th>动作（kind）</th></tr>
+      </thead>
+      <tbody id="rows"><tr><td colspan="5" class="caveat">读取中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>对话在哪</h2>
+    <p class="caveat">
+      对话只有一个入口：dsh 容器（<code>http://127.0.0.1:3080/</code>）。它通过 MCP 读这张表
+      （<code>mcp__tenon__registry_list</code>），并在对话里用选项卡片让你决定「允许执行 / 驳回」。
+      本页不再提供输入框——同一个状态有两个对话入口，迟早会出现「在 A 页点过、在 B 页又点一次」。
+    </p>
+    <a class="goto" href="http://127.0.0.1:3080/" target="_blank" rel="noreferrer">打开 dsh 对话 →</a>
+    <p class="caveat" style="margin:10px 0 0">
+      如果打开后只有一行 <code>dsh web authentication required</code>，那不是链接坏了：
+      dsh 的入口是启动时打印的 <strong>带 <code>?token=…</code> 的那条 URL</strong>（token 每进程随机、
+      只存在内存里），访问它才会种下 30 天的 HttpOnly cookie；之后这个裸地址在同一个浏览器里直接可用。
+      本仓的 <code>scripts/dsh-up.ps1</code> 会把那条 URL 抓到 <code>out/dev/dsh-url.txt</code> 并打印出来。
+    </p>
+  </section>
+
+  <footer>数据来源：GET /tenon/modules（宿主可见视图，非测试态没有全量视图）</footer>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let snapshot = [];
+
+function ageSeconds(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return Math.max(0, Math.round((Date.now() - t) / 1000));
+}
+
+function ageText(iso) {
+  const s = ageSeconds(iso);
+  if (s === null) return '—';
+  if (s < 60) return s + ' 秒前';
+  if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒前';
+  return Math.floor(s / 3600) + ' 小时前';
+}
+
+function render() {
+  const rows = $('rows');
+  if (!snapshot.length) {
+    rows.innerHTML = '<tr><td colspan="5" class="caveat">没有任何模块注册（或全部掉线）。</td></tr>';
+    return;
+  }
+  rows.innerHTML = snapshot.map((m) => {
+    const man = m.manifest || {};
+    const actions = Array.isArray(man.actions) ? man.actions : [];
+    const caps = Array.isArray(man.capabilities) ? man.capabilities : [];
+    const title = (man.module && man.module.title) || m.id;
+    const stateClass = m.state === 'alive' ? 'ok' : 'warn';
+    const actHtml = actions.map((a) => {
+      const kind = a.kind === 'write' ? 'write' : 'read';
+      return '<span class="pill ' + kind + '">' + a.id + ' · ' + kind + '</span>';
+    }).join('') || '<span class="caveat">未声明动作</span>';
+    const capHtml = caps.map((c) => '<span class="pill">' + c + '</span>').join('') ||
+      '<span class="caveat">—</span>';
+    return '<tr>' +
+      '<td><strong>' + title + '</strong><br><code>' + m.id + '</code><br>' +
+        '<span class="caveat">' + (m.baseURL || '') + '</span></td>' +
+      '<td><span class="pill ' + stateClass + '">' + m.state + '</span><br>' +
+        '<span class="caveat">hash ' + String(m.declarationHash || '').slice(7, 19) + '</span></td>' +
+      '<td class="age" data-seen="' + (m.lastSeen || '') + '">' + ageText(m.lastSeen) + '</td>' +
+      '<td>' + capHtml + '</td>' +
+      '<td><div class="acts">' + actHtml + '</div></td>' +
+    '</tr>';
+  }).join('');
+}
+
+// 心跳年龄只改文本，不重建表格：否则每次刷新都会把用户正在看的滚动位置抖掉。
+function tickAges() {
+  document.querySelectorAll('td.age').forEach((cell) => {
+    cell.textContent = ageText(cell.getAttribute('data-seen'));
+  });
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/tenon/modules', { headers: { 'Accept': 'application/json' } });
+    const raw = await res.text();
+    if (!res.ok) throw new Error('HTTP ' + res.status + '：' + raw.slice(0, 200));
+    const data = JSON.parse(raw);
+    snapshot = Array.isArray(data.modules) ? data.modules : [];
+    $('error').style.display = 'none';
+    render();
+  } catch (err) {
+    const box = $('error');
+    box.textContent = '读取注册中心失败：' + err.message;
+    box.style.display = 'block';
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+setInterval(tickAges, 1000);
+</script>
+</body>
+</html>

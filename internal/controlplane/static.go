@@ -47,6 +47,15 @@ func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// 每次都要回源校验（no-cache = 可缓存但必须 revalidate，不是不缓存）。
+	//
+	// 不设它的后果实测过：ServeFile 只给 Last-Modified，浏览器按启发式规则复用旧副本，
+	// 于是 index.html 已经是新版、app.js 还是几小时前那份。现象是「页面上功能点了没反应」，
+	// 而服务器日志里全是 200、毫无异常，排查方向会被带偏（2026-11-01 实测：页面加载的
+	// app.js 是 23KB 旧版，服务器当时给的是 30KB 新版）。
+	//
+	// 不是 no-store：这些文件改完就该生效，但没改的时候 304 比重新传 30KB 划算。
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeFile(w, r, full)
 }
 

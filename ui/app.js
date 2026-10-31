@@ -1,23 +1,30 @@
 'use strict';
 
 /*
- * Tenon 对话入口（无构建链的纯静态页）。
+ * Tenon 待批看板（无构建链的纯静态页，**只读**）。
+ *
+ * 对话入口只有一个：dsh 容器（127.0.0.1:3080）。本页不发任何请求帧，
+ * 只镜像宿主的只读状态——多入口最典型的故障是「同一个决定被点两次」，
+ * 而只要这里没有写路径，它就不可能发生。
  *
  * 协议形状以宿主代码为准，这里不猜：
  *   POST /tenon/session   {user, password}                → {token, user, roles, exp}
- *   POST /tenon/requests  tenon.request / tenon.confirm    → {ok, seq, durable}
  *   GET  /tenon/pending   Bearer token                     → {items:[{planId, requestId,
  *                                                            by, summary, items:[{label}],
  *                                                            requiredRoles, expiresAt, mine, state}]}
+ *   GET  /tenon/intents/poll?after=                        → {frames:[{seq,frame}], nextCursor}
  *
- * 四条不能松的约定：
- *   1. requestId 由宿主签发，前端不生成；前端只生成 confirmId（^cfm_[A-Za-z0-9_-]{4,}$）；
- *   2. confirm 帧不放 roles —— 宿主先删后写（取 token 里的角色），填了也会被丢弃；
- *   3. 未知 state 一律当待批（fail-closed），绝不显示成已完成；
- *   4. 错误必须显示在页面上（tenonError.code/message 或原始响应体），不能只进 console。
+ * 三条不能松的约定：
+ *   1. 未知 state 一律当待批（fail-closed），绝不显示成已完成；
+ *   2. 卡片一律不可操作（没有批准/驳回按钮）：批准只走 dsh，本页只显示「在 dsh 里怎么说」；
+ *   3. 错误必须显示在页面上（tenonError.code/message 或原始响应体），不能只进 console。
  */
 
 const POLL_MS = 2000;
+
+// intentCursor 是 /tenon/intents/poll 的游标：持久化到 sessionStorage，
+// 刷新页面不会把已经看过的结论再放一遍。
+let intentCursor = Number(sessionStorage.getItem('tenon.intentCursor') || 0);
 const SESSION_KEY = 'tenon.ui.session.v1';
 
 // 终态集合来自协议。不在这里的 state（含空串、future 名字）一律按待批处理。
@@ -93,6 +100,10 @@ const state = {
   roles: [],
   exp: 0, // 秒（宿主签发的时间戳）
   items: [], // 最近一次 GET /tenon/pending 的 items
+  // intents 是 agent 的结局帧（内存态，按游标增量拉）。它比公告板全：没有待批卡的
+  // 回合（被闸门拒、auto 直接执行）也会有一条，界面上才不会「agent 一声不响」。
+  // 这里**只读回放**：帧是 agent 说完的话，不是可点的操作。
+  intents: [],
   pollTimer: null,
   refreshing: false,
   errorFromPoll: false,
@@ -247,8 +258,8 @@ function renderSession() {
   const logged = !!state.token;
   $('login-form').hidden = logged;
   $('session-info').hidden = !logged;
-  $('send').disabled = !logged;
-  $('request-text').disabled = !logged;
+  // 本页没有输入框可禁用：说话与批准的入口都在 dsh，这里的登录只用来读公告板
+  // （GET /tenon/pending 要 Bearer token）。
   if (logged) {
     $('session-user').textContent = state.user || '（未知用户）';
     renderRoles($('session-roles'), state.roles);
@@ -299,121 +310,6 @@ function onLogout() {
   setStatus('已退出。');
 }
 
-// ---------- 说话 ----------
-
-async function onSend() {
-  clearError();
-  if (!state.token) {
-    showError('尚未登录：先登录再发送。');
-    return;
-  }
-
-  const text = $('request-text').value.trim();
-  if (!text) {
-    showError('请先输入要对 agent 说的话。');
-    return;
-  }
-  if (text.length > 2000) {
-    showError('原话超过 2000 字符上限（当前 ' + text.length + '）。');
-    return;
-  }
-
-  // 视图上下文三项必须一起填：只给一半构造不出合法 EntityRef，宁可在前端拦住。
-  let view = null;
-  if ($('ctx-toggle').checked) {
-    const module = $('ctx-module').value.trim();
-    const type = $('ctx-type').value.trim();
-    const id = $('ctx-id').value.trim();
-    if (!module || !type || !id) {
-      showError('视图上下文要三项一起填（module / type / id），或者取消勾选「附带视图上下文」。');
-      return;
-    }
-    view = { module, type, id };
-  }
-
-  // 不填 requestId：宿主签发。by 会被宿主用 token 覆写，这里给合法形状即可。
-  const frame = { type: 'tenon.request', text, by: state.user };
-  if (view) frame.context = { view };
-
-  $('send').disabled = true;
-  try {
-    const data = await api('POST', '/tenon/requests', frame);
-    $('request-text').value = '';
-    setStatus(
-      '已发送：seq ' + data.seq + '，' + (data.durable ? '已落盘' : '仅内存（未落盘，重启会丢）') + '。等 agent 处理中…'
-    );
-    await refreshBoard();
-  } catch (err) {
-    reportError(err);
-  } finally {
-    $('send').disabled = !state.token;
-  }
-}
-
-// ---------- 批/驳 ----------
-
-function newConfirmId() {
-  let core;
-  const cryptoObj = window.crypto || {};
-  if (typeof cryptoObj.randomUUID === 'function') {
-    core = cryptoObj.randomUUID();
-  } else if (typeof cryptoObj.getRandomValues === 'function') {
-    const bytes = new Uint8Array(16);
-    cryptoObj.getRandomValues(bytes);
-    core = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  } else {
-    // 非安全上下文（例如用局域网 IP + http 打开）没有 WebCrypto：退化成时间+随机数，够用即可。
-    core = Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
-  }
-  return 'cfm_' + core.replace(/[^A-Za-z0-9_-]/g, '');
-}
-
-async function onConfirm(planId, decision, trigger) {
-  const item = state.items.find((it) => it && it.planId === planId);
-  if (!item) {
-    showError('这张卡已经不在当前看板上了（可能刚被处理），请刷新后再试。');
-    return;
-  }
-
-  // roles 不放：宿主会删掉前端填的 roles，再用 token 里的角色覆写。
-  const frame = {
-    type: 'tenon.confirm',
-    confirmId: newConfirmId(),
-    planId: item.planId,
-    decision,
-    patch: null,
-    by: state.user, // 形状合法即可，宿主用 token 的 sub 覆写
-    at: new Date().toISOString(),
-  };
-
-  clearError();
-  const card = trigger && trigger.closest ? trigger.closest('.card') : null;
-  const buttons = card ? Array.from(card.querySelectorAll('button')) : [];
-  buttons.forEach((b) => {
-    b.disabled = true;
-  });
-
-  try {
-    const data = await api('POST', '/tenon/requests', frame);
-    setStatus(
-      (decision === 'approve' ? '已提交批准' : '已提交驳回') +
-        '：' +
-        item.planId +
-        '（seq ' +
-        data.seq +
-        '，等待 agent 处理）'
-    );
-  } catch (err) {
-    reportError(err);
-    buttons.forEach((b) => {
-      b.disabled = false;
-    });
-  }
-
-  // 无论成败都立刻刷新一次：卡片状态以服务端为准，不靠前端猜。
-  await refreshBoard({ manual: true });
-}
-
 // ---------- 看板 ----------
 
 function stateOf(item) {
@@ -427,7 +323,9 @@ function isPending(item) {
   return !TERMINAL.has(stateOf(item));
 }
 
-function canApprove(item) {
+// canDecide 只用来**提示**这张卡你是不是那个能批的人；本页没有批准按钮，
+// 真正的角色判定在 pending_decide（MCP）与宿主那一侧。
+function canDecide(item) {
   const need = Array.isArray(item.requiredRoles) ? item.requiredRoles : [];
   if (!need.length) return false; // 没指定审批角色 ⇒ 没人能认领
   return need.some((role) => state.roles.includes(role));
@@ -523,29 +421,138 @@ function renderCard(item, pending) {
   card.append(tech);
 
   if (pending) {
+    // 只看不点：批准的唯一路径是 dsh 里的选项卡片 → pending_decide → 宿主签票。
+    // 这里若再放一对按钮，同一份计划就有了第二个写入口，审计里也分不清是谁点的。
     const actions = h('div', { class: 'card-actions' });
-    if (canApprove(item)) {
-      actions.append(
-        h('button', { type: 'button', class: 'primary', dataset: { act: 'approve' } }, '批准'),
-        h('button', { type: 'button', class: 'danger', dataset: { act: 'reject' } }, '驳回'),
-        h('span', { class: 'muted' }, '整份计划一次批准；服务端还会再判一次角色。')
-      );
-    } else {
-      actions.append(
-        h('span', {
-          class: 'readonly',
-          text: need.length
+    actions.append(
+      h('span', {
+        class: 'readonly',
+        text: canDecide(item)
+          ? '你有审批角色。去 dsh 对话框里选「允许执行」，或用下面的指令让 agent 提交决定。'
+          : need.length
             ? '需要 ' + need.join(' / ') + ' 角色才能批；你的角色：' + (state.roles.join('、') || '（无）')
             : '该条目没有指定审批角色（requiredRoles 为空），任何人都不应批准。',
-        })
-      );
+      })
+    );
+    if (item.planId) {
+      actions.append(h('code', { class: 'decide-hint', text: '批准 ' + item.planId + ' / 驳回 ' + item.planId }));
     }
     card.append(actions);
   } else {
     card.append(h('p', { class: 'meta muted' }, '已到终态，不接受操作；如需重做请让业务员重新发起。'));
   }
 
+  // 「回到业务系统核对」：审批人真正想知道的是「批准之后库存到底减了没有」。
+  // 链接按这张卡涉及的模块给，不多给——一张只动库存的卡不该出现报价入口。
+  const mods = involvedModules(item);
+  if (mods.length) {
+    const links = h('p', { class: 'meta module-links' }, '去业务系统核对：');
+    mods.forEach((mod, i) => {
+      if (i > 0) links.append(' · ');
+      links.append(h('a', { href: MODULE_PAGES[mod], target: '_blank', rel: 'noreferrer' }, MODULE_NAMES[mod] + '系统'));
+    });
+    card.append(links);
+  }
+
   return card;
+}
+
+// 三个业务系统的页面地址与名字（模块 id 前缀 → 页面）。
+const MODULE_PAGES = {
+  inventory: 'http://127.0.0.1:8081/',
+  procurement: 'http://127.0.0.1:8082/',
+  quote: 'http://127.0.0.1:8083/',
+};
+const MODULE_NAMES = { inventory: '库存', procurement: '备货', quote: '报价' };
+
+// involvedModules 从一张卡的步骤里取出去重后的模块 id（action 形如 "inventory.DeductStock"）。
+function involvedModules(item) {
+  const seen = [];
+  (Array.isArray(item.items) ? item.items : []).forEach((entry) => {
+    const action = entry && typeof entry.action === 'string' ? entry.action : '';
+    const mod = action.split('.')[0];
+    if (MODULE_PAGES[mod] && seen.indexOf(mod) < 0) seen.push(mod);
+  });
+  return seen;
+}
+
+// pollIntents 拉取 agent → 界面的结局帧。
+//
+// 这条通道本来就有（GET /tenon/intents/poll），只是界面一直没用它——于是「agent 说了
+// 什么」只能从公告板推断，而没有卡片的回合（被闸门拒、auto 直接执行）就完全看不见。
+async function pollIntents() {
+  try {
+    const data = await api('GET', '/tenon/intents/poll?after=' + intentCursor, undefined, false);
+    const frames = (data && data.frames) || [];
+    let changed = false;
+    frames.forEach((entry) => {
+      // 宿主返回的是 {"seq":N,"frame":{...}}：帧本体在 frame 里，外面还包了一层序号。
+      // 直接按平铺读会全部丢掉（取到 undefined），而界面表现为「agent 从来不说话」。
+      const frame = (entry && entry.frame) || entry;
+      if (!frame || frame.type !== 'tenon.intent' || !frame.intentId) return;
+      if (state.intents.some((it) => it.intentId === frame.intentId)) return;
+      state.intents.push({
+        intentId: frame.intentId,
+        planId: frame.planId || '',
+        requestId: frame.requestId || '',
+        outcome: frame.outcome || '',
+        message: frame.message || '',
+        at: Date.now(),
+      });
+      changed = true;
+    });
+    if (typeof data.nextCursor === 'number' && data.nextCursor !== intentCursor) {
+      intentCursor = data.nextCursor;
+      sessionStorage.setItem('tenon.intentCursor', String(intentCursor));
+    }
+    // 只留最近 100 条：界面是回放窗口，不是审计库。
+    if (state.intents.length > 100) state.intents = state.intents.slice(-100);
+    if (changed) renderIntents();
+  } catch (_) {
+    /* 结局帧拉不到不该影响主流程：公告板仍然可用 */
+  }
+}
+
+// 结局 → 左边框语气。completed 用 ok，needs_human 用 warn，failed 用 bad。
+const OUTCOME_TONE = { completed: 'ok', needs_human: 'warn', failed: 'bad' };
+
+/**
+ * renderIntents 把 agent 的帧按时间顺序铺开，**只读**。
+ *
+ * 这里刻意不挂任何按钮：批准要落到宿主签票与审计链上，那条路径只有 dsh 里的
+ * pending_decide 走得到。看板再放一个「批准」按钮，就等于给同一份计划开第二个写入口。
+ */
+function renderIntents() {
+  const log = $('intent-log');
+  if (!log) return;
+  log.textContent = '';
+
+  if (!state.intents.length) {
+    log.append(h('p', { class: 'empty' },
+      '还没有帧。agent 处理完一个回合后，这里会出现它的结论。'));
+    return;
+  }
+
+  state.intents
+    .slice()
+    .sort((a, b) => a.at - b.at)
+    .forEach((intent) => {
+      const row = h('div', { class: 'bubble agent ' + (OUTCOME_TONE[intent.outcome] || 'wait') });
+      row.append(h('div', { class: 'bubble-who' }, 'agent · ' + timeOf(intent.at)));
+      row.append(h('div', { class: 'bubble-text' }, intent.message || '（这一回合没有给出结论）'));
+      const meta = [];
+      if (intent.outcome) meta.push(intent.outcome);
+      if (intent.planId) meta.push(intent.planId);
+      if (meta.length) row.append(h('div', { class: 'bubble-meta' }, meta.join(' · ')));
+      log.append(row);
+    });
+}
+
+function timeOf(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
 }
 
 function renderBoard() {
@@ -559,6 +566,8 @@ function renderBoard() {
     processedList.append(h('p', { class: 'empty' }, '登录后显示已处理条目'));
     $('pending-count').textContent = '';
     $('processed-count').textContent = '';
+    // 帧不需要登录也能读：agent 说过的话不能因为没登录就从界面上消失。
+    renderIntents();
     return;
   }
 
@@ -573,11 +582,24 @@ function renderBoard() {
   $('pending-count').textContent = '（' + pending.length + '）';
   $('processed-count').textContent = '（' + processed.length + '）';
 
-  if (!pending.length) pendingList.append(h('p', { class: 'empty' }, '没有待批条目。'));
+  if (!pending.length) {
+    // 「板子是空的」有三个完全不同的原因，别让人以为功能坏了：agent 还在规划（真模型
+    // 一个回合要 10–40 秒）、计划根本不需要审批（auto 直接执行了）、或者卡片已过期
+    // （15 分钟 TTL，自检会把它归档）。把三条都写出来，比一句「没有待批条目」有用。
+    pendingList.append(
+      h('p', { class: 'empty' },
+        '没有待批条目。可能的原因：① agent 正在规划（真模型一个回合约 10–40 秒，稍等再看）；' +
+        '② 这份计划不需要审批（策略判 auto，已直接执行，去「已处理」看）；' +
+        '③ 卡片已过期（15 分钟 TTL，过期即归档）。')
+    );
+  }
   pending.forEach((item) => pendingList.append(renderCard(item, true)));
 
   if (!processed.length) processedList.append(h('p', { class: 'empty' }, '还没有处理过的条目。'));
   processed.forEach((item) => processedList.append(renderCard(item, false)));
+
+  // 帧区每次都跟着公告板重算：agent 说过什么是服务端事实，不是本地缓存。
+  renderIntents();
 
   tickExpiry();
 }
@@ -652,7 +674,10 @@ async function refreshBoard(options) {
 function startPolling() {
   stopPolling();
   state.pollTimer = setInterval(() => {
+    // 公告板与结局帧一起拉：前者是「等你批的」，后者是「agent 说了什么」。
+    // 两者都不带人的登录身份也能读，所以未登录时也在跑。
     refreshBoard();
+    pollIntents();
   }, POLL_MS);
 }
 
@@ -665,50 +690,17 @@ function stopPolling() {
 
 // ---------- 事件绑定 ----------
 
-function onBoardClick(ev) {
-  const target = ev.target instanceof Element ? ev.target : null;
-  const button = target ? target.closest('button[data-act]') : null;
-  if (!button) return;
-  const card = button.closest('.card');
-  if (!card) return;
-
-  const planId = card.dataset.planId || '';
-  const decision = button.dataset.act;
-  if (decision !== 'approve' && decision !== 'reject') return;
-  if (!planId) {
-    showError('这张卡没有 planId，无法提交决定。');
-    return;
-  }
-  if (!state.token) {
-    showError('尚未登录：请先登录。');
-    return;
-  }
-
-  const question =
-    decision === 'approve' ? '批准计划 ' + planId + '？' : '驳回计划 ' + planId + '？';
-  if (!window.confirm(question)) return;
-  onConfirm(planId, decision, button);
-}
-
 function init() {
+  renderIntents();
   $('login-form').addEventListener('submit', onLogin);
   $('logout').addEventListener('click', onLogout);
-  $('send').addEventListener('click', onSend);
   $('error-close').addEventListener('click', clearError);
 
-  $('ctx-toggle').addEventListener('change', () => {
-    $('ctx-fields').hidden = !$('ctx-toggle').checked;
-  });
-
-  // Ctrl/Cmd+Enter 直接发送，避免长文本里回车被吃掉。
-  $('request-text').addEventListener('keydown', (ev) => {
-    if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') onSend();
-  });
-
-  $('pending-list').addEventListener('click', onBoardClick);
-  $('processed-list').addEventListener('click', onBoardClick);
-
+  // 看板没有可点的动作：待批卡上只有文字与一句「去 dsh 里怎么说」的指令，
+  // 所以这里不再绑 click 处理器（旧版绑过 onBoardClick，那是第二个写入口）。
   setInterval(tickExpiry, 1000);
+  // 结局帧先拉一次：刷新页面后立刻补上「agent 说过什么」，不用等第一个轮询周期。
+  pollIntents();
 
   // 留一个可观测的接管标记：无头/人工排查时用它区分「脚本没跑」与「脚本跑了但没数据」。
   document.documentElement.dataset.app = 'ready';

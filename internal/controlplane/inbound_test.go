@@ -489,3 +489,51 @@ func TestConfirmFrameRoles(t *testing.T) {
 		}
 	})
 }
+
+// 入队响应必须回两个 id：requestId（人话的锚点）与 syntheticEventId（来源凭证）。
+//
+// 后者是 policy 判 origin=request 的唯一凭据。过去只在帧里签发、不回给调用方，
+// 于是任何「先预检再落卡」的调用方都带不上它，origin=request 类规则永不命中。
+func TestInboundEnqueueReturnsRequestAndSyntheticIDs(t *testing.T) {
+	_, ts := newInboundServer(t)
+	defer ts.Close()
+	tok := login(t, ts.URL)
+
+	status, body := postJSONAuth(t, ts.URL+"/tenon/requests", tok,
+		`{"type":"tenon.request","text":"扣 12 件"}`)
+	if status != http.StatusOK {
+		t.Fatalf("入队失败 %d：%s", status, body)
+	}
+	var resp struct {
+		RequestID        string `json:"requestId"`
+		SyntheticEventID string `json:"syntheticEventId"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("响应不是 JSON：%v（%s）", err, body)
+	}
+	if resp.RequestID == "" || resp.SyntheticEventID == "" {
+		t.Fatalf("响应必须同时带 requestId 与 syntheticEventId，实际：%s", body)
+	}
+
+	// 与投递出去的帧逐字一致：调用方要靠这两个 id 把预检挂回这句话。
+	_, pollBody := getJSONAuth(t, ts.URL+"/tenon/requests/poll?after=0", agentToken(t))
+	var polled struct {
+		Frames []struct {
+			Frame struct {
+				RequestID        string `json:"requestId"`
+				SyntheticEventID string `json:"syntheticEventId"`
+			} `json:"frame"`
+		} `json:"frames"`
+	}
+	if err := json.Unmarshal([]byte(pollBody), &polled); err != nil {
+		t.Fatalf("poll 响应坏：%v", err)
+	}
+	if len(polled.Frames) != 1 {
+		t.Fatalf("应有 1 帧，得到 %d", len(polled.Frames))
+	}
+	got := polled.Frames[0].Frame
+	if got.RequestID != resp.RequestID || got.SyntheticEventID != resp.SyntheticEventID {
+		t.Fatalf("响应与帧不一致：resp=(%s,%s) frame=(%s,%s)",
+			resp.RequestID, resp.SyntheticEventID, got.RequestID, got.SyntheticEventID)
+	}
+}

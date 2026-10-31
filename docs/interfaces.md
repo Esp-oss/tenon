@@ -88,7 +88,8 @@ flowchart LR
 | `Tenon-Version: 0.1` | 双向 | 写操作 ✅ | 写路径缺头即 400（见 §3.7）；只读/预演/事件缺头按 0.1 宽松处理 |
 | `Tenon-Min-Version` | 双向 | 可选 | 低于此版本宁可失败，也不要静默降级 |
 | `Idempotency-Key` | 请求 | 写操作 ✅ | 同一键重复提交必须返回**首次结果**，绝不产生重复副作用 |
-| `X-Tenon-Grant` | 请求 | 写操作 ✅ | 授权凭证；规范要求模块**再校验一次**，M0.5 只承认不校验（§9 缺口 3） |
+| `X-Tenon-Grant` | 请求 | 写操作 ✅ | 0.1 的授权凭证；模块只承认不校验（§9 缺口 3）。**0.2.0 起由 `Tenon-Ticket` 取代** |
+| `Tenon-Ticket` | 请求 | 写操作 ✅（0.2.0） | 宿主签发的 Ed25519 执行票据，`v1.<payload>.<sig>`；模块持公钥验签，无票即 403。载荷见 `spec/0.1/schemas/ticket.schema.json`，有效期 ≤60 秒 |
 | `X-Tenon-Signature` | 请求 | 事件投递 ✅ | `t=<unix>,v1=<hex>`，见 §3.4 |
 
 ### 3.2 执行与幂等
@@ -96,7 +97,7 @@ flowchart LR
 ```
 POST /tenon/actions/inventory.DeductStock
 Idempotency-Key: tenon:pln_01JB.../s2
-X-Tenon-Grant: gr-01J...
+Tenon-Ticket: v1.eyJ2IjoxLCJ0aWQiOiJ0a3RfMDAwMSIsImtpZCI6...
 Tenon-Version: 0.1
 Content-Type: application/json
 
@@ -138,7 +139,7 @@ POST /tenon/actions/inventory.DeductStock:dry-run
 |---|---|---|
 | 动作不支持预演（未声明 `dryRun.supported`） | **404 空体**（无错误信封） | 按 `unsupported` 处理并**强制审批**（fail-closed，见 §10） |
 | 动作 id 不存在 | 404 + `tenonError(UNKNOWN_ACTION)` | 同上，不得当作放行 |
-| 预演成功但结论不是 `verified`（`unsafe`/`pending`） | 200 + 该结论 | 强制审批；**只有 `verified` 允许自动执行** |
+| 预演成功但结论不是 `verified`（`unsafe`/`pending`） | 200 + 该结论 | 不自动执行；**只有 `verified` 允许自动执行**。`unsafe` 可带裁决有界重规划，`pending` 直接转人工（§10） |
 
 一句话：**404 不等于免检。** 把 404 读成「没有预演就放行」，等于让供应商删掉端点即可绕过预演。
 
@@ -277,6 +278,24 @@ POST /tenon/policies:evaluate
 - 求值出错（规则配置坏、`action` 不是 `<module>.<Action>` 词法）→ 200 + `deny` + `POLICY_EVALUATION_FAILED`（与「策略拒绝」「无命中」区分开，排障时不会把配置错误看成业务判定）。
 - 策略本身不可被 agent 读取或改写，只能请求评估。
 
+### 4.2.1 签发执行票据（P0-1）
+
+```
+POST /tenon/tickets:issue          Authorization: Bearer <agent token（role:agent）>
+{ "planId": "pln_01J...", "stepId": "s2", "action": "inventory.DeductStock",
+  "args": {...}, "agent": "ag_fulfillment", "onBehalfOf": "user:alice" }
+→ 200 { "ticket": "v1...", "auditId": "aud_01J...", "exp": 1793400030 }
+```
+
+宿主按序做三件事，任一步失败都不签票：
+
+1. **策略**：`deny` → 403 `POLICY_DENIED`；`approve` → 403 `APPROVAL_REQUIRED`（批准证据未落地前不签）。
+2. **授权**：拒绝 → 403 `GRANT_DENIED`；**配额在这里扣一次**，调用方的预检应传 `charge:false`。
+3. **审计前置**：先写 `stage=dispatched`，写失败 → 503 `AUDIT_WRITE_FAILED`。
+
+签出的票绑定 `mod/act/ah（原始请求体摘要）/idem/pid/sid/aud/by/gid/iat/exp`，有效期 ≤60 秒。
+缺 bearer → 401 `AUTH_REQUIRED`；宿主没配签名私钥 → 503 `TICKET_SIGNING_DISABLED`（不降级为无票执行）。
+
 ### 4.3 审计：写与查
 
 **写**（两段写的唯一写入口）：
@@ -289,6 +308,7 @@ POST /tenon/audit
 
 - **200 表示这条记录已经落盘（fsync 之后才应答）。** 非 2xx 时调用方**必须拒绝执行下游调用**：一次没有 `dispatched` 的写是不允许发生的。
 - 必填：`auditId`；`stage` 只能是 `dispatched` 或 `result`（其它值 → 400 `INVALID_AUDIT_STAGE`）。
+- **步骤级 `dispatched`（`stepId` 非空）自 0.2.0 起只能由宿主在签发票据时写入**：调用方再写 → 403 `AUDIT_STAGE_FORBIDDEN`。计划级 `dispatched`（`stepId` 为空）仍由 agent 在挂起时写，用于批准—续跑链路。
 - `hash` / `prevHash` 由宿主计算并**无条件覆盖**调用方给的值：链的唯一权威是宿主的审计存储。
 - 宿主**不做 schema 完整性校验**（见 §9 缺口 6）：字段缺失会照原样落盘，`hash` 覆盖的是「你给的内容」。
 - 落盘失败 → 503 `AUDIT_WRITE_FAILED`（不是「这次没记上」，而是「审计链已不可用」）。
@@ -466,6 +486,12 @@ POST /tenon/session
 
 **`durable` 的含义**：`POST /tenon/requests` 回 `{ok, seq, durable}`。`durable:false` 表示这帧**只进了内存、没落盘**（重启会丢），同时宿主日志打一条告警。**这种情况下仍回 200，不回 500**：500 会诱导客户端重试，而 `requestId`/`syntheticEventId` 由宿主签发，重试等于重发用户那句话、造出第二条请求——比「热情地告知没落盘」更坏。消费方可以对 `durable:false` 打点告警，但**不要重试**。
 
+**入队响应回两个 id**：`POST /tenon/requests` → `200 { ok, seq, durable, requestId, syntheticEventId }`。
+
+`requestId` 让人话与后续公告板条目对上（卡片带同一个 id）；`syntheticEventId` 是**来源凭证**——
+`policies:evaluate` 带它才会被判成 `origin=request`，命中「对话发起」类规则。这两个 id 以前只在帧里签发、
+不回给调用方，于是任何「先预检、再落卡」的调用方都带不上来源凭证，规则永不命中（症状是「人在对话里要的事被判无策略匹配」）。
+
 **来源凭证（与 §4.2 的 `origin` 对接）**：收到 `tenon.request` 时宿主**签发** `requestId` 与合成 `syntheticEventId`（`evt_` 前缀）、用 token 的 `sub` 覆写 `by`、盖上 `at`，并把 `syntheticEventId → {requestId, by, at}` 登记进 `requests-index.jsonl`（**独立落盘，不依赖队列实现**）。agent **必须沿用**帧里这两个 id，不得自行生成——自行生成等于让 agent 决定自己要不要被审。客户端自报的 `by`/`requestId` 一律被覆盖。
 
 - 帧类型只收 `tenon.request` 与 `tenon.confirm`（`tenon.context` 不入站）：其它 `type` → 400 `UNKNOWN_FRAME_TYPE`；登记 origin 失败 → 400 `ORIGIN_REGISTER_FAILED`（凭证没留下就不入队）。
@@ -494,6 +520,51 @@ GET /tenon/pending
 - 公告板是**只读 read-model，刻意不落盘**：权威状态在 agent 盘上的 pending 文件，公告板可丢、可重建（agent 每 tick 重推即自愈）。host 不判断、不执行、不授权；持久化会造出第二份「权威状态」，与 agent 盘上的文件互相漂移。
 
 ---
+
+### 4.8 模块自带页面与只读快照（0.1 附加，不进协议面）
+
+模块可以像宿主一样提供业务页面：`GET /` 与 `GET /ui/…`，目录由 `TENON_MODULE_UI_DIR` 指定
+（缺省 `ui/<moduleID>`）。这些路径**不参与 `Tenon-Version` 协商、不要求 token**，非 `GET`/`HEAD` → 405。
+目录不可用 → **503 并点名环境变量**（与宿主 §4 的口径一致：把「页面没配」伪装成 404 会让运维去查路由）。
+
+页面要显示真值，因此 0.1 增加了三条**只读**动作（无副作用、不需要票据、不写审计）：
+
+| 动作 | 形态 |
+|---|---|
+| `inventory.ListStock` | `{items:[{sku,onHand}]}` |
+| `procurement.ListPurchaseRequests` | `{items:[{requestNo,sku,qty,referenceNo,createdAt}]}` |
+| `quote.ListQuotes` | `{items:[{quoteNo,quoteId,status,lines:[{sku,qty}]}]}` |
+
+排序在服务端做（按 id/单号升序）：页面不该为了稳定顺序再排一次，两个排序口径迟早会不一致。
+**页面没有任何写权限**——业务页面上的「让 agent 去做」只是把一句话投到 `POST /tenon/requests`。
+
+### 4.9 MCP 工具面（`tenon-mcp`，0.2 附加）
+
+`cmd/tenon-mcp` 是一个 **stdio MCP 服务端**，把 Tenon 的能力交给对话层（dsh 等）。
+工具名在 dsh 侧投影为 `mcp__tenon__<name>`。
+
+| 工具 | 权限 | 落到哪 | 副作用 |
+|---|---|---|---|
+| `registry_list` | 读 | `GET /tenon/modules` | 无 |
+| `action_invoke` | **仅 `kind=read`** | 模块 `POST /tenon/actions/{id}` | 无 |
+| `plan_preview` | 预检 | `policies:evaluate` → `grants:evaluate(charge:false)` → `:dry-run` | 无（不落卡、不执行） |
+| `request_submit` | 人 | `POST /tenon/requests`（`tenon.request`，Bearer） | 间接：投递一帧后由 agent 自己规划、落卡 |
+| `pending_list` | 人 | `GET /tenon/pending`（Bearer） | 无 |
+| `pending_decide` | 人 | `POST /tenon/requests`（`tenon.confirm`，Bearer） | 间接：批准后由 agent 恢复执行 |
+| `audit_query` | 读 | `GET /tenon/audit?planId=` | 无 |
+
+**没有执行写动作的工具，也没有造卡的工具。** 前者会把策略/授权/预演/票据一次性绕开；
+后者不可行也不该可行：可恢复的卡的依赖 agent 侧的 `argsHash` 冻结快照与本地 `store`，
+而公告板写入要求 `role:agent`（拿到它就等于同时拿到 `tickets:issue`）。
+
+**`request_submit` 不是造卡工具**，它只把**人的原话**投进入站队列（与共驾前端发
+`tenon.request` 完全同一条路径）：计划由 agent 生成、卡由 agent 落，审计里的 plan 归属不变。
+它必须存在——入站帧是唯一能开回合的入口，页面上的输入框收掉之后，没有它就没有任何东西
+可以批准了。工具面因此是 **7 个**，不是 6 个。
+
+人工身份只从环境变量读（`TENON_MCP_HUMAN_TOKEN`，或 `TENON_MCP_USER`/`TENON_MCP_PASSWORD` 惰性登录），
+**不进工具参数**：参数会进模型上下文，token 不该去那里。`401` 后会自动重登一次——否则 dsh 里长活的
+MCP 进程会在 token 过期后表现为「一开始能批、过一会儿不能批」。
 
 ## 5. 调用矩阵
 
@@ -637,10 +708,15 @@ G1 是「预演闸门」：每个 **write** 动作在执行前先 `:dry-run`，�
 | 预演结果 | agent 行为 | 是否产生副作用 |
 |---|---|---|
 | 200 + `verified` | 放行，继续 | 是 |
-| 200 + `unsafe` / `pending` / `unsupported` | **转人工**（`needs_human`） | 否 |
+| 200 + `unsafe` | **有界重新规划**（带这条裁决回填，最多 2 轮，与业务拒绝共用预算）；用尽仍不可行才**转人工** | 否 |
+| 200 + `pending` / `unsupported` | **转人工**（`needs_human`） | 否 |
 | **404（端点不存在）** | **转人工**（等价 `unsupported`） | 否 |
 | 404 + `UNKNOWN_ACTION` | **转人工**（动作不存在，计划的前提就不成立） | 否 |
 | 5xx / 超时 / 响应不是 `{"dryRun":{...}}` | **失败**（`failed`，fail-closed） | 否 |
+
+`unsafe` 与其余非 `verified` 结论分档，是因为它是**事实性**裁决：模块按当前状态算出来「这一步不成立」（例如可用量不足），这是运行时才算得出的新信息。一次都不回填就转人工，等于刚学到的东西白学——D1 的实测里模型在还没有库存事实时就规了扣减，预演判 `unsafe` 后整轮放弃，A/B 两轮的动作序列因此完全相同，看上去像「没用能力清单」。
+
+回填不给旁路留口子：换出来的写动作要自己再过一遍预演，没有哪一步能跳过闸门；`unsafe` 期间一个步骤都没有执行，也不会留下半截副作用。`pending`（说不清）与 `unsupported`/404（能力缺失）保持直接转人工——前者该由人判，后者若可重规划就等于「删掉端点能换免检」。
 
 三条必须一起成立，缺一条就有洞：
 

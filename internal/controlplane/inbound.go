@@ -149,17 +149,34 @@ func (s *Server) serveInboundEnqueue(w http.ResponseWriter, r *http.Request) {
 	if !durable {
 		log.Printf("controlplane: 入站帧已入内存队列但未落盘（seq=%d）——重启会丢，请检查磁盘", seq)
 	}
-	writeJSON(w, http.StatusOK, inboundEnqueueResponse{OK: true, Seq: seq, Durable: durable})
+	requestID, _ := frame["requestId"].(string)
+	syntheticEventID, _ := frame["syntheticEventId"].(string)
+	writeJSON(w, http.StatusOK, inboundEnqueueResponse{
+		OK: true, Seq: seq, Durable: durable,
+		RequestID: requestID, SyntheticEventID: syntheticEventID,
+	})
 }
 
 // inboundEnqueueResponse 是 POST /tenon/requests 的响应。
 //
-// 比出站的 enqueueResponse 多一个 durable：出站是内存队列、丢了只是界面提示；
-// 入站承载的是人说过的话，客户端需要能区分「已落盘」与「只在内存里」。
+// 比出站的 enqueueResponse 多两个字段：
+//
+//   - durable：出站是内存队列、丢了只是界面提示；入站承载的是人说过的话，
+//     客户端需要能区分「已落盘」与「只在内存里」。
+//   - requestId：宿主签发的那一个。前端要把它和自己刚说出的那句话配上，
+//     否则「我说了什么 → agent 后来提了什么」在界面上无法对应（发布公告板上的
+//     pending 条目本来就带 requestId，回给客户端只是把同一条线接上）。
 type inboundEnqueueResponse struct {
-	OK      bool  `json:"ok"`
-	Seq     int64 `json:"seq"`
-	Durable bool  `json:"durable"`
+	OK        bool   `json:"ok"`
+	Seq       int64  `json:"seq"`
+	Durable   bool   `json:"durable"`
+	RequestID string `json:"requestId,omitempty"`
+	// SyntheticEventID 是宿主为这句人话合成的触发事件 id。
+	//
+	// 它是**来源凭证**：`policies:evaluate` 带它才会被宿主判成 `origin=request`，从而命中
+	// 「对话发起」类规则（`plat-request-needs-human`）。签发时不给调用方，调用方就只能
+	// 空着传，于是这类规则永远不命中——症状是「人在对话里要的事被判无策略匹配」。
+	SyntheticEventID string `json:"syntheticEventId,omitempty"`
 }
 
 // inboundFrame 不再单独定义类型：规范化后的帧就是 map[string]any（保留原字段 + 宿主签发字段）。

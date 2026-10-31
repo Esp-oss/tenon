@@ -808,6 +808,10 @@ type handler struct {
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
+	// 业务页面：不在协议面上（不协商 Tenon-Version、不要求 token），
+	// 与宿主侧的 GET / 与 /ui/… 同一口径（interfaces.md §4）。
+	case path == "/" || strings.HasPrefix(path, "/ui/"):
+		h.serveUI(w, r)
 	case path == "/healthz":
 		h.serveHealth(w, r)
 	case path == "/readyz":

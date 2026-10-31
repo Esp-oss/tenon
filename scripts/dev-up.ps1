@@ -1,4 +1,4 @@
-#!/usr/bin/env powershell
+﻿#!/usr/bin/env powershell
 # 本地开发栈：起 llmstub + 三个模块 + host + agent，**常驻不退出**，供浏览器手工验收。
 #
 #   powershell -NoProfile -File scripts/dev-up.ps1          # 桩规划器（默认，结果可预期）
@@ -57,7 +57,9 @@ if ($HostPort -ne 8080 -and [bool](Get-NetTCPConnection -LocalPort $HostPort -St
 }
 
 New-Item -ItemType Directory -Force -Path $bin, $logDir, $stateDir, (Join-Path $work 'inbound') | Out-Null
-foreach ($svc in 'host', 'agent', 'inventory', 'procurement', 'quote') {
+# tenon-mcp 不常驻：它由 dsh 以 stdio 拉起，这里只负责把它构建到 $bin。
+# 少了它，dsh 那边的 MCP 条目会指向一个不存在的可执行文件，症状是「工具一个都没有」。
+foreach ($svc in 'host', 'agent', 'inventory', 'procurement', 'quote', 'tenon-mcp') {
 	& go build -o (Join-Path $bin "$svc.exe") "./cmd/$svc"
 	if ($LASTEXITCODE -ne 0) { Fail "构建 $svc 失败" }
 }

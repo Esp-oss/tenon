@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tenon 对话入口</title>
+<title>Tenon 待批看板</title>
 <!--
   同源静态资源必须走 /ui/ 前缀：宿主只把「/」与「/ui/…」交给静态处理器
   （internal/controlplane/static.go 的 uiPrefix），写成 ./style.css 会落到
@@ -15,8 +15,15 @@
 
 <header class="topbar">
   <div class="brand">
-    <h1>Tenon 对话入口</h1>
-    <p class="sub">人对 agent 说话 · 待批看板 · 批准/驳回</p>
+    <h1>Tenon 待批看板</h1>
+    <p class="sub">只读：待批 / 已处理 / 共驾提议 —— 对话与批准都在 dsh 里（首次需用带 <code>?token=</code> 的入口 URL 开一次）</p>
+    <nav class="biz-nav">
+      <a href="http://127.0.0.1:3080/" target="_blank" rel="noreferrer">Agent 对话（dsh）</a>
+      <a href="http://127.0.0.1:8081/" target="_blank" rel="noreferrer">库存系统</a>
+      <a href="http://127.0.0.1:8082/" target="_blank" rel="noreferrer">备货系统</a>
+      <a href="http://127.0.0.1:8083/" target="_blank" rel="noreferrer">报价系统</a>
+      <a href="/ui/registry.html" target="_blank" rel="noreferrer">注册中心</a>
+    </nav>
   </div>
 
   <div class="session">
@@ -43,23 +50,19 @@
 </div>
 
 <main>
+  <!--
+    这个页面<strong>不发起任何请求帧</strong>（没有 POST /tenon/requests）。
+    对话、批准、驳回都只有一个入口：dsh 容器。这里只镜像宿主的只读状态，
+    所以「同一个决定被点两次」在多入口下才会有的问题，在这里不可能发生。
+  -->
   <section class="panel">
-    <h2>说话</h2>
-    <p class="hint">原话直接进 agent 的对话上下文，不做意图分类。发送后宿主签发 requestId；命中审批的计划会出现在下面的待批区。</p>
-    <label class="sr-only" for="request-text">要对 agent 说的话</label>
-    <textarea id="request-text" maxlength="2000" rows="3" placeholder="例：STD-1001 这单货不够，先扣现有的，缺的发起采购"></textarea>
-    <div class="row">
-      <label class="check"><input id="ctx-toggle" type="checkbox"> 附带视图上下文（可选）</label>
-      <span class="hint">告诉 agent「这单」指哪一单：module / type / id 三项一起填，或都留空。</span>
-    </div>
-    <div id="ctx-fields" class="ctx" hidden>
-      <label>module <input id="ctx-module" type="text" placeholder="inventory" spellcheck="false"></label>
-      <label>type <input id="ctx-type" type="text" placeholder="Stock" spellcheck="false"></label>
-      <label>id <input id="ctx-id" type="text" placeholder="STD-1001" spellcheck="false"></label>
-    </div>
-    <div class="row">
-      <button id="send" type="button" class="primary">发送</button>
-      <span id="status-line" class="status" role="status"></span>
+    <h2>共驾提议（只读）</h2>
+    <p class="hint">
+      agent 每回合结束时发来的帧（<code>GET /tenon/intents/poll</code>）。只回放，不接受操作；
+      要批准某张卡，去 dsh 里说「批准 pln_…」，或直接在对话框的选项卡片上点「允许执行」。
+    </p>
+    <div id="intent-log" class="intent-log">
+      <p class="empty">还没有帧。agent 处理完一个回合后，这里会出现它的结论。</p>
     </div>
   </section>
 
@@ -73,7 +76,7 @@
     <div id="processed-list" class="cards"><p class="empty">登录后显示已处理条目</p></div>
   </section>
 
-  <p class="hint foot">登录后每 2 秒自动刷新看板；批准/驳回提交后立即刷新。最后刷新 <span id="board-updated">—</span></p>
+  <p class="hint foot">看板每 2 秒刷新；批准与执行都发生在 dsh 里，本页不做任何写操作。最后刷新 <span id="board-updated">—</span> <span id="status-line" class="status" role="status"></span></p>
 </main>
 
 <script src="/ui/app.js"></script>
