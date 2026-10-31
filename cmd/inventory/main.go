@@ -29,6 +29,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +49,9 @@ const (
 	actionGetStock     = "inventory.GetStock"
 	actionDeductStock  = "inventory.DeductStock"
 	actionReleaseStock = "inventory.ReleaseStock"
+	// actionListStock 是**只读**的全量快照：业务页面与看板要显示真值，而 GetStock
+	// 一次只能问一个 SKU。它没有副作用、不需要票据，也不参与任何写路径。
+	actionListStock = "inventory.ListStock"
 
 	// envSeed 覆盖初始库存，便于演示「库存不足 → 转采购」的分支。
 	envSeed     = "TENON_INVENTORY_SEED"
@@ -70,6 +74,7 @@ func main() {
 		TestMode: os.Getenv("TENON_TEST_MODE") == "1", // D1 的 A/B 两轮要靠 /tenon/admin/reset 造同输入
 		Actions: []module.Action{
 			getStockAction(),
+			listStockAction(),
 			deductStockAction(),
 			releaseStockAction(),
 		},
@@ -124,6 +129,41 @@ func getStockAction() module.Action {
 		TimeoutMs: 30000,
 		// 读动作无副作用，无需预演（semantics.md §6.3：只含 read 的计划视为 verified）。
 		DryRun: module.DryRunCapability{Supported: false},
+	}
+}
+
+// listStockAction 供业务页面渲染库存表：一次返回全部 SKU 的在库量。
+//
+// 仍然走动作协议（而不是加一个 /ui 专用接口）：页面看到的值必须和执行用的是同一套
+// 状态与同一份契约，否则「页面显示 108、执行时却是 96」这种偏差没人能解释。
+func listStockAction() module.Action {
+	return module.Action{
+		ID:              actionListStock,
+		Version:         "0.1.0",
+		Title:           "库存快照",
+		SummaryTemplate: "列出全部 SKU 的在库量",
+		Kind:            "read",
+		InputSchema:     json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{}}`),
+		OutputSchema: json.RawMessage(`{
+  "type": "object",
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["sku", "onHand"],
+        "properties": {
+          "sku": {"type": "string"},
+          "onHand": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  }
+}`),
+		Risk:      module.Risk{Level: "low", Reversible: true},
+		TimeoutMs: 30000,
+		DryRun:    module.DryRunCapability{Supported: false},
 	}
 }
 
@@ -269,6 +309,8 @@ func (s *store) handle(ctx context.Context, actionID string, args json.RawMessag
 	switch actionID {
 	case actionGetStock:
 		return s.getStock(args)
+	case actionListStock:
+		return s.listStock()
 	case actionDeductStock:
 		return s.applyStock(args, false)
 	case actionReleaseStock:
@@ -293,6 +335,18 @@ func (s *store) getStock(args json.RawMessage) (json.RawMessage, *protocol.Error
 		return nil, unknownSKU(in.SKU)
 	}
 	return mustJSON(getStockOutput{OnHand: onHand}), nil
+}
+
+// listStock 返回按 SKU 排序的全量快照（排序在服务端做：页面不该为了稳定顺序再排一次）。
+func (s *store) listStock() (json.RawMessage, *protocol.Error) {
+	s.mu.Lock()
+	items := make([]stockItem, 0, len(s.onHand))
+	for sku, qty := range s.onHand {
+		items = append(items, stockItem{SKU: sku, OnHand: qty})
+	}
+	s.mu.Unlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].SKU < items[j].SKU })
+	return mustJSON(listStockOutput{Items: items}), nil
 }
 
 // applyStock 同时实现扣减与回补：两者只差方向，业务级幂等口径完全一致。
@@ -401,6 +455,16 @@ type getStockInput struct {
 
 type getStockOutput struct {
 	OnHand int `json:"onHand"`
+}
+
+// stockItem 是库存快照的一行。
+type stockItem struct {
+	SKU    string `json:"sku"`
+	OnHand int    `json:"onHand"`
+}
+
+type listStockOutput struct {
+	Items []stockItem `json:"items"`
 }
 
 type stockWriteInput struct {

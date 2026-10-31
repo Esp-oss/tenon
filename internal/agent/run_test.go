@@ -46,9 +46,14 @@ type fakeHost struct {
 	GrantAllowed    bool
 	GrantReason     string
 	FailAuditPost   bool
+	// FailTicketIssue 让签票端点失败，用于验「拿不到票就不执行」。
+	FailTicketIssue bool
 
-	AuditRecords []map[string]any
-	IntentFrames []map[string]any
+	TicketRequests []map[string]any
+	GrantRequests  []map[string]any
+	PolicyRequests []map[string]any
+	AuditRecords   []map[string]any
+	IntentFrames   []map[string]any
 }
 
 func newFakeHost(t *testing.T, trace *[]string) *fakeHost {
@@ -72,6 +77,12 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 
 	case "/tenon/policies:evaluate":
 		h.appendTrace("policies:evaluate")
+		var policyReq map[string]any
+		if err := json.Unmarshal(readTestBody(h.t, r), &policyReq); err == nil {
+			h.mu.Lock()
+			h.PolicyRequests = append(h.PolicyRequests, policyReq)
+			h.mu.Unlock()
+		}
 		reasons := h.PolicyReasons
 		if len(reasons) == 0 {
 			reasons = []string{"TEST_RULE"}
@@ -91,6 +102,12 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 
 	case "/tenon/grants:evaluate":
 		h.appendTrace("grants:evaluate")
+		var grantReq map[string]any
+		if err := json.Unmarshal(readTestBody(h.t, r), &grantReq); err == nil {
+			h.mu.Lock()
+			h.GrantRequests = append(h.GrantRequests, grantReq)
+			h.mu.Unlock()
+		}
 		if !h.GrantAllowed {
 			writeTestJSON(w, http.StatusOK, map[string]any{"allowed": false, "reason": h.GrantReason})
 			return
@@ -99,6 +116,25 @@ func (h *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 			"allowed":        true,
 			"matchedGrantId": "gr-test001",
 			"quota":          map[string]any{"remaining": 100, "unit": "calls"},
+		})
+
+	case "/tenon/tickets:issue":
+		var req map[string]any
+		if err := json.Unmarshal(readTestBody(h.t, r), &req); err != nil {
+			h.t.Errorf("签票请求体不是 JSON：%v", err)
+		}
+		h.appendTrace("tickets:issue")
+		if h.FailTicketIssue {
+			writeTestError(w, http.StatusBadGateway, "retryable", "TICKET_SIGN_FAILED", "注入的签票失败")
+			return
+		}
+		h.mu.Lock()
+		h.TicketRequests = append(h.TicketRequests, req)
+		h.mu.Unlock()
+		writeTestJSON(w, http.StatusOK, map[string]any{
+			"ticket":  "v1.stub.sig",
+			"auditId": "aud_stub",
+			"exp":     time.Now().Add(30 * time.Second).Unix(),
 		})
 
 	case "/tenon/audit":
@@ -147,8 +183,11 @@ type fakeModule struct {
 	// Meta 是 action id → manifest 里的额外键（当前用于 requiredArgs）。
 	Meta map[string]map[string]any
 
-	DryRunStatus  string // 默认 verified
-	DryRunMissing bool   // 声明「不支持预演」：回 404 空体
+	DryRunStatus string // 默认 verified
+	// DryRunStatuses 是按调用顺序消费的预演结论队列（用完后回落到 DryRunStatus）。
+	// 有了它，「第一次 unsafe、第二次 verified」这种**跨规划轮次**的时序才测得到。
+	DryRunStatuses []string
+	DryRunMissing  bool // 声明「不支持预演」：回 404 空体
 
 	RetryableTimes int    // 前 n 次执行返回 retryable
 	AlwaysReject   string // 非空则每次执行都返回该错误码的 business_rejection
@@ -211,7 +250,14 @@ func (m *fakeModule) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		// 真实模块把报告包在 {"dryRun": ...} 里（internal/module 的 wrapDryRun，
 		// interfaces.md §3.3）：桩必须同形，否则测不到真正的解析路径。
-		writeTestJSON(w, http.StatusOK, map[string]any{"dryRun": map[string]any{"status": m.DryRunStatus}})
+		m.mu.Lock()
+		status := m.DryRunStatus
+		if len(m.DryRunStatuses) > 0 {
+			status = m.DryRunStatuses[0]
+			m.DryRunStatuses = m.DryRunStatuses[1:]
+		}
+		m.mu.Unlock()
+		writeTestJSON(w, http.StatusOK, map[string]any{"dryRun": map[string]any{"status": status}})
 		return
 	}
 
@@ -270,6 +316,7 @@ func (e *fakeEnv) Deps() Deps {
 		HTTP:       &http.Client{Timeout: 10 * time.Second},
 		Skills:     EmptySkills(),
 		Trace:      &e.Trace,
+		Token:      func(context.Context) (string, error) { return "tok-test", nil },
 	}
 }
 
@@ -291,13 +338,55 @@ func equalSeq(got, want []string) bool {
 
 // ---------- 用例 ----------
 
+// 授权预检不能扣配额：配额只在宿主签票时扣一次（interfaces.md §4.2.1）。
+//
+// 宿主的 grants:evaluate 缺省「预检即扣」以兼容 0.1，所以 agent 必须显式传 charge:false。
+// 漏了它的症状很难看出来：正常一轮只是多扣一次；但一旦某轮反复重试（例如批准后执行被拒、
+// 每秒重试），窗口配额会被扣穿，最终错误变成 QUOTA_EXCEEDED，跟真正的原因毫无关系
+// （2026-10-31 本地演示就这样把一张待批卡归档成了 stale）。
+func TestGrantPreflightDoesNotChargeQuota(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_charge001", testStep{id: "s1", action: "inventory.DeductStock"})}
+
+	Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if len(env.Host.GrantRequests) == 0 {
+		t.Fatal("没有观察到授权预检请求")
+	}
+	for _, req := range env.Host.GrantRequests {
+		if req["charge"] != false {
+			t.Fatalf("预检必须显式传 charge:false（缺省会被宿主当成「预检即扣」），实际 %#v", req["charge"])
+		}
+	}
+}
+
+// 策略评估必须递交触发源 id：宿主靠它判来源（request / event），而「对话发起」类
+// 业务规则只在 origin=request 时命中。漏了它，人明确要求的事会被判成「无策略命中」。
+func TestPolicyEvaluateSendsTriggerEventID(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{planJSON("pln_trigger01", testStep{id: "s1", action: "inventory.DeductStock"})}
+
+	Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if len(env.Host.PolicyRequests) == 0 {
+		t.Fatal("没有观察到策略评估请求")
+	}
+	if got := env.Host.PolicyRequests[0]["triggerEventId"]; got != "evt_test0001" {
+		t.Fatalf("triggerEventId 必须是本次回合的触发事件 id，实际 %#v", got)
+	}
+	// 来源只能由宿主判定：agent 不得自报 origin（spec §3.11）。
+	if _, present := env.Host.PolicyRequests[0]["origin"]; present {
+		t.Fatal("请求体里不该出现 origin：来源只能由宿主判定")
+	}
+}
+
 func TestGateOrder(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{planJSON("pln_gate0001", testStep{id: "s1", action: "inventory.DeductStock"})}
 
 	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
 
-	want := []string{"policies:evaluate", "grants:evaluate", "dry-run", "audit:dispatched", "execute", "audit:result"}
+	want := []string{"policies:evaluate", "grants:evaluate", "dry-run", "tickets:issue", "execute", "audit:result"}
 	if !equalSeq(env.Trace, want) {
 		t.Fatalf("闸门顺序不对：\n  实际 %v\n  期望 %v", env.Trace, want)
 	}
@@ -319,11 +408,11 @@ func TestGateOrderWithReadStep(t *testing.T) {
 	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
 
 	// 授权要先把整份计划的每个动作都过一遍（不能执行一半才撞拒绝）；
-	// 两段审计则与各自的执行紧邻，所以顺序是「dispatched → execute → result」×2。
+	// 读动作不签票、不写审计，写动作则是「签票 → execute → result」。
 	want := []string{
 		"policies:evaluate", "grants:evaluate", "grants:evaluate", "dry-run",
-		"audit:dispatched", "execute", "audit:result",
-		"audit:dispatched", "execute", "audit:result",
+		"execute", "audit:result",
+		"tickets:issue", "execute", "audit:result",
 	}
 	if !equalSeq(env.Trace, want) {
 		t.Fatalf("闸门顺序不对：\n  实际 %v\n  期望 %v", env.Trace, want)
@@ -352,10 +441,12 @@ func TestTraceOrderAgainstStubRequestsOnly(t *testing.T) {
 	}
 }
 
-func TestAuditDispatchedFailureAbortsExecution(t *testing.T) {
+// 拿不到票据就不能执行：dispatched 审计与"宿主批准过"现在由签票一步同时给出，
+// 签票失败等价于审计失败。
+func TestTicketIssueFailureAbortsExecution(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{planJSON("pln_audit0001", testStep{id: "s1", action: "inventory.DeductStock"})}
-	env.Host.FailAuditPost = true
+	env.Host.FailTicketIssue = true
 
 	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
 
@@ -363,12 +454,12 @@ func TestAuditDispatchedFailureAbortsExecution(t *testing.T) {
 		t.Fatalf("期望 failed，得到 %q（%s）", res.Outcome, res.Detail)
 	}
 	if env.Module.WriteCalls != 0 || env.Module.ExecuteCalls != 0 {
-		t.Fatalf("dispatched 审计写失败时必须拒绝执行，实际 write=%d execute=%d",
+		t.Fatalf("签票失败时必须拒绝执行，实际 write=%d execute=%d",
 			env.Module.WriteCalls, env.Module.ExecuteCalls)
 	}
-	want := []string{"policies:evaluate", "grants:evaluate", "dry-run", "audit:dispatched"}
+	want := []string{"policies:evaluate", "grants:evaluate", "dry-run", "tickets:issue"}
 	if !equalSeq(env.Trace, want) {
-		t.Fatalf("审计失败后应当立即终止：实际 %v，期望 %v", env.Trace, want)
+		t.Fatalf("签票失败后应当立即终止：实际 %v，期望 %v", env.Trace, want)
 	}
 }
 
@@ -763,6 +854,47 @@ func TestDryRunUnsafeGoesNeedsHuman(t *testing.T) {
 	}
 }
 
+// unsafe 是**事实性**裁决（模块按当前状态算出这一步不成立），不是治理拒绝。
+//
+// 把它一次性丢掉、直接转人工，等于刚学到的信息白学：D1 实测里模型在还没有库存事实时
+// 就规了扣减，预演判 unsafe 后整轮放弃，A/B 两轮序列因此完全相同。这条用例锁的是
+// 「带着裁决再规划一轮」——以及裁决里必须指明是哪个动作，否则模型不知道该换哪一步。
+func TestUnsafeDryRunReplansWithVerdict(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{
+		// 一轮就给出读+写：这正是 D1 实测里 deepseek-flash 的行为。
+		planJSON("pln_unsafe001",
+			testStep{id: "s1", action: "inventory.GetStock", kind: "read", args: `{"sku":"STD-1002"}`},
+			testStep{id: "s2", action: "inventory.DeductStock", dependsOn: `["s1"]`}),
+		// 拿到裁决后先取事实。
+		planJSON("pln_unsafe002", testStep{id: "s1", action: "inventory.GetStock", kind: "read", args: `{"sku":"STD-1002"}`}),
+		// 事实到手再决定。
+		planJSON("pln_unsafe003", testStep{id: "s1", action: "inventory.DeductStock"}),
+	}
+	// 第一次预演判 unsafe（这一步在当下不成立），第二次通过。
+	env.Module.DryRunStatuses = []string{dryRunUnsafe, dryRunVerified}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("重新规划后预演通过，应当 completed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if got := env.PlannerCalls(); got != 3 {
+		t.Fatalf("unsafe → 再规划 → 只读取事实 → 再规划：期望 3 次规划，实际 %d", got)
+	}
+	if !strings.Contains(env.LLM.prompts[1], "unsafe") {
+		t.Fatalf("第二轮 prompt 必须带上预演裁决，实际：\n%s", env.LLM.prompts[1])
+	}
+	if !strings.Contains(env.LLM.prompts[1], "inventory.DeductStock") {
+		t.Fatalf("裁决要指明是哪个动作（否则模型不知道该换哪一步），实际：\n%s", env.LLM.prompts[1])
+	}
+	// 预演失败的那一轮一步都没执行：闸门在派发之前，读也不提前跑。
+	if env.Module.ExecuteCalls != 2 || env.Module.WriteCalls != 1 {
+		t.Fatalf("只应有「取事实那一步 + 最终扣减」被执行，实际 execute=%d write=%d",
+			env.Module.ExecuteCalls, env.Module.WriteCalls)
+	}
+}
+
 // TestDryRunNotFoundForcesHuman 锁住 fail-closed 语义：
 // 模块没实现预演（404）不等于免检。设计文档 §8 的降级矩阵写的是
 // 「无 dry-run（unsupported）或 unsafe → 强制审批」。
@@ -816,6 +948,67 @@ func TestBusinessRejectionReplansAtMostTwice(t *testing.T) {
 	}
 	if !strings.Contains(env.LLM.prompts[1], "STOCK_INSUFFICIENT") {
 		t.Fatalf("重规划 prompt 必须包含业务拒绝的错误码，实际：\n%s", env.LLM.prompts[1])
+	}
+}
+
+// 只读不是完成：一整轮只有读动作时，事实才刚到手、处置还没开始，不能回报 completed。
+//
+// 这条用例锁的是 D1 的失效形态：`quote.completed` 的载荷里没有库存快照，「够就扣、不够
+// 就采购」是只有运行期才看得见的分支。模型一次规划要给出一份完整动作序列，所以它只能
+// 先读——读完之后必须拿到**读回来的事实**再规划一轮，否则它永远走不到第二步。
+func TestReadOnlyPlanReplansWithObservedFacts(t *testing.T) {
+	env := newFakeEnv(t)
+	env.LLM.replies = []string{
+		planJSON("pln_obs0001", testStep{id: "s1", action: "inventory.GetStock", kind: "read", args: `{"sku":"STD-1002"}`}),
+		planJSON("pln_obs0002", testStep{id: "s1", action: "inventory.DeductStock"}),
+	}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeCompleted {
+		t.Fatalf("第二轮给出了写动作，应当 completed，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if got := env.PlannerCalls(); got != 2 {
+		t.Fatalf("只读一轮之后必须再规划一轮，期望 2 次规划，实际 %d", got)
+	}
+	// 回填的必须是真的读回来的内容（桩模块的执行响应是 {"onHand":0}），不是「我读过了」。
+	if !strings.Contains(env.LLM.prompts[1], "onHand") {
+		t.Fatalf("第二轮 prompt 必须带上第一轮只读步骤的实际返回，实际：\n%s", env.LLM.prompts[1])
+	}
+	if !strings.Contains(env.LLM.prompts[1], "inventory.GetStock") {
+		t.Fatalf("事实块必须标明它来自哪个动作，实际：\n%s", env.LLM.prompts[1])
+	}
+	// 读动作确实执行过，所以它仍在 ActionsTaken 里；但结局由写动作给出。
+	if !equalSeq(res.ActionsTaken, []string{"inventory.GetStock", "inventory.DeductStock"}) {
+		t.Fatalf("执行过的动作序列不对：%v", res.ActionsTaken)
+	}
+}
+
+// 观察回填有上限：连续只读、始终拿不出写动作，就必须转人工。
+//
+// 「再规划一轮」不能变成无限循环，也不能在事实齐了之后仍然自称完成——能力清单里没有
+// 能完成业务的写动作时，正确的答案是举手，而不是把只读计划当成结果交出去。
+func TestReadOnlyPlanEscalatesAfterObservationCap(t *testing.T) {
+	env := newFakeEnv(t)
+	readOnly := func(planID string) string {
+		return planJSON(planID, testStep{id: "s1", action: "inventory.GetStock", kind: "read", args: `{"sku":"STD-1002"}`})
+	}
+	env.LLM.replies = []string{readOnly("pln_obsc001"), readOnly("pln_obsc002"), readOnly("pln_obsc003")}
+
+	res := Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
+
+	if res.Outcome != OutcomeNeedsHuman {
+		t.Fatalf("只读到上限仍无写动作必须转人工，得到 %q（%s）", res.Outcome, res.Detail)
+	}
+	if got := env.PlannerCalls(); got != 1+maxObservationRounds {
+		t.Fatalf("期望 1 次初始 + %d 次观察回填 = %d 次规划，实际 %d",
+			maxObservationRounds, 1+maxObservationRounds, got)
+	}
+	if env.Module.WriteCalls != 0 {
+		t.Fatalf("只读轮次不该有写调用，实际 %d", env.Module.WriteCalls)
+	}
+	if !strings.Contains(res.Detail, "只读") {
+		t.Fatalf("结局必须说清是「只有只读、没有业务动作」，实际：%s", res.Detail)
 	}
 }
 
@@ -903,33 +1096,45 @@ func TestEnabledModulesAreFiltered(t *testing.T) {
 	}
 }
 
-func TestAuditRecordsTwoSegments(t *testing.T) {
+// 0.2.0 起两段由两侧分工：dispatched 由宿主在签票时写，agent 只写 result。
+// 这条锁住"分工之后仍然对得上"：两边用的是同一个 auditId，绑定字段在签票请求里。
+func TestTicketAndResultSplit(t *testing.T) {
 	env := newFakeEnv(t)
 	env.LLM.replies = []string{planJSON("pln_audit0002", testStep{id: "s1", action: "inventory.DeductStock"})}
 	_ = Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
 
-	if len(env.Host.AuditRecords) != 2 {
-		t.Fatalf("期望 dispatched + result 两段，实际 %d 条", len(env.Host.AuditRecords))
+	if len(env.Host.AuditRecords) != 1 {
+		t.Fatalf("agent 只写 result 一段，实际 %d 条", len(env.Host.AuditRecords))
 	}
-	dispatched, result := env.Host.AuditRecords[0], env.Host.AuditRecords[1]
-	if dispatched["stage"] != "dispatched" || result["stage"] != "result" {
-		t.Fatalf("两段顺序不对：%v / %v", dispatched["stage"], result["stage"])
+	result := env.Host.AuditRecords[0]
+	if result["stage"] != "result" {
+		t.Fatalf("agent 写的必须是 result 段，实际 %v", result["stage"])
 	}
-	if dispatched["auditId"] != result["auditId"] {
-		t.Fatalf("同一笔调用的两段必须共用 auditId：%v / %v", dispatched["auditId"], result["auditId"])
+	if result["auditId"] != "aud_stub" {
+		t.Fatalf("result 必须复用签票返回的 auditId，实际 %v", result["auditId"])
 	}
-	if dispatched["planId"] != "pln_audit0002" || dispatched["stepId"] != "s1" {
-		t.Fatalf("审计缺少计划锚点：%v", dispatched)
+	if len(env.Host.TicketRequests) != 1 {
+		t.Fatalf("写动作应签一次票，实际 %d 次", len(env.Host.TicketRequests))
 	}
-	if got := dispatched["idempotencyKey"]; got != "tenon:pln_audit0002/s1" {
+	req := env.Host.TicketRequests[0]
+	if req["planId"] != "pln_audit0002" || req["stepId"] != "s1" {
+		t.Fatalf("签票请求缺计划锚点：%v", req)
+	}
+	if req["action"] != "inventory.DeductStock" || req["agent"] != "ag_test" || req["onBehalfOf"] != "user:alice" {
+		t.Fatalf("签票请求的绑定字段不对：%v", req)
+	}
+	if _, ok := req["args"].(map[string]any); !ok {
+		t.Fatalf("签票请求必须带原始入参：%v", req["args"])
+	}
+	if got := result["idempotencyKey"]; got != "tenon:pln_audit0002/s1" {
 		t.Fatalf("写动作的审计必须带幂等键，实际 %v", got)
 	}
 	for _, field := range []string{"trigger", "inputHash", "tokenUsage", "actor", "effects"} {
-		if _, ok := dispatched[field]; !ok {
-			t.Fatalf("审计记录缺少必填字段 %q（audit-event.schema.json）：%v", field, dispatched)
+		if _, ok := result[field]; !ok {
+			t.Fatalf("审计记录缺少必填字段 %q（audit-event.schema.json）：%v", field, result)
 		}
 	}
-	decision, _ := dispatched["decision"].(map[string]any)
+	decision, _ := result["decision"].(map[string]any)
 	if decision["outcome"] != outcomeAuto {
 		t.Fatalf("审计的 decision.outcome 应当是闸门处置 %q，实际 %v", outcomeAuto, decision["outcome"])
 	}
@@ -941,10 +1146,6 @@ func TestAuditRecordsTwoSegments(t *testing.T) {
 	if decision["grantId"] != "gr-test001" {
 		t.Fatalf("audit.decision.grantId 应当是命中的授权，实际 %v", decision["grantId"])
 	}
-	res, _ := dispatched["result"].(map[string]any)
-	if res["status"] != "unknown" {
-		t.Fatalf("dispatched 段的结果必须未定（unknown），实际 %v", res["status"])
-	}
 }
 
 // F1 的反面：auto 路径没有人批准过，step 级两段的 decision.approvedBy 必须是 null。
@@ -954,8 +1155,8 @@ func TestAuditAutoPathKeepsApprovedByNull(t *testing.T) {
 	env.LLM.replies = []string{planJSON("pln_auto0003", testStep{id: "s1", action: "inventory.DeductStock"})}
 	_ = Run(context.Background(), env.Deps(), RunInput{Event: quoteCompleted(12)})
 
-	if len(env.Host.AuditRecords) != 2 {
-		t.Fatalf("期望 dispatched + result 两段，实际 %d 条", len(env.Host.AuditRecords))
+	if len(env.Host.AuditRecords) != 1 {
+		t.Fatalf("agent 只写 result 一段，实际 %d 条", len(env.Host.AuditRecords))
 	}
 	for _, rec := range env.Host.AuditRecords {
 		decision, _ := rec["decision"].(map[string]any)
@@ -1015,8 +1216,16 @@ func TestAuditRequestTurnCorrelationIsCorAnchor(t *testing.T) {
 	}
 
 	correlationIDPattern := regexp.MustCompile(`^cor:\S+$`)
-	if len(env.Host.AuditRecords) != 2 {
-		t.Fatalf("一步计划应写 dispatched + result 两段，实际 %d 条", len(env.Host.AuditRecords))
+	// 读动作不签票、不写 dispatched，只剩 result 一段；**每一轮只读也各写一条**。
+	// 轮数不再固定为 1：只读不再直接算完成（见 run.go 的「只读不是完成」），
+	// 纯查询会走满观察预算。这条用例判的是锚点，不是轮数，所以按实际规划次数对齐。
+	if len(env.Host.AuditRecords) != env.PlannerCalls() {
+		t.Fatalf("每次只读各写一条 result，规划 %d 次却有 %d 条审计",
+			env.PlannerCalls(), len(env.Host.AuditRecords))
+	}
+	// 结局要把「没有产生业务动作」说出来：只读完成不许冒充「办完了」（run.go 的判据）。
+	if !strings.Contains(res.Detail, "只读完成") {
+		t.Fatalf("请求回合只读到底时，结论必须自报「只读完成」，实际：%s", res.Detail)
 	}
 	for _, rec := range env.Host.AuditRecords {
 		trigger, _ := rec["trigger"].(map[string]any)

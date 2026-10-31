@@ -3,6 +3,8 @@ package module
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -70,11 +72,15 @@ type fixture struct {
 }
 
 func newFixture() *fixture {
+	testSigner.init()
 	f := &fixture{}
+	// 既有用例测的是契约与幂等，不是票据；默认 warn 让它们不被票据拦住。
+	// 票据本身的强制行为由 ticket_test.go 用 enforce 模块单独判定。
 	f.module = &Module{
-		ID:      fixtureModuleID,
-		Title:   "演示模块",
-		Version: "0.1.0",
+		TicketMode: TicketModeWarn,
+		ID:         fixtureModuleID,
+		Title:      "演示模块",
+		Version:    "0.1.0",
 		Actions: []Action{
 			{
 				ID:      readActionID,
@@ -168,6 +174,14 @@ func testError(class protocol.ErrorClass, code, message string) *protocol.Error 
 
 func serve(t *testing.T, m *Module) *httptest.Server {
 	t.Helper()
+	// 测试默认 warn：绝大多数用例验的是契约与幂等，不该被票据拦截。
+	// 票据强制由 ticket_test.go 用显式 enforce 的模块单独判定。
+	if m.TicketMode == "" {
+		m.TicketMode = TicketModeWarn
+	}
+	if len(m.TrustedKeys) == 0 && testSigner.priv != nil {
+		m.TrustedKeys = protocol.KeySet{testSigner.kid: testSigner.priv.Public().(ed25519.PublicKey)}
+	}
 	srv := httptest.NewServer(m.Handler())
 	t.Cleanup(srv.Close)
 	return srv
@@ -190,6 +204,15 @@ func do(t *testing.T, method, url string, body []byte, extra map[string]string) 
 	req.Header.Set(protocol.HeaderVersion, protocol.Version)
 	for k, v := range extra {
 		req.Header.Set(k, v)
+	}
+	// 写动作自动带票：0.2.0 起模块只认票，用例不该为每个写请求手搓一张。
+	// 要测拒票的用例只需自己塞一个 Tenon-Ticket 头，注入就会让位。
+	if testSigner.priv != nil && method == http.MethodPost && strings.Contains(url, "/tenon/actions/") &&
+		!strings.Contains(url, ":dry-run") && req.Header.Get(protocol.HeaderIdempotencyKey) != "" {
+		if req.Header.Get(protocol.HeaderTicket) == "" {
+			req.Header.Set(protocol.HeaderTicket, testSigner.mint(t, url, body,
+				req.Header.Get(protocol.HeaderIdempotencyKey)))
+		}
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1930,4 +1953,53 @@ func TestValidateRejectsRequiredArgsOutsideSchema(t *testing.T) {
 	if !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("错误里要点名字段，得到：%v", err)
 	}
+}
+
+// testSigner 是测试用签名器：让写请求自动带上合法票据。
+// 要测「无票/坏票」的用例自己塞 Tenon-Ticket 头即可绕过注入。
+type testSignerType struct {
+	priv ed25519.PrivateKey
+	kid  string
+}
+
+var testSigner testSignerType
+
+var testTicketSeq atomic.Int64
+
+func (s *testSignerType) init() {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	s.priv, s.kid = priv, protocol.KeyID(pub)
+}
+
+func (s *testSignerType) mint(t *testing.T, url string, body []byte, idem string) string {
+	t.Helper()
+	action := url[strings.LastIndex(url, "/")+1:]
+	if i := strings.IndexByte(action, '?'); i >= 0 {
+		action = action[:i]
+	}
+	mod := fixtureModuleID
+	if over := strings.TrimSpace(os.Getenv(EnvModuleID)); over != "" {
+		mod = over
+	}
+	now := time.Now().UTC()
+	tk := protocol.Ticket{
+		TicketID:       fmt.Sprintf("tkt_test_%d", testTicketSeq.Add(1)),
+		Module:         mod,
+		Action:         action,
+		ArgsHash:       protocol.ArgsHash(body),
+		IdempotencyKey: idem,
+		PlanID:         "pln_test",
+		StepID:         "s1",
+		AuditID:        "aud_test",
+		IssuedAt:       now.Unix(),
+		ExpiresAt:      now.Add(30 * time.Second).Unix(),
+	}
+	token, err := protocol.SignTicket(s.priv, tk)
+	if err != nil {
+		t.Fatalf("签测试票失败：%v", err)
+	}
+	return token
 }

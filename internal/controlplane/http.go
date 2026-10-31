@@ -74,6 +74,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -197,6 +198,14 @@ type Config struct {
 	// 本字段只在装配侧（cmd/host）读取：是否容忍坏的 approval.json 是部署决定，
 	// New() 不替调用方做这个判断，因此引擎行为不受它影响。
 	StrictRules bool
+	// TicketSigningKey 是签发执行票据的 Ed25519 私钥。
+	//
+	// 为空时签发端点回 503 TICKET_SIGNING_DISABLED，**不做降级签票**：没有密钥
+	// 就没有"宿主批准过"这回事。生产装配方（cmd/host）在缺密钥时直接拒绝启动；
+	// 本包留 503 是给测试态与未来装配方一个说得清原因的出口。
+	TicketSigningKey ed25519.PrivateKey
+	// TicketTTL 是票据有效期，缺省 30s；超过 protocol.TicketMaxTTL 一律按上限截断。
+	TicketTTL time.Duration
 }
 
 // Server 是组装好的控制平面。构造后并发安全；Handler() 与服务共享同一份状态。
@@ -235,6 +244,9 @@ type Server struct {
 	uiDir string
 	// pending 是待批公告板：只读 read-model，agent 推、前端看。刻意不落盘（可重建）。
 	pending *pendingBoard
+	// ticketKey 是签发执行票据的私钥；ticketTTL 是票据有效期。
+	ticketKey ed25519.PrivateKey
+	ticketTTL time.Duration
 }
 
 // New 装配控制平面。审计日志打不开或策略规则自检不过都会返回错误：宿主不该带着
@@ -271,6 +283,9 @@ func New(cfg Config) (*Server, error) {
 		uiDir:          cfg.UIDir,
 		// 公告板是纯内存 read-model：可丢、可重建，重建靠 agent 每 tick 的幂等 upsert。
 		pending: newPendingBoard(),
+		// 票据密钥缺失不在这里报错：测试态可以不签票，但签发端点会拒绝而不是降级。
+		ticketKey: cfg.TicketSigningKey,
+		ticketTTL: ticketTTLOrDefault(cfg.TicketTTL),
 	}
 	// 会话密钥没有安全缺省值：空密钥签出的 token 任何人都能伪造，宁可拒绝启动。
 	// 关掉审计句柄再返回，否则调用方拿不到 Server，文件却已经被这个失败的构造打开。
@@ -389,6 +404,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.servePoliciesEvaluate(w, r)
 	case "/tenon/grants:evaluate":
 		s.serveGrantsEvaluate(w, r)
+	case "/tenon/tickets:issue":
+		s.serveTicketIssue(w, r)
 	case "/tenon/session":
 		s.serveSession(w, r)
 	case "/tenon/audit":
@@ -704,6 +721,11 @@ type grantEvaluateRequest struct {
 	OnBehalfOf string          `json:"onBehalfOf"`
 	Action     string          `json:"action"`
 	Args       json.RawMessage `json:"args"`
+	// Charge 为 false 时只预检、不记账。
+	//
+	// 缺省（nil）保持 0.1 的「预检即扣」语义，不改变既有调用方行为；
+	// 计划阶段的估算应显式传 false，真正的扣减发生在签发执行票据时。
+	Charge *bool `json:"charge,omitempty"`
 }
 
 // serveGrantsEvaluate 对单次调用做授权评估。拒绝是 200 + allowed:false（interfaces.md §4.1：
@@ -737,7 +759,13 @@ func (s *Server) serveGrantsEvaluate(w http.ResponseWriter, r *http.Request) {
 		writeTenonError(w, *perr)
 		return
 	}
-	result, err := s.grantEngine.Evaluate(req.Agent, req.OnBehalfOf, req.Action, amount)
+	var result grant.GrantResult
+	var err error
+	if req.Charge != nil && !*req.Charge {
+		result, err = s.grantEngine.EvaluateNoCharge(req.Agent, req.OnBehalfOf, req.Action, amount)
+	} else {
+		result, err = s.grantEngine.Evaluate(req.Agent, req.OnBehalfOf, req.Action, amount)
+	}
 	if err != nil {
 		// 引擎错误是「授权数据读不懂」（窗口/计量单位不在支持范围），不是一次判定：
 		// GrantResult 的拒绝原因被 schema 锁死为四态，无法承载它，所以走 503。
@@ -849,6 +877,16 @@ func (s *Server) serveAuditAppend(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(rec.AuditID) == "" {
 		writeTenonError(w, *newError(protocol.ClassContractViolation, "MISSING_AUDIT_ID",
 			"审计记录缺少 auditId"))
+		return
+	}
+	// 步骤级 dispatched 是"执行前置"的唯一凭据，只能由签发票据时产生。
+	// 若还允许 agent 自己写，审计前置就退化成 agent 的自觉，票据也就白验了。
+	//
+	// 计划级 dispatched（stepId 为空）不在此列：挂起/续跑链路依赖它，
+	// 且它不对应任何副作用。收归宿主留到 P1。
+	if rec.Stage == audit.StageDispatched && strings.TrimSpace(rec.StepID) != "" {
+		writeTenonError(w, *newError(protocol.ClassPolicyDenied, "AUDIT_STAGE_FORBIDDEN",
+			"步骤级 dispatched 只能由宿主签发票据时写入；调用方只能写 stage=result"))
 		return
 	}
 	switch rec.Stage {

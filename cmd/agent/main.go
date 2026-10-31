@@ -351,6 +351,8 @@ func run(ctx context.Context) error {
 	if err := hostc.Login(ctx); err != nil {
 		return fmt.Errorf("宿主登录失败（%s / %s）：%w", envAgentUser, envAgentPassword, err)
 	}
+	// 写动作要凭这张 token 换执行票据：没有它，agent 只能读、不能写。
+	deps.Token = hostc.Token
 
 	p := &poller{cfg: cfg, deps: deps, client: deps.HTTP, cursors: cursors, plans: plans,
 		hostc: hostc, store: store, ledger: ledger}

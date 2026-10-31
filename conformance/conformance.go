@@ -183,6 +183,8 @@ func Run(ctx context.Context, opts Options) Report {
 	rep.Results = append(rep.Results, checkErrorClass(ctx, client, opts.Target, fix)...)
 	rep.Results = append(rep.Results, checkDryRunOptional(ctx, client, opts.Target, manifest, raws)...)
 	rep.Results = append(rep.Results, checkLint(opts.LintRoot))
+	rep.Results = append(rep.Results, checkTicketEnforcement(ctx, client, opts.Target, manifest, fix)...)
+	rep.Results = append(rep.Results, checkAuditChain(ctx, client, opts.Target, manifest))
 	rep.Results = append(rep.Results, hostSideChecks(ctx, client, opts.HostTarget)...)
 
 	rep.FinishedAt = time.Now()
@@ -561,7 +563,10 @@ func checkAuditTrail(ctx context.Context, client *http.Client, host string) Resu
 	// errorClass）都是封闭对象，缺键与给 null 在哈希链里是不同的字节，所以这里写全。
 	args := []byte(`{"sku":"STD-1001","qty":2,"referenceNo":"CONF-1"}`)
 	output := []byte(`{"onHand":98}`)
-	common := fmt.Sprintf(`"auditId":%q,"planId":%q,"stepId":"s1","action":"inventory.DeductStock",`+
+	// stepId 留空：自 0.2.0 起，步骤级 dispatched 由宿主在签发票据时写入，
+	// 调用方再写会被 403 拒绝。C4 验的是「两段写 + 哈希链」这条机制本身，
+	// 用计划级那一对记录同样成立；票据侧的强制另由 C11 判定。
+	common := fmt.Sprintf(`"auditId":%q,"planId":%q,"stepId":"","action":"inventory.DeductStock",`+
 		`"actor":{"type":"agent","id":"ag_conformance","onBehalfOf":"user:alice"},`+
 		`"decision":{"outcome":"auto","policyId":"pol.conformance.auto","grantId":null,"approvedBy":null},`+
 		`"inputHash":%q,"idempotencyKey":"tenon:%s/s1"`,

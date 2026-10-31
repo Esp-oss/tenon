@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
@@ -33,6 +37,38 @@ func setHMACSecretFile(t *testing.T) {
 		t.Fatalf("写密钥文件失败：%v", err)
 	}
 	t.Setenv("TENON_HMAC_SECRET_FILE", path)
+	setTicketSigningKey(t)
+}
+
+// setTicketSigningKey 注入一份临时 Ed25519 私钥。
+//
+// 与注册密钥同理：生产缺私钥即拒绝启动，所以每个走 loadConfig 的用例都要先备好，
+// 否则测的就不是「装配接对了没」，而是「密钥校验有没有生效」。
+func setTicketSigningKey(t *testing.T) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("生成签名密钥失败：%v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("编码私钥失败：%v", err)
+	}
+	path := filepath.Join(t.TempDir(), "ticket-key.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("写私钥失败：%v", err)
+	}
+	t.Setenv("TENON_HOST_SIGNING_KEY", path)
+}
+
+// 生产（非测试态）缺票据私钥必须拒绝启动：签不出票不能降级成不验票。
+func TestLoadConfigFailsWithoutTicketKey(t *testing.T) {
+	setHMACSecretFile(t)
+	t.Setenv("TENON_HOST_SIGNING_KEY", "")
+	t.Setenv("TENON_TEST_MODE", "")
+	if _, _, err := loadConfig(registry.NewRegistry()); err == nil {
+		t.Fatal("缺票据私钥时 loadConfig 应失败")
+	}
 }
 
 // loadConfig 是纯装配：给它环境变量与一个假模块，它必须把规则、身份、目录都接上。
@@ -125,6 +161,8 @@ func TestLoadConfigWarnsOnRequireTrigger(t *testing.T) {
 // D7：拿不到可用的共享密钥就启动失败（未设置 / 文件不存在 / 空文件 / 多行），
 // 且错误信息必须点名是哪个环境变量——运维只凭日志修问题。
 func TestLoadConfigFailsWithoutUsableHMACSecret(t *testing.T) {
+	// 票据私钥先备好，否则失败原因会变成"缺票据私钥"，测不到这条 D7 规则。
+	setTicketSigningKey(t)
 	dir := t.TempDir()
 	empty := filepath.Join(dir, "empty")
 	if err := os.WriteFile(empty, []byte(" \n\r\n"), 0o600); err != nil {

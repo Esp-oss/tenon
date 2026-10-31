@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env powershell
+#!/usr/bin/env powershell
 # 本地开发栈：起 llmstub + 三个模块 + host + agent，**常驻不退出**，供浏览器手工验收。
 #
 #   powershell -NoProfile -File scripts/dev-up.ps1          # 桩规划器（默认，结果可预期）
@@ -72,6 +72,15 @@ if (-not (Test-Path $hmacFile)) {
 	$buf = New-Object byte[] 32
 	$rng.GetBytes($buf)
 	[System.IO.File]::WriteAllText($hmacFile, [System.BitConverter]::ToString($buf).Replace('-', '').ToLowerInvariant())
+}
+
+# 票据签名密钥：宿主缺它拒绝启动（P0-1）。公钥文件同时给三个模块做信任集，
+# 两边必须成对，所以一起生成、一起放在 $work 里。
+$ticketKey = Join-Path $work 'host-ticket.key'
+$ticketPub = Join-Path $work 'host-ticket.pub.json'
+if (-not (Test-Path $ticketKey)) {
+	& go run ./cmd/tenon keygen --out $ticketKey --pub $ticketPub
+	if ($LASTEXITCODE -ne 0) { Fail '生成票据签名密钥失败' }
 }
 
 # R1 自注册的三处接线：模块的 TENON_HOST、宿主的事件链路径、预期可见的模块集合。
@@ -161,16 +170,19 @@ try {
 		PORT = '8081'; TENON_MODULE_ID = 'inventory'; TENON_TEST_MODE = '1'
 		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-inventory.jsonl"
+		TENON_TRUSTED_KEYS = $ticketPub; TENON_TICKET_MODE = 'enforce'
 	} | Out-Null
 	Start-Svc 'procurement' @{
 		PORT = '8082'; TENON_MODULE_ID = 'procurement'; TENON_TEST_MODE = '1'
 		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-procurement.jsonl"
+		TENON_TRUSTED_KEYS = $ticketPub; TENON_TICKET_MODE = 'enforce'
 	} | Out-Null
 	Start-Svc 'quote' @{
 		PORT = '8083'; TENON_MODULE_ID = 'quote'; TENON_TEST_MODE = '1'
 		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-quote.jsonl"
+		TENON_TRUSTED_KEYS = $ticketPub; TENON_TICKET_MODE = 'enforce'
 	} | Out-Null
 	Wait-Ready 'inventory' 'http://127.0.0.1:8081/readyz'
 	Wait-Ready 'procurement' 'http://127.0.0.1:8082/readyz'
@@ -186,6 +198,7 @@ try {
 		TENON_SKILLS_DIR = 'skills'; TENON_POLICY_FILE = 'config/policies.dev.json'
 		TENON_GRANT_FILE = 'config/grants.dev.json'; TENON_INBOUND_DIR = "$work/inbound"
 		TENON_AUDIT_PATH = "$work/audit-host.jsonl"; TENON_UI_DIR = 'ui'
+		TENON_HOST_SIGNING_KEY = $ticketKey
 	} | Out-Null
 	Wait-Ready 'host' "http://127.0.0.1:$HostPort/readyz"
 	# 端口通 ≠ 注册完：等清单齐了再起 agent，否则第一张待批卡会因为「agent 看不到模块」造不出来。
@@ -216,16 +229,28 @@ try {
 	Start-Sleep -Seconds 2
 
 	if (-not $NoDemoCard) {
-		# 造一张待批卡，让人一打开页面就有东西可点（否则待批区是空的）。
-		$bodyPath = Join-Path $work 'quote-body.json'
-		[System.IO.File]::WriteAllText($bodyPath, '{"quoteNo":"Q-LOCAL-1","lines":[{"sku":"STD-1001","qty":12}]}', (New-Object System.Text.UTF8Encoding($false)))
-		& curl.exe -s -X POST 'http://127.0.0.1:8083/tenon/actions/quote.CreateStandardPartQuote' `
-			-H 'Content-Type: application/json' -H 'Tenon-Version: 0.1' -H 'Idempotency-Key: tenon:dev/1' `
-			--data-binary "@$bodyPath" -o (Join-Path $work 'quote-resp.json')
-		$deadline = (Get-Date).AddSeconds(30)
+		# 种一张待批卡：走**入站请求帧**，不直连模块。
+		#   直连模块写（旧实现）在 P0-1 之后必然 403 TICKET_MISSING —— 模块要求宿主签发的票，
+		#   而脚本手里没有；旧版本把失败吞掉了，于是「已预置一张待批卡」这句话是假的。
+		#   改走入站帧以后，规划由 agent 做、卡由 agent 落，与人在对话里说一句话走的是同一条路径。
+		$reqBody = Join-Path $work 'seed-request.json'
+		[System.IO.File]::WriteAllText($reqBody, '{"type":"tenon.request","text":"把 STD-1001 的 12 件库存扣掉，给 Q-LOCAL 这张单发货"}', (New-Object System.Text.UTF8Encoding($false)))
+		try {
+			$session = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$HostPort/tenon/session" -ContentType 'application/json' -Body '{"user":"alice","password":"alice-dev"}'
+			$seed = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$HostPort/tenon/requests" -ContentType 'application/json' -Headers @{ Authorization = "Bearer $($session.token)" } -InFile $reqBody
+			Write-Host ("  种子请求：seq $($seed.seq)  requestId $($seed.requestId)") -ForegroundColor DarkGray
+		} catch {
+			Write-Host ('  ! 种子请求失败：' + $_.Exception.Message) -ForegroundColor Yellow
+		}
+		# 等 agent 规划完并落卡（桩模型约 2-3 秒；真模型一个回合 10-40 秒）。
+		$deadline = (Get-Date).AddSeconds(45)
 		while ((Get-Date) -lt $deadline) {
 			if (Get-ChildItem (Join-Path $stateDir 'pending') -Filter '*.json' -ErrorAction SilentlyContinue) { break }
 			Start-Sleep -Milliseconds 400
+		}
+		$pendingFiles = @(Get-ChildItem (Join-Path $stateDir 'pending') -Filter '*.json' -ErrorAction SilentlyContinue)
+		if ($pendingFiles.Count -eq 0) {
+			Write-Host '  ! 45 秒内没等到待批卡：看 out/dev/logs/agent.err（规划失败/被闸门拒都是这个症状）' -ForegroundColor Yellow
 		}
 	}
 

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tenon.dev/spec/0.1/schemas/ticket.schema.json",
+  "title": "ExecutionTicket（执行票据）",
+  "description": "宿主在「策略 + 授权」通过后签发的单次执行凭证。模块先验票再执行：没有票就产生不了副作用。票据是 v1.<base64url(payload)>.<base64url(sig)> 的三段式，sig 为 Ed25519 对 \"v1.\"+payload 段签名的结果。本 schema 描述的是中间那段 payload。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "tid", "kid", "mod", "act", "ah", "idem", "pid", "sid", "aud", "iat", "exp"],
+  "properties": {
+    "v": {
+      "description": "票据格式版本。换签名方案或字段语义时递增，模块只接受已知版本。",
+      "const": 1
+    },
+    "tid": {
+      "description": "票据 id，模块用它实现一次性：同 tid 换幂等键重放 → TICKET_REUSED。",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "kid": {
+      "description": "签名密钥 id，由公钥内容推导（sha256 前 8 字节 hex），不单独分配。",
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "mod": {
+      "description": "目标模块 id。模块必须与自身 id 比对，防止拿 A 模块的票打 B 模块。",
+      "type": "string",
+      "minLength": 1
+    },
+    "act": {
+      "description": "动作标识，必须与请求 URL 里的 action 完全一致。",
+      "type": "string",
+      "minLength": 1
+    },
+    "ah": {
+      "description": "入参摘要，对**原始请求体字节**求值（不是解析后重新序列化）。改一个字节即失配。",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "idem": {
+      "description": "幂等键，与请求头 Idempotency-Key 一致。",
+      "type": "string",
+      "minLength": 1
+    },
+    "pid": {
+      "description": "计划 id，审计与对账用。",
+      "type": "string",
+      "minLength": 1
+    },
+    "sid": {
+      "description": "步骤 id。",
+      "type": "string",
+      "minLength": 1
+    },
+    "aud": {
+      "description": "宿主审计 id，与 stage=dispatched 的审计记录一致，是两侧对账的主键。",
+      "type": "string",
+      "minLength": 1
+    },
+    "by": {
+      "description": "审批人。自动档为 null。宿主从 token claims 或冻结的批准记录取值，不接受调用方自报。",
+      "type": ["string", "null"]
+    },
+    "gid": {
+      "description": "命中的授权 id。无授权（如仅策略放行）时为 null。",
+      "type": ["string", "null"]
+    },
+    "iat": {
+      "description": "签发时间（Unix 秒）。",
+      "type": "integer",
+      "minimum": 0
+    },
+    "exp": {
+      "description": "过期时间（Unix 秒），必须满足 0 < exp-iat <= 60。",
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

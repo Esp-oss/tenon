@@ -43,6 +43,8 @@ func TestMain(m *testing.M) {
 	}
 	_ = os.Setenv(module.EnvAuditPath, filepath.Join(dir, "audit.jsonl"))
 	_ = os.Setenv(module.EnvHMACSecretFile, filepath.Join(dir, "absent-secret.txt"))
+	// 本包测的是报价业务逻辑，不是票据；票据强制由 internal/module 的用例判定。
+	_ = os.Setenv(module.EnvTicketMode, module.TicketModeWarn)
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -558,8 +560,9 @@ func TestManifestSummariesOmitInputSchema(t *testing.T) {
 	if mf.Module.ID != moduleID || mf.Module.Version != moduleVersion || mf.Module.Title == "" {
 		t.Fatalf("module 摘要不对：%+v", mf.Module)
 	}
-	if len(mf.Actions) != 2 {
-		t.Fatalf("动作摘要应有 2 条，得到 %d：%s", len(mf.Actions), raw)
+	// 三条：建单、按单号查、全量列表（列表是业务页面要的只读能力）。
+	if len(mf.Actions) != 3 {
+		t.Fatalf("动作摘要应有 3 条，得到 %d：%s", len(mf.Actions), raw)
 	}
 
 	// 摘要字段集合：六个必填字段之外，summaryTemplate 可选（0.2.0 加的字段）。

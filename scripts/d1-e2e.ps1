@@ -93,6 +93,22 @@ if (-not (Test-Path $hmacFile)) {
 	[System.IO.File]::WriteAllText($hmacFile, [System.BitConverter]::ToString($buf).Replace('-', '').ToLowerInvariant())
 }
 
+# 2b) 执行票据（P0-1）的接线。
+#
+# 宿主缺签名私钥会拒绝启动，模块缺信任集会拒票（enforce 是缺省）。D1 的**触发**是
+# 测试台直接 POST 模块写端点（quote.CreateStandardPartQuote），它拿不到宿主签发的票
+# ——票只发给「过完闸门、绑定到某个 plan/step 的 agent 调用」。所以这里给模块设
+# TENON_TICKET_MODE=warn：触发照旧放行并留一条告警日志，agent 的真实调用仍走验签。
+#
+# 别把这条读成「D1 验过票据强制」：D1 判的是**规划层**的自适应。票据强制由
+# conformance C11 与 out/dev/e2e-ticket.ps1 覆盖，那两处是 enforce 模式。
+$ticketKey = Join-Path $out 'host-ticket.key'
+$ticketPub = Join-Path $out 'host-ticket.pub.json'
+if (-not (Test-Path $ticketKey) -or -not (Test-Path $ticketPub)) {
+	& go run ./cmd/tenon keygen --out $ticketKey --pub $ticketPub
+	if ($LASTEXITCODE -ne 0) { Fail '生成票据签名密钥失败' }
+}
+
 # 2c) R1 自注册的三个接线点：模块的 TENON_HOST、宿主的事件链路径、以及「预期可见的模块」。
 # 事件链是 append-only 哈希链，但本脚本要可重复：每次从空链开始。理由不是「链脏了」而是
 # 上一次运行崩在写盘中间时，末行可能是半条记录，宿主 Open 时会「拒绝接链」直接起不来——
@@ -224,6 +240,7 @@ try {
 		PORT = '8081'; TENON_MODULE_ID = 'inventory'; TENON_TEST_MODE = '1'
 		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile
+		TENON_TRUSTED_KEYS = $ticketPub; TENON_TICKET_MODE = 'warn'
 		TENON_MODULE_AUDIT_PATH = "$out/audit-inventory.jsonl"
 		# 库存种子改 0：需求 12、在库 0 ⇒ 扣减在业务上不成立，唯一合理的写路径就是
 		# 被摘的那个模块（procurement）。否则模型可以只做「先扣 3、缺 9 再采购」，
@@ -234,12 +251,14 @@ try {
 		PORT = '8082'; TENON_MODULE_ID = 'procurement'; TENON_TEST_MODE = '1'
 		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile
+		TENON_TRUSTED_KEYS = $ticketPub; TENON_TICKET_MODE = 'warn'
 		TENON_MODULE_AUDIT_PATH = "$out/audit-procurement.jsonl"
 	}
 	$procs += Start-Svc 'quote' @{
 		PORT = '8083'; TENON_MODULE_ID = 'quote'; TENON_TEST_MODE = '1'
 		TENON_HOST = $hostURL
 		TENON_HMAC_SECRET_FILE = $hmacFile
+		TENON_TRUSTED_KEYS = $ticketPub; TENON_TICKET_MODE = 'warn'
 		TENON_MODULE_AUDIT_PATH = "$out/audit-quote.jsonl"
 	}
 	Wait-Ready 'inventory' 'http://127.0.0.1:8081/readyz'
@@ -254,6 +273,7 @@ try {
 	$procs += Start-Svc 'host' @{
 		PORT = '8080'; TENON_TEST_MODE = '1'; TENON_STRICT_RULES = '1'
 		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_REGISTRY_EVENTS = $registryEvents
+		TENON_HOST_SIGNING_KEY = $ticketKey
 		TENON_USERS_FILE = 'config/users.dev.json'; TENON_SESSION_SECRET = 'dev'
 		TENON_SKILLS_DIR = 'skills'; TENON_POLICY_FILE = 'config/policies.dev.json'
 		TENON_GRANT_FILE = 'config/grants.dev.json'; TENON_INBOUND_DIR = "$out/inbound"

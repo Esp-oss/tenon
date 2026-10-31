@@ -60,6 +60,9 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -86,6 +89,11 @@ const (
 	envGrantFile  = "TENON_GRANT_FILE"
 	// envAuditPath 覆盖审计路径；TENON_AUDIT_PATH 与模块侧同名同义。
 	envAuditPath = "TENON_AUDIT_PATH"
+	// envTicketSigningKey 是签发执行票据的 Ed25519 私钥（PKCS#8 PEM）。
+	// 生产缺它即拒绝启动：签不出票不能降级成不验票。
+	envTicketSigningKey = "TENON_HOST_SIGNING_KEY"
+	// envTicketTTL 覆盖票据有效期（缺省 30s，上限 60s）。
+	envTicketTTL = "TENON_TICKET_TTL"
 	// envHMACSecretFile 是注册/心跳端点的共享密钥文件。名字的唯一定义在 controlplane
 	// （EnvHMACSecretFile），那里还要用它拼 503 的报文，两处写死迟早分叉。
 	envHMACSecretFile = controlplane.EnvHMACSecretFile
@@ -297,6 +305,20 @@ func loadConfig(modules *registry.Registry) (controlplane.Config, *suspendedRule
 	if path := strings.TrimSpace(os.Getenv(envAuditPath)); path != "" {
 		cfg.AuditPath = path
 	}
+	// 票据签名私钥：生产缺它即拒绝启动；测试态允许缺失（签发端点回 503），
+	// 免得每个只测策略/审计的用例都被迫造一对密钥。
+	key, err := loadTicketSigningKey()
+	if err != nil {
+		return cfg, nil, err
+	}
+	cfg.TicketSigningKey = key
+	if ttl := strings.TrimSpace(os.Getenv(envTicketTTL)); ttl != "" {
+		d, err := time.ParseDuration(ttl)
+		if err != nil {
+			return cfg, nil, fmt.Errorf("%s=%q 不是合法时长：%w", envTicketTTL, ttl, err)
+		}
+		cfg.TicketTTL = d
+	}
 	// 注册/心跳的共享密钥：**读不到就返回错误**，由 main 以 log.Fatalf 收尾（D7）。
 	// 这里绝不退回缺省值：一个猜出来的密钥等于让注册端点对任何知道缺省值的人开放。
 	secretBytes, err := loadHMACSecret()
@@ -376,6 +398,42 @@ func loadHMACSecret() ([]byte, error) {
 			"多行时无法判断哪一行是密钥，宿主拒绝启动（D7）", envHMACSecretFile, path)
 	}
 	return []byte(secret), nil
+}
+
+// loadTicketSigningKey 读取 Ed25519 私钥（PKCS#8 PEM）。
+//
+// 生产缺私钥即拒绝启动：没有它签不出票，而"签不出票"不能降级成"不验票"——
+// 那等于把 P0-1 整个关掉，还看起来一切正常。测试态允许缺失，签发端点会回 503。
+func loadTicketSigningKey() (ed25519.PrivateKey, error) {
+	path := strings.TrimSpace(os.Getenv(envTicketSigningKey))
+	if path == "" {
+		if testMode() {
+			log.Printf("host: 未设置 %s（测试态）——签发端点会回 503 TICKET_SIGNING_DISABLED", envTicketSigningKey)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("未设置 %s：宿主靠它签发执行票据，缺私钥即拒绝启动（不降级为无票执行）", envTicketSigningKey)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取 %s=%s 失败：%w；没有私钥就无法签发执行票据，宿主拒绝启动",
+			envTicketSigningKey, path, err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "PRIVATE KEY" {
+		return nil, fmt.Errorf("%s=%s 不是 PKCS#8 PEM 私钥（期望以 BEGIN PRIVATE KEY 开头）", envTicketSigningKey, path)
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("解析 %s 失败：%w", envTicketSigningKey, err)
+	}
+	key, ok := parsed.(ed25519.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("%s 里的私钥类型是 %T，票据只支持 Ed25519", envTicketSigningKey, parsed)
+	}
+	if len(key) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("%s 里的私钥长度 %d，期望 %d", envTicketSigningKey, len(key), ed25519.PrivateKeySize)
+	}
+	return key, nil
 }
 
 // loadApprovalRules 把 skills/*/approval.json 读成业务级规则并 append 进 cfg.Policies。

@@ -182,7 +182,20 @@ func NewGrantEngine(grants []Grant, opts ...Option) *GrantEngine {
 // 判定顺序：白名单（含到期）→ 委托人交集 → 配额。任一环不过即拒绝，拒绝结果只有
 // allowed 与 reason。返回 error 表示授权数据本身读不懂（窗口/单位不受支持），此时结果
 // 不可用，调用方必须按拒绝处理。
+// Evaluate 评估并计入用量。这是 0.1 的语义：预检即扣。
 func (e *GrantEngine) Evaluate(agent, onBehalfOf, action string, amount float64) (GrantResult, error) {
+	return e.evaluate(agent, onBehalfOf, action, amount, true)
+}
+
+// EvaluateNoCharge 只评估、不记账，供计划阶段的预检使用。
+//
+// 真正的扣减发生在宿主签发执行票据时：如果预检也扣，同一笔业务会被扣两次，
+// 而"预检了几次"跟"实际执行了几次"本来就不是一回事。
+func (e *GrantEngine) EvaluateNoCharge(agent, onBehalfOf, action string, amount float64) (GrantResult, error) {
+	return e.evaluate(agent, onBehalfOf, action, amount, false)
+}
+
+func (e *GrantEngine) evaluate(agent, onBehalfOf, action string, amount float64, record bool) (GrantResult, error) {
 	if e == nil {
 		return deny(ReasonNotInGrant), nil
 	}
@@ -243,7 +256,9 @@ func (e *GrantEngine) Evaluate(agent, onBehalfOf, action string, amount float64)
 		if used+charge > c.windowMax {
 			continue // 窗口已满：限额记在别的 grant 上可能还有余额
 		}
-		e.usage[key] = append(e.usage[key], usageRecord{at: now, amount: charge})
+		if record {
+			e.usage[key] = append(e.usage[key], usageRecord{at: now, amount: charge})
+		}
 		return GrantResult{
 			Allowed:        true,
 			MatchedGrantID: c.grantID,

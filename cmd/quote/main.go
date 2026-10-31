@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -53,6 +54,8 @@ const (
 
 	actionCreateStandardPartQuote = "quote.CreateStandardPartQuote"
 	actionGetQuote                = "quote.GetQuote"
+	// actionListQuotes 是只读列表：GetQuote 要单号，而业务页面没有单号。
+	actionListQuotes = "quote.ListQuotes"
 
 	// eventQuoteCompleted 是本模块唯一的产出事件类型：manifest 的事件摘要、
 	// skill 的订阅点（tenon.subscribes）与 agent 的触发源都取这个字面量。
@@ -106,6 +109,7 @@ func newQuoteModule(store *quoteStore) *module.Module {
 		Actions: []module.Action{
 			createStandardPartQuoteAction(),
 			getQuoteAction(),
+			listQuotesAction(),
 		},
 		Events: []string{eventQuoteCompleted},
 		Handle: store.handle,
@@ -215,8 +219,52 @@ func getQuoteAction() module.Action {
 	}
 }
 
-// ---------- 业务状态 ----------
+// listQuotesAction 让业务页面看到全部报价单：GetQuote 只能按单号问，页面没有单号。
+//
+// 仍是动作协议的一部分（不是页面专用接口）：页面显示的值与 agent 读到的是同一份状态。
+func listQuotesAction() module.Action {
+	return module.Action{
+		ID:      actionListQuotes,
+		Version: "0.1.0",
+		Title:   "报价单列表",
+		Kind:    "read",
+		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{}}`),
+		OutputSchema: json.RawMessage(`{
+  "type": "object",
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["quoteNo", "quoteId", "status", "lines"],
+        "properties": {
+          "quoteNo": {"type": "string", "minLength": 1},
+          "quoteId": {"type": "string", "minLength": 1},
+          "status": {"type": "string", "enum": ["completed"]},
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["sku", "qty"],
+              "properties": {
+                "sku": {"type": "string", "minLength": 1},
+                "qty": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`),
+		Risk:      module.Risk{Level: "low", Reversible: true},
+		TimeoutMs: 30000,
+		DryRun:    module.DryRunCapability{Supported: false},
+	}
+}
 
+// ---------- 业务状态 ----------
 // quoteStore 是内存态的报价单台账。
 //
 // 两层幂等：框架层按 Idempotency-Key 去重（请求级），本层按 quoteNo 去重
@@ -245,6 +293,8 @@ func (s *quoteStore) handle(ctx context.Context, actionID string, args json.RawM
 		return s.create(args)
 	case actionGetQuote:
 		return s.get(args)
+	case actionListQuotes:
+		return s.list()
 	default:
 		return nil, contractViolation("UNKNOWN_ACTION", "报价模块不提供动作 "+actionID)
 	}
@@ -309,6 +359,20 @@ func (s *quoteStore) create(args json.RawMessage) (json.RawMessage, *protocol.Er
 	return mustJSON(createQuoteOutput{QuoteID: rec.QuoteID, Status: rec.Status}), nil
 }
 
+// list 返回按单号排序的全部报价单（排序在服务端做，页面不为了稳定顺序再排一次）。
+func (s *quoteStore) list() (json.RawMessage, *protocol.Error) {
+	s.mu.Lock()
+	items := make([]quoteRecord, 0, len(s.byNo))
+	for _, rec := range s.byNo {
+		// 明细拷一份：台账在别的 goroutine 里还会被读，返回的切片不该共享底层数组。
+		rec.Lines = append([]quoteLine(nil), rec.Lines...)
+		items = append(items, rec)
+	}
+	s.mu.Unlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].QuoteNo < items[j].QuoteNo })
+	return mustJSON(listQuotesOutput{Items: items}), nil
+}
+
 func (s *quoteStore) get(args json.RawMessage) (json.RawMessage, *protocol.Error) {
 	var in getQuoteInput
 	if perr := decodeArgs(args, &in); perr != nil {
@@ -365,6 +429,10 @@ type quoteRecord struct {
 	QuoteID string      `json:"quoteId"`
 	Status  string      `json:"status"`
 	Lines   []quoteLine `json:"lines"`
+}
+
+type listQuotesOutput struct {
+	Items []quoteRecord `json:"items"`
 }
 
 type createQuoteInput struct {

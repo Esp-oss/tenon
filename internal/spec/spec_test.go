@@ -14,17 +14,18 @@ func mustLoad(t *testing.T) *Set {
 	return s
 }
 
-// TestLoadAllSchemas 锁定「九类契约 + common」共 10 份，缺一份就说明真源被动了。
+// TestLoadAllSchemas 锁定「九类契约 + common + 执行票据」共 11 份，缺一份就说明真源被动了。
 func TestLoadAllSchemas(t *testing.T) {
 	s := mustLoad(t)
 	names := s.Names()
-	if len(names) != 10 {
-		t.Fatalf("期望 10 份 schema，实际 %d：%v", len(names), names)
+	if len(names) != 11 {
+		t.Fatalf("期望 11 份 schema，实际 %d：%v", len(names), names)
 	}
 	for _, want := range []string{
 		"common.schema.json", "module-manifest.schema.json", "action.schema.json",
 		"domain-event.schema.json", "plan.schema.json", "frames.schema.json",
 		"grant.schema.json", "policy.schema.json", "audit-event.schema.json", "error.schema.json",
+		"ticket.schema.json",
 	} {
 		if _, err := s.Schema(want); err != nil {
 			t.Errorf("缺少 %s: %v", want, err)

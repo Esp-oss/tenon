@@ -494,10 +494,13 @@ func TestAuditWriteQueryAndChain(t *testing.T) {
 	srv := newTestHost(t)
 	ts := serveHost(t, srv)
 
+	// 步骤级 dispatched 自 0.2.0 起只能由签发票据时产生（见 ticket_test.go），
+	// 所以这里用计划级 dispatched（stepId 为空）来验两段写与哈希链——它正是挂起/续跑
+	// 链路使用的那一对记录，仍然由 agent 写。
 	records := []string{
-		`{"auditId":"aud_7a","stage":"dispatched","planId":"pln_7","stepId":"s1","action":"inventory.DeductStock"}`,
+		`{"auditId":"aud_7a","stage":"dispatched","planId":"pln_7","stepId":"","action":"plan"}`,
 		`{"auditId":"aud_7b","stage":"result","planId":"pln_7","stepId":"s1","action":"inventory.DeductStock","result":{"ok":true}}`,
-		`{"auditId":"aud_8a","stage":"dispatched","planId":"pln_8","stepId":"s1","action":"procurement.CreatePurchaseRequest"}`,
+		`{"auditId":"aud_8a","stage":"dispatched","planId":"pln_8","stepId":"","action":"plan"}`,
 	}
 	for _, rec := range records {
 		if st, body := postJSON(t, ts.URL+"/tenon/audit", rec); st != 200 || !strings.Contains(body, `"ok":true`) {
@@ -1137,8 +1140,12 @@ func TestLoadDevConfigFiles(t *testing.T) {
 		wantApprovers []string
 		wantReasons   []string
 	}{
+		// 试点口径（2026-11-01）：审批人加上了发起人自己的角色 role:warehouse_clerk，
+		// 于是业务员自己点「允许执行」即可，不需要第二个人。四眼原则在这条路径上失效，
+		// 只用于闭环验证；恢复四眼把 config/policies.dev.json 的 approvers 改回单一角色，
+		// 代码不用动。仓管仍在列表里，原来的双人路径没有被删掉。
 		{"inventory.DeductStock", `{"sku":"STD-1001","qty":12}`, policy.OutcomeApprove,
-			[]string{"role:warehouse_manager"}, []string{policy.ReasonApprovalRequired}},
+			[]string{"role:warehouse_clerk", "role:warehouse_manager"}, []string{policy.ReasonApprovalRequired}},
 		{"inventory.DeductStock", `{"sku":"STD-1001","qty":3}`, policy.OutcomeDeny,
 			[]string{}, []string{policy.ReasonNoMatch}},
 		// 平台级不再对事件驱动的采购单无条件 approve（否则它会把业务级阈值整份压住，
@@ -1193,7 +1200,9 @@ func TestLoadDevConfigFiles(t *testing.T) {
 		t.Fatalf("对话发起（origin=request）的采购单必须 approve，得到 %s", reqRaw)
 	}
 	wantStrings(t, "decidedBy", asked.DecidedBy, []string{"plat-request-needs-human"})
-	wantStrings(t, "approvers", asked.Approvers, []string{"role:procurement_manager"})
+	// 采购单同样按试点口径：业务员本人也能点（role:warehouse_clerk），采购经理仍可批。
+	wantStrings(t, "approvers", asked.Approvers,
+		[]string{"role:warehouse_clerk", "role:procurement_manager"})
 	wantStrings(t, "reasons", asked.Reasons, []string{policy.ReasonApprovalRequired})
 
 	// 读 + 写的多步 plan：读步骤（auto）不得把整份 plan 拉到 deny，最终仍取写步骤的 approve。

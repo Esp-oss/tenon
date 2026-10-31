@@ -29,6 +29,20 @@ type pendingItem struct {
 	// 缺省 awaiting_approval —— 老客户端不推这个字段时不能被当成终态，也不能留空串。
 	State string `json:"state"`
 	Mine  bool   `json:"mine"`
+
+	// Steps 是这一步要执行的参数摘要（不存参数原文）。
+	//
+	// 为什么要有：审批人看到的是"采购 8 件"，而签票请求里可以写 800。
+	// 只绑动作不绑参数，审批就是形式。宿主在这里冻结第一次看到的那份，
+	// 之后任何与它不符的签票请求都拒掉。
+	Steps []pendingStep `json:"steps,omitempty"`
+}
+
+// pendingStep 是一条待批步骤的参数摘要。
+type pendingStep struct {
+	StepID   string `json:"stepId"`
+	Action   string `json:"action"`
+	ArgsHash string `json:"argsHash"`
 }
 
 // pendingBoard 是待批公告板：**只读 read-model**，权威状态在 agent 盘上的 pending 文件。
@@ -39,10 +53,54 @@ type pendingItem struct {
 type pendingBoard struct {
 	mu    sync.RWMutex
 	items map[string]pendingItem
+
+	// snapshots 是「计划 → 步骤 → 参数摘要」的冻结副本，只写一次、永不覆盖。
+	//
+	// 它与 items 分开存，是因为 items 会被 agent 每 tick 覆盖（自愈语义），
+	// 而审批依据一旦被覆盖，就等于没有依据。
+	snapshots map[string]map[string]string
+	frozenAt  map[string]time.Time
 }
 
 func newPendingBoard() *pendingBoard {
-	return &pendingBoard{items: map[string]pendingItem{}}
+	return &pendingBoard{
+		items:     map[string]pendingItem{},
+		snapshots: map[string]map[string]string{},
+		frozenAt:  map[string]time.Time{},
+	}
+}
+
+// FreezeSteps 记录某计划第一次公布时的步骤摘要；已有快照则忽略。
+//
+// 只认第一次：agent 每 tick 重推，如果每次覆盖，攻击者只要在批准后再推一版
+// 就能把票绑到自己想要的参数上——那还不如不做。
+func (b *pendingBoard) FreezeSteps(planID string, steps []pendingStep) {
+	if planID == "" || len(steps) == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, exists := b.snapshots[planID]; exists {
+		return
+	}
+	m := make(map[string]string, len(steps))
+	for _, s := range steps {
+		m[s.StepID] = s.ArgsHash
+	}
+	b.snapshots[planID] = m
+	b.frozenAt[planID] = time.Now().UTC()
+}
+
+// approvedArgs 返回某计划某步骤被冻结的参数摘要。
+func (b *pendingBoard) approvedArgs(planID, stepID string) (string, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	steps, ok := b.snapshots[planID]
+	if !ok {
+		return "", false
+	}
+	h, ok := steps[stepID]
+	return h, ok
 }
 
 // Upsert 幂等写入（同 planId 覆盖）。agent 每 tick 重推即靠它自愈。
@@ -56,6 +114,17 @@ func (b *pendingBoard) Upsert(it pendingItem) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.items[it.PlanID] = it
+	// 快照与条目一起冻结：分开写会出现"卡片已更新、依据还是旧的"的窗口。
+	if len(it.Steps) > 0 {
+		if _, exists := b.snapshots[it.PlanID]; !exists {
+			m := make(map[string]string, len(it.Steps))
+			for _, st := range it.Steps {
+				m[st.StepID] = st.ArgsHash
+			}
+			b.snapshots[it.PlanID] = m
+			b.frozenAt[it.PlanID] = time.Now().UTC()
+		}
+	}
 }
 
 // List 返回按角色过滤后的列表：过期条目顺手剔除。

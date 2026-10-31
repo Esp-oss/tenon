@@ -102,9 +102,28 @@ type PlanInput struct {
 	SkillText string
 	Modules   []ModuleDigest
 	Feedback  string
+	// ReplanReason 说明 Feedback 的来源（replanReasonRejection / replanReasonObservation，
+	// 首次规划为空串）。两种原因的处置不同：被业务拒绝要换一条路，只读轮次要给出处置
+	// 或说清缺口；同一段文案写两件事，模型会两边都做错。
+	ReplanReason string
+	// Observations 是本回合此前几轮只读步骤实际取回的事实（原样响应体，已截断）。
+	//
+	// 它是「只读不是完成」这条规则的输入：一次规划要给出一份完整动作序列，而「库存够
+	// 不够」这类分支只有运行期才看得见。不回填事实，模型下一轮只能在想象里补一个数字，
+	// 那比不补更糟——一个编造的库存值会让它自信地扣错货。
+	Observations []Observation
 	// Request 是人工发起时的原话；事件回合为 nil。
 	// 它与 Event 语义不同：Event 是领域事实，Request 是**指令**。
 	Request *UserRequest
+}
+
+// Observation 是一条只读步骤实际取回的事实。
+//
+// Body 是模块响应的原始字节（截断到 observationLimit）：prompt 里要放模型能直接读的
+// 事实，而不是「上一个动作成功了」这种结论——结论里没有它做判断需要的数字。
+type Observation struct {
+	Action string
+	Body   string
 }
 
 // UserRequest 是 tenon.request 帧在 agent 侧的投影：人要什么，以及是谁要的。
@@ -309,6 +328,9 @@ func systemPrompt() string {
    from / to 是改前与改后的值（新建时 from 为 null，删除时 to 为 null）。
 8. dryRun.status 只能是 verified、unsafe、unsupported、pending 之一。
 9. estimatedRisk 只能是 low、medium、high；rationale 是一句人能读懂的理由，或 null。
+10. 只读动作拿到的是事实，不是完成：需要处置的业务必须在同一份计划里给出产生副作用的动作。
+    清单里确实没有能完成这笔业务的写动作时，就保持只读，并把缺口（缺哪个能力、缺多少）写进
+    rationale——系统会把这种计划转人工。不要用只读计划冒充完成，也不要把「再读一次」当成新的一步。
 能力不足时：仍然输出一份只做清单内能力的计划；把「做不到的部分」写进 rationale，
 不要编造动作，也不要输出错误信息代替计划。`
 }
@@ -353,10 +375,33 @@ func userPrompt(in PlanInput) string {
 		}
 	}
 	b.WriteString("\n请只输出一个 JSON 对象：plan.schema.json 定义的 Plan。steps 里每个 action 都必须逐字来自上面的清单。\n")
+
+	// 事实块放在指令块之前：下一段文字要模型「据此决定处置」，它得先看到那些事实。
+	// 每条都标明来源动作，否则模型无法判断 "onHand":3 是哪个 SKU 的。
+	if len(in.Observations) > 0 {
+		b.WriteString("\n已观察到的运行期事实（上一轮只读步骤的实际返回，原样；这是事实，不是计划里的假设）：\n")
+		for _, obs := range in.Observations {
+			fmt.Fprintf(&b, "- %s → %s\n", obs.Action, obs.Body)
+		}
+	}
+
 	if feedback := strings.TrimSpace(in.Feedback); feedback != "" {
-		b.WriteString("\n上一轮执行被业务拒绝，请在这一轮换一条路（仍然只能使用上面的清单）：\n")
-		b.WriteString(feedback)
-		b.WriteString("\n")
+		if in.ReplanReason == replanReasonBlocked {
+			b.WriteString("\n上一轮计划没能通过预演闸门（模块裁决某个写动作在当前状态下不成立，整轮一步都没执行）：\n")
+			b.WriteString(feedback)
+			b.WriteString("\n请重新规划：判断这一步是否成立所需要的事实，用清单里的只读动作先取回来——只读不需要预演；\n")
+			b.WriteString("把同一个动作、同一份参数再交一次不会得到不同结论。\n")
+		} else if in.ReplanReason == replanReasonObservation {
+			b.WriteString("\n上一轮只有只读动作，没有产生任何业务动作（读结果不是完成）：\n")
+			b.WriteString(feedback)
+			b.WriteString("\n事实已经在上面了，这一轮要给出处置：用清单里的写动作把业务做完。\n")
+			b.WriteString("清单里确实没有能完成业务的写动作时，保持只读，并把缺口（缺哪个能力、缺多少）写进 rationale，\n")
+			b.WriteString("系统会把这种计划转人工。不要重复上一轮已经做过的只读动作。\n")
+		} else {
+			b.WriteString("\n上一轮执行被业务拒绝，请在这一轮换一条路（仍然只能使用上面的清单）：\n")
+			b.WriteString(feedback)
+			b.WriteString("\n")
+		}
 	}
 	return b.String()
 }
