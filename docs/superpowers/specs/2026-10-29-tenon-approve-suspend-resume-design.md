@@ -203,3 +203,20 @@ POST /tenon/requests/ack {upto}            # role:agent
 - 实测：`node scripts/verify-module-host.mjs` 的 f) 段——以 bob 的 token 提交 `tenon.confirm` → 轮询器执行 → 库存 103→91、审计 `approvedBy=user:bob`（**来自宿主 token，不是配置**）→ 卡片覆盖成 done → 再用 agent token 读队列，**帧仍在**（证明从未 ack）→ 新轮询器重放不产生动作。合计 93 条断言。
 
 **仍未做：唤醒**。`agent.followup(message)` 需要一个 `UserMessage` 对象，本包不引 `@deepseek-ai/dsh-llm`（计划约束只允许 dsh-tools/schemastery），而按结构猜一个消息形状属于「没验证过的能力」——不猜。因此公告板批准后**业务会完成，但聊天里不会自动出现一句话**；要知道结果得问 `tenon_pending` 或再续一次（`resumePlan` 会返回归档结论）。
+
+### 10.4 已补：批准后唤醒 + 入站治理（2026-11-01）
+
+- **唤醒**：`packages/dsh-plugin-module-host/src/wake.ts`。挂起时把 `exec.agent` 按 planId 记进内存 Map；
+  confirm 真正落地（执行或驳回）后，用 `agent.followup(message)` 唤醒**提出这条计划的那个会话**。
+  消息形状照已安装的 `@deepseek-ai/dsh-llm@0.2.0-rc.2` 的 `UserMessage` 类型构造
+  （`{id, role:'user', content:[{type:'text',text}], source:{kind:'user'}}`），不再依赖「猜」；
+  本包仍不 import dsh-llm（不为一条消息引入整个运行时依赖）。
+  **限制**：句柄只在同一进程存活期内有效；插件重启后业务照常完成但不唤醒。没有句柄、`followup`
+  抛错或句柄超过 100 个，都只写日志——业务已经完成，唤醒失败不能回滚任何东西。
+- **入站治理**：确认帧从不 ack，所以宿主按 `TENON_INBOUND_CONFIRM_TTL`（缺省 1h）清掉过期确认帧
+  （只清 confirm，不清 `tenon.request`——用户原话不设保留期）；`origin` 凭证按
+  `TENON_ORIGIN_RETENTION`（缺省 7 天）+ 硬上限修剪，**仍被公告板引用的凭证不丢**（否则长挂起的
+  请求会丢掉来源凭证，续跑时被判成 event，绕过「对话发起必须审批」）。
+- **P0-1 票据迁移**：插件不再自己写步骤级 `dispatched`（宿主拒收），改为执行前向
+  `POST /tenon/tickets:issue` 换票、把 `Tenon-Ticket` 连同幂等键发给模块；公告板卡片带
+  `steps[].argsHash` 供宿主冻结审批依据。`verify-module-host.mjs` 已按新链路补上密钥/信任集。

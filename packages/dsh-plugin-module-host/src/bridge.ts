@@ -10,6 +10,8 @@ export const TENON_VERSION = '0.1';
 /** 请求头名（与 Go 的 `protocol` 常量逐字一致）。 */
 export const HEADER_VERSION = 'Tenon-Version';
 export const HEADER_IDEMPOTENCY_KEY = 'Idempotency-Key';
+/** 宿主签发的执行票据（0.2.0）。写动作没它模块一律 403。 */
+export const HEADER_TICKET = 'Tenon-Ticket';
 
 /** 协议里「可容纳任意 JSON」的取值类型。与 dsh-tools 的 JsonValue 同构，但不必为此多引一个包。 */
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };

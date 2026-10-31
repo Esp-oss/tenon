@@ -248,15 +248,17 @@ docker compose -f compose.m0.yaml config --quiet
 
 ### 还没做的
 
-dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`tenon.request` 帧**至今没有 schema**（只在 prose 与 CHANGELOG 里）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、撤销与补偿（`ReleaseStock` 未接）、`amend`（JSON Patch 改 step 后再批）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
+dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`tenon.request` 帧**至今没有 schema**（只在 prose 与 CHANGELOG 里）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、撤销与补偿（`ReleaseStock` 未接）、`amend`（JSON Patch 改 step 后再批）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
 
 > **对话发起的小量扣减（`qty ≤ 10`）会转人工**：平台策略没有登记该区间（fail-closed 的必然结果），业务员说「扣 5 件」时会挂起给仓管批。随时可以加一条 `pol-inventory-deduct-auto-small` 改成自动，但那是一次产品语义变更，需单独决定。
 
 > **Go host 的接收侧与 `versioning.md` §3.2 不一致**：§3.2 要求「消费方遇到未知字段必须忽略并继续」，但 `internal/spec` 的校验入口按 `additionalProperties: false` 直接拒绝（2026-10-27 加 `requiredArgs` 时，`additional properties 'requiredArgs' not allowed` 就是现场）。TS 侧（`@tenon/core` 的 `src/validate`）已按「接收侧宽松、一致性侧严格」双视图实现；**Go 侧待对齐**，修它要动校验入口并评估既有用例，需单独评估。
 
-> **DSH 已经能驱动一次真实业务，但还不是产品形态**：`packages/dsh-plugin-module-host` 注册三个工具——`tenon_action`（自动执行或转为待批）、`tenon_pending`（列待批）、`tenon_resume`（续跑）。`approve` 现在是**真挂起**：整份计划落盘到 adapter 状态目录、写一条计划级 `dispatched` 审计（I7 三步），批准走 DSH 回合内的 `ctx.approval`（只有 `allowed-once` 才执行），执行时沿用原 `planId` 与幂等键，step 级两段审计带 `approvedBy`。验收可回归：`node scripts/verify-module-host.mjs`（77 条断言，真 host + 真 inventory + 假 answerer）。
+> **DSH 已经能驱动一次真实业务，但还不是产品形态**：`packages/dsh-plugin-module-host` 注册三个工具——`tenon_action`（自动执行或转为待批）、`tenon_pending`（列待批）、`tenon_resume`（续跑）。`approve` 现在是**真挂起**：整份计划落盘到 adapter 状态目录、写一条计划级 `dispatched` 审计（I7 三步），批准走 DSH 回合内的 `ctx.approval`（只有 `allowed-once` 才执行），执行时沿用原 `planId` 与幂等键，step 级两段审计带 `approvedBy`。验收可回归：`node scripts/verify-module-host.mjs`（96 条断言，真 host + 真 inventory + 真 confirm 帧 + 假 answerer；含 P0-1 签票链路与「批准后唤醒」）。
 >
-> **仍然缺的四件事**：① 公告板可见性与**批准消费**都已实现，但要显式配 agent 凭据（`agentUser`/`agentPassword` 或 `agentToken`）——那是权限，缺省关闭；消费方式是**只读不 ack**（[spec §10.3](docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md)），因此重启后会重读旧帧，靠归档幂等挡住，入站队列无界增长则留给宿主侧治理；② 批准后**自动唤醒**没做——`agent.followup` 要一个 `UserMessage`，本包不引 `dsh-llm`，按结构猜形状属于未验证能力，不做；所以公告板批准后业务会完成，但聊天里不会自动冒出一句话；③ `approvedBy` 现在有**两条来源**：回合内经 DSH 审批时来自部署配置（Q2 未定前的临时绑定），公告板路径来自宿主验过的 token claims——后者才是 Q2 想要的答案，前者要等 Q2 定；④ 真机上「在 DSH 里点批准」未验证（本机审批策略 disabled），但「在公告板上点批准→业务执行」已用真 host 的 confirm 帧证明。设计与裁决见 [`docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md`](docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md)。
+> **仍然缺的三件事**：① 公告板可见性与**批准消费**都已实现，但要显式配 agent 凭据（`agentUser`/`agentPassword` 或 `agentToken`）——那是权限，缺省关闭；消费方式是**只读不 ack**（[spec §10.3](docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md)），重启后会重读旧帧，靠归档幂等挡住；**入站治理已补**：确认帧超过 `TENON_INBOUND_CONFIRM_TTL`（缺省 1h）清掉，origin 凭证按 `TENON_ORIGIN_RETENTION`（缺省 7 天）+ 上限修剪，仍被公告板引用的凭证不丢；② `approvedBy` 现在有**两条来源**：回合内经 DSH 审批时来自部署配置（Q2 未定前的临时绑定），公告板路径来自宿主验过的 token claims——后者才是 Q2 想要的答案，前者要等 Q2 定；③ 真机上「在 DSH 里点批准」未验证（本机审批策略 disabled），但「在公告板上点批准→业务执行」已用真 host 的 confirm 帧证明。设计与裁决见 [`docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md`](docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md)。
+>
+> **批准后的自动唤醒（M1 剩余项，2026-11-01 补上）**：挂起时按 planId 记下 `exec.agent`，confirm 真正落地后用 `agent.followup` 把结论送回提出计划的会话（`packages/dsh-plugin-module-host/src/wake.ts`）。**限制**：句柄只在同一进程存活期内有效；插件重启后业务照常完成，但聊天里不会自动冒出一句话——不猜持久句柄，是这个限制存在的原因。
 >
 > 历史状态（已过期，保留上下文）：全仓曾**没有一行 dsh/cordis 代码**，操作业务的是 Go 的 `cmd/agent` + `cmd/host` + 模块。模块侧硬耦合已解一半：R1 已落地动态注册 + 心跳 + 失联自动摘除（`TENON_MODULES` 已删除，见 `docs/superpowers/specs/2026-10-27-tenon-module-registration-design.md`）；请求回合的 skill 粗筛词表也已在 2026-10-27 去掉硬编码（`knownModuleNames` 删除，改由 skill frontmatter 的 `tenon.expectedModules` / `tenon.subscribes` 自行声明）——所以「新增业务 = 加模块 + 加 skill」，不再改 agent 代码。R1–R3 / Q1–Q3 的原始记录在 [`docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md`](docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md)。
 
@@ -277,8 +279,8 @@ dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、�
 | **M1 切片 1（已完成）** | host 入站面：落盘入站队列 / dev 身份 / `origin` 进策略 / 业务级规则 / 待批公告板 / 同源静态页 | 入站与策略侧用例全绿 |
 | **M1 切片 2（已完成）** | agent 侧：消费入站队列 / 挂起落盘（I7 三次写）/ 审批人角色通道 / 恢复执行 / 去重账本 / 公告板终态 | 端到端真跑通：投一句话 → 挂起 → bob 批准 → 真扣库存 → 归档 done |
 | **M1 切片 3 / P3（已完成）** | 白话：模块声明 `summaryTemplate` → 能力发现带回 → agent 渲染（失败退「标题+参数」）→ 公告板带 `detail` → 页面折叠 | `scripts/verify-ui.ps1` 在 Edge 里 7 条断言 × 2 身份全过：卡面只有人话、技术信息默认收起、非审批人无批准按钮 |
-| **M1 切片 4 / DSH 驱动（已完成）** | DSH 侧 `module-host`：`tenon_action` / `tenon_pending` / `tenon_resume`；`approve` 真挂起（落盘 + 计划级审计 + I7 三步）、回合内经 DSH 审批、按原 planId 与幂等键续跑；待批上公告板 + **只读不 ack** 地消费 `tenon.confirm`（公告板上点批准即执行，批准人来自宿主 token） | `node scripts/verify-module-host.mjs` 93 条断言全过（真 host + 真 inventory + 真 confirm 帧 + 假 answerer）；`pnpm check` 全绿 |
-| M1（剩余） | 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 + D1 判定阻塞项（prompt 不带入参契约）；DSH 侧的批准后唤醒、入站队列无界增长、Q2 身份绑定 | 高风险路径必须人工；对账能发现篡改 |
+| **M1 切片 4 / DSH 驱动（已完成）** | DSH 侧 `module-host`：`tenon_action` / `tenon_pending` / `tenon_resume`；`approve` 真挂起（落盘 + 计划级审计 + I7 三步）、回合内经 DSH 审批、按原 planId 与幂等键续跑；待批上公告板 + **只读不 ack** 地消费 `tenon.confirm`（公告板上点批准即执行，批准人来自宿主 token）；**P0-1 票据迁移**（执行前向宿主换票，不再自己写步骤级 dispatched）；**批准后唤醒**（按 planId 记会话句柄，confirm 落地后 `agent.followup` 回灌结论） | `node scripts/verify-module-host.mjs` 96 条断言全过（真 host + 真 inventory + 真 confirm 帧 + 假 answerer）；`pnpm check` 全绿 |
+| M1（剩余） | 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 + D1 判定阻塞项（prompt 不带入参契约）；Q2 身份绑定 | 高风险路径必须人工；对账能发现篡改 |
 | M2 | HTTP 侧车 SDK + MCP 双向 + 非 TS 示例 | 非 TS 模块跑通全套用例 |
 | M3 | skill 仓库 + 轨迹蒸馏 + 发布审计/回滚 | 新流程只改 skill 即可上线 |
 

@@ -103,6 +103,25 @@ func (b *pendingBoard) approvedArgs(planID, stepID string) (string, bool) {
 	return h, ok
 }
 
+// referencesRequest 回答「这条 requestId 是否还挂在公告板上」。
+//
+// origin GC 用它兜底：凭证超过保留期，但计划还在待批（例如放了一个长假才回来批），
+// 这时丢掉凭证会让续跑时的策略评估把 request 判成 event，从而绕过「对话发起必须审批」。
+// 只要公告板还列着它，就不许丢。
+func (b *pendingBoard) referencesRequest(requestID string) bool {
+	if requestID == "" {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, it := range b.items {
+		if it.RequestID == requestID {
+			return true
+		}
+	}
+	return false
+}
+
 // Upsert 幂等写入（同 planId 覆盖）。agent 每 tick 重推即靠它自愈。
 //
 // 缺省 state 在这里补，而不是在 handler 里：Upsert 是写公告板的**唯一**入口，

@@ -497,6 +497,15 @@ POST /tenon/session
 - 帧类型只收 `tenon.request` 与 `tenon.confirm`（`tenon.context` 不入站）：其它 `type` → 400 `UNKNOWN_FRAME_TYPE`；登记 origin 失败 → 400 `ORIGIN_REGISTER_FAILED`（凭证没留下就不入队）。
 - 队列是**落盘 JSONL**（`requests.jsonl` + `.meta` 序号水位）：重启续号、崩溃留下的半行被跳过、ack 后重写存活部分。容量 1024 帧，溢出丢最旧并**留日志**（入站丢的是「用户说过的话」，与出站丢界面提示不是一个量级）。
 - **重置入站队列要同时删三个文件**：`requests.jsonl`、`requests.jsonl.meta`、`requests-index.jsonl`。前两者是序号水位（只删主文件会让序号从 meta 续上、不回 1）；第三个是**治理状态而非缓存**——判定规则是「未登记即视为 `event`」，单删索引会把在途 request 静默降级成事件驱动，绕开「对话发起必须审批」。所以清索引必须与清空 pending 一起做。
+- **入站治理（两处保留期，2026-11-01）**：
+  - 确认帧从不 ack（公告板批准走「只读不 ack」），所以队列里会积压 `tenon.confirm`。宿主按
+    `TENON_INBOUND_CONFIRM_TTL`（缺省 `1h`）清掉超期确认帧，**只清 confirm、不清 `tenon.request`**
+    （用户原话不设保留期，只受 1024 帧容量约束）。清掉的帧计入 `poll` 响应的 `dropped`。
+  - `requests-index.jsonl` 每说一句话追加一行，必须修剪：按 `TENON_ORIGIN_RETENTION`（缺省 `168h`）
+    + 硬上限（5 万条）修剪，**仍被公告板待批条目引用的凭证不丢**——丢了会让长挂起的 request
+    在续跑时被判成 `event`，绕过「对话发起必须审批」。修剪是原子重写（临时文件 + rename）。
+  - `poll` 返回的每条帧外层多了 `receivedAt`（宿主收帧时间）；旧版本记录没有该字段，读回为空，
+    不参与确认帧过期清理（升级不会误删历史帧）。
 
 ### 4.7 待批公告板（`/tenon/pending`）
 

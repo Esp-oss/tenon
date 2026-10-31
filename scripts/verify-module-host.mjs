@@ -496,10 +496,42 @@ async function main() {
     'utf8',
   )
 
-  // 授权表：本轮编排**不调** grants:evaluate（M0.5 没有 grant 签发，设计 §2），
-  // 这里给一份显式的空表，只是为了让 host 的启动日志不出现「所有调用都会被拒绝」这句误导。
+  // 授权表：P0-1 起 `tickets:issue` 会真的过授权并扣配额，空表 = 所有写动作 GRANT_DENIED。
+  // 这里给验收身份（ag_dsh_e2e / user:alice）一条明确的 grant，额度足够整轮验收用。
   const grantsPath = path.join(RUN_DIR, 'grants.json')
-  writeFileSync(grantsPath, '{"grants":[],"subjects":{}}\n', 'utf8')
+  writeFileSync(
+    grantsPath,
+    `${JSON.stringify(
+      {
+        grants: [
+          {
+            grantId: 'gr-e2e-module-host',
+            agent: AGENT_ID,
+            // 缺 expiresAt 等于已过期（fail-closed）：dev 的 grant 文件也显式给了远期时间。
+            expiresAt: '2030-01-01T00:00:00Z',
+            allow: [
+              {
+                module: 'inventory',
+                actions: ['inventory.GetStock', 'inventory.ListStock', 'inventory.DeductStock', 'inventory.ReleaseStock'],
+                constraints: { window: 'PT1H', maxUnitsPerWindow: 500 },
+              },
+            ],
+          },
+        ],
+        subjects: {
+          [ON_BEHALF_OF]: [
+            'inventory.GetStock',
+            'inventory.ListStock',
+            'inventory.DeductStock',
+            'inventory.ReleaseStock',
+          ],
+        },
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  )
 
   // dev 账号表：公告板的写入侧只允许 role:agent，读取侧要一个真 token，
   // 所以这里造两个账号——agent（推卡片）与 bob（仓管，读公告板）。
@@ -521,6 +553,16 @@ async function main() {
   buildPlugin()
   const hostBin = goBuild('tenon-host.exe', './cmd/host')
   const inventoryBin = goBuild('tenon-inventory.exe', './cmd/inventory')
+  // P0-1 起宿主缺票据私钥即拒绝启动、模块 enforce 下无票拒写：
+  // 验收链必须自己造一对密钥，不能靠「恰好没验票」跑通。
+  const tenonBin = goBuild('tenon.exe', './cmd/tenon')
+  const ticketKey = path.join(RUN_DIR, 'host-ticket.key')
+  const ticketPub = path.join(RUN_DIR, 'host-ticket.pub.json')
+  const keygen = spawnSync(tenonBin, ['keygen', '--out', ticketKey, '--pub', ticketPub, '--force'], {
+    cwd: REPO,
+    stdio: 'inherit',
+  })
+  if (keygen.status !== 0) throw new Error(`生成票据密钥失败（exit=${keygen.status}）`)
 
   const baseEnv = cleanEnv()
   const hostEnv = {
@@ -533,6 +575,8 @@ async function main() {
     TENON_INBOUND_DIR: path.join(RUN_DIR, 'inbound'),
     TENON_REGISTRY_EVENTS: path.join(RUN_DIR, 'registry-events.jsonl'),
     TENON_SKILLS_DIR: path.join(REPO, 'skills'),
+    // 签发票据的私钥：缺了宿主会拒绝启动（不降级为无票执行）。
+    TENON_HOST_SIGNING_KEY: ticketKey,
     // 显式给出会话密钥：不给的话 host 会用 dev 缺省值并告警，日志里多一句噪音。
     TENON_SESSION_SECRET: 'verify-module-host-e2e',
     // dev 账号表：agent 用来推公告板，bob 用来读公告板（两者都需要真 token）。
@@ -546,6 +590,9 @@ async function main() {
     TENON_HMAC_SECRET_FILE: secretPath,
     TENON_MODULE_AUDIT_PATH: path.join(RUN_DIR, 'audit-inventory.jsonl'),
     TENON_INVENTORY_SEED: `${SKU}:${SEED_ON_HAND},STD-1002:3`,
+    // 票据强制：模块只接受宿主签发的票；公钥来自上面刚生成的信任集。
+    TENON_TRUSTED_KEYS: ticketPub,
+    TENON_TICKET_MODE: 'enforce',
     // 心跳按 200ms（只认 time.ParseDuration 形式）：注册是 push 的，缺省 5s 会让本脚本白等。
     TENON_HEARTBEAT_INTERVAL: '200ms',
   }
@@ -622,7 +669,8 @@ async function main() {
         'inventory.DeductStock',
         'inventory.DeductStock',
       ])
-      eq('dispatched 段的 result.status = unknown（执行前结果未定）', dispatched.result?.status, 'unknown')
+      // 步骤级 dispatched 由宿主在签票时写，没有 result；插件只写 result 段。
+      eq('dispatched 段由宿主在签票时写，本身不含 result', dispatched.result, undefined)
       eq('result 段的 result.status = ok', result.result?.status, 'ok')
       match(
         'result 段的 outputHash 是 sha256 摘要',
@@ -643,10 +691,7 @@ async function main() {
         result.actor,
         { type: 'agent', id: AGENT_ID, onBehalfOf: ON_BEHALF_OF },
       )
-      eq('auto 路径没有人批准：approvedBy 为空', [dispatched.decision?.approvedBy, result.decision?.approvedBy], [
-        null,
-        null,
-      ])
+      eq('auto 路径没有人批准：result.approvedBy 为空', result.decision?.approvedBy, null)
       eq(
         'decision.policyId 是策略引擎真的裁决过的那条规则',
         result.decision?.policyId,
@@ -876,10 +921,15 @@ async function main() {
         'result/null',
       ])
       const stepRecords = records.filter((record) => record.stepId === 's1')
-      eq('step 级两段都写了审批人', stepRecords.map((record) => record.decision?.approvedBy), [
-        'user:alice',
-        'user:alice',
-      ])
+      // dispatched 由宿主在签票时写（不含 approvedBy——宿主只知道「谁在调用」，不知道谁批的）；
+      // 批准人落在插件写的 result 段，两段共用票上的 auditId。
+      const stepResult = stepRecords.find((record) => record.stage === 'result')
+      eq('step result 写了审批人', stepResult?.decision?.approvedBy, 'user:alice')
+      eq(
+        'step result 与宿主 dispatched 共用票上的 auditId',
+        stepResult?.auditId,
+        stepRecords.find((record) => record.stage === 'dispatched')?.auditId,
+      )
       eq('step 级两段的幂等键沿用挂起时的', stepRecords.map((record) => record.idempotencyKey), [
         `tenon:${planId}/s1`,
         `tenon:${planId}/s1`,
@@ -915,6 +965,9 @@ async function main() {
       const { createConfirmPoller } = await import(
         pathToFileURL(path.join(PLUGIN_DIR, 'dist', 'confirm.js')).href
       )
+      const { createWakeRegistry } = await import(
+        pathToFileURL(path.join(PLUGIN_DIR, 'dist', 'wake.js')).href
+      )
 
       const before = await moduleOnHand(moduleURL, SKU)
       const suspended = await runAction({
@@ -926,6 +979,11 @@ async function main() {
       eq('待批已生成', suspended?.status, 'needs_approval')
       const planId = suspended?.planId
 
+      // 挂起时插件会把这个会话的 agent 句柄按 planId 存下来（apply 里做）；这里用假的验证唤醒链路。
+      const woken = []
+      const wake = createWakeRegistry((line) => console.log(`    ${line}`))
+      wake.remember(planId, { followup: (message) => woken.push(message) })
+
       // 人在公告板上点「批准」：宿主用 bob 的 token 覆写 by/roles 之后才入队。
       const enqueued = await postJSONAuth(`${hostURL}/tenon/requests`, bobToken, {
         type: 'tenon.confirm',
@@ -935,18 +993,33 @@ async function main() {
       })
       eq('confirm 帧已入队', enqueued?.ok, true)
 
-      const poller = createConfirmPoller({ config, log: (line) => console.log(`    ${line}`) })
+      const poller = createConfirmPoller({
+        config,
+        log: (line) => console.log(`    ${line}`),
+        onExecuted: (event) => wake.notify(event),
+      })
       const ticked = await poller.tick()
       eq('轮询器读到并处理了一条 confirm', [ticked.confirms, ticked.applied], [1, 1])
       eq('公告板批准后库存真减：103 → 91', await moduleOnHand(moduleURL, SKU), before - 12)
 
+      // 唤醒：业务完成后把结论送回提出计划的会话（M1「DSH 侧批准后唤醒」）。
+      ok(
+        '批准后唤醒会话：followup 收到 UserMessage 形状',
+        woken.length === 1 &&
+          woken[0]?.role === 'user' &&
+          woken[0]?.source?.kind === 'user' &&
+          String(woken[0]?.content?.[0]?.text ?? '').includes(String(planId)) &&
+          String(woken[0]?.content?.[0]?.text ?? '').includes('user:bob'),
+      )
+
       const records = await auditFor(hostURL, planId)
-      const stepDispatched = records.find(
-        (record) => record.stage === 'dispatched' && record.stepId === 's1',
+      // 批准人落在插件写的 result 段；dispatched 由宿主签票时写，不带 approvedBy。
+      const stepResult = records.find(
+        (record) => record.stage === 'result' && record.stepId === 's1',
       )
       eq(
         '审计里的批准人来自宿主验过的 token（不是部署配置 operatorRoles）',
-        stepDispatched?.decision?.approvedBy,
+        stepResult?.decision?.approvedBy,
         'user:bob',
       )
       eq('计划级两段仍然共用挂起时的 auditId', records.at(-1)?.auditId, records[0]?.auditId)
@@ -963,9 +1036,14 @@ async function main() {
       ok('confirm 帧仍留在入站队列里（证明从未 ack）', stillThere)
 
       // ---- 重放：新轮询器 = 新进程，游标归零再读一遍，靠归档幂等挡住 ----
-      const replay = createConfirmPoller({ config })
+      const replayWoken = []
+      const replay = createConfirmPoller({
+        config,
+        onExecuted: (event) => replayWoken.push(event),
+      })
       const again = await replay.tick()
       eq('重放不产生动作', again.applied, 0)
+      eq('重放不重复唤醒', replayWoken.length, 0)
       eq('重放后库存不变', await moduleOnHand(moduleURL, SKU), before - 12)
     })
   } finally {

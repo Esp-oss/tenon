@@ -12,6 +12,7 @@ import {
   canonicalJSON,
   fetchJSON,
   HEADER_IDEMPOTENCY_KEY,
+  HEADER_TICKET,
   invalidArguments,
   normalizeFailure,
   snippet,
@@ -20,6 +21,7 @@ import {
   type JsonResponse,
 } from './bridge.js';
 import { DEFAULT_PENDING_TTL_MINUTES, DEFAULT_STATE_DIR, DEFAULT_TIMEOUT_MS, type ModuleHostConfig } from './config.js';
+import { agentTokenFor } from './host-auth.js';
 import { pendingCard, pushBoardCard, terminalCard } from './board.js';
 import {
   archivePlan,
@@ -444,41 +446,39 @@ async function executePlan(input: ExecutionInput): Promise<ExecutedAction> {
   // ---- 3. 预演：模块自己说这一步会不会成 ----
   await dryRun(baseURL, actionId, argsBody, timeoutMs, signal);
 
-  // ---- 4. I7：dispatched 审计必须先落盘，写不进去就绝不执行 ----
+  // ---- 4. 换票：宿主签票时写 dispatched 审计并扣配额 ----
+  // P0-1 之后步骤级 dispatched 只能由宿主写；agent 再自己写会 403 AUDIT_STAGE_FORBIDDEN。
+  // 票同时也把「批准过的那份参数摘要」冻结进来：模块验签时逐字比对请求体。
+  const ticket = await issueTicket({
+    config,
+    planId,
+    actionId,
+    argsBody,
+    timeoutMs,
+    signal,
+  });
   const auditInput: AuditInput = {
     config,
     actionId,
     planId,
-    auditId: randomToken('aud_', 20),
+    auditId: ticket.auditId,
     inputHash: input.inputHash,
     idemKey: input.idemKey,
     policyId: input.policyId,
     decisionOutcome: input.decisionOutcome,
     approvedBy: input.approvedBy,
   };
-  try {
-    await postAudit(
-      host,
-      buildAuditRecord(auditInput, 'dispatched', {
-        status: 'unknown',
-        outputHash: null,
-        errorClass: null,
-      }),
-      timeoutMs,
-      signal,
-    );
-  } catch (error) {
-    // 这条分支是本项目最重要的一行语义：**宁可这次不做，也不能做了一次没人记得的事**。
-    throw auditFailed(actionId, planId, error, '未执行任何动作');
-  }
 
-  // ---- 5. 执行 ----
+  // ---- 5. 执行（票与幂等键一起带；无票模块一律 403 TICKET_MISSING）----
   let response: JsonResponse;
   try {
     response = await fetchJSON(`${baseURL}/tenon/actions/${actionId}`, {
       method: 'POST',
       body: argsBody,
-      headers: { [HEADER_IDEMPOTENCY_KEY]: input.idemKey },
+      headers: {
+        [HEADER_IDEMPOTENCY_KEY]: input.idemKey,
+        [HEADER_TICKET]: ticket.ticket,
+      },
       timeoutMs,
       signal,
     });
@@ -1136,6 +1136,74 @@ async function dryRun(
   if (response.status < 200 || response.status > 299) {
     throw normalizeFailure(response.status, response.text);
   }
+}
+
+/**
+ * 向宿主换一张执行票据（P0-1）。
+ *
+ * 票里有四个绑定：模块/动作、**原始请求体摘要**、幂等键、审计 id。模块侧逐项比对，
+ * 所以这里必须把「即将发出去的那串字节」原样嵌进请求体——先 JSON.parse 再 stringify
+ * 会改变键序/空白，票上的 argsHash 立刻对不上。
+ *
+ * 失败不降级：没有 agent 凭据、宿主拒绝（策略/授权/批准快照）、响应坏，一律抛错且不执行。
+ */
+async function issueTicket(input: {
+  config: ModuleHostConfig;
+  planId: string;
+  actionId: string;
+  argsBody: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}): Promise<{ ticket: string; auditId: string }> {
+  let token: string | null;
+  try {
+    token = await agentTokenFor(input.config, input.signal);
+  } catch (error) {
+    throw new TenonCallError({
+      code: 'AGENT_TOKEN_REQUIRED',
+      errorClass: 'contract_violation',
+      retryable: false,
+      message: `取不到 agent 凭据，无法换执行票据（写动作不降级为无票执行）：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    });
+  }
+  if (token === null) {
+    throw new TenonCallError({
+      code: 'AGENT_TOKEN_REQUIRED',
+      errorClass: 'contract_violation',
+      retryable: false,
+      message: '未配置 agent 凭据（agentUser/agentPassword 或 agentToken），无法换执行票据；写动作未执行',
+    });
+  }
+
+  const body =
+    `{"planId":${JSON.stringify(input.planId)},"stepId":${JSON.stringify(STEP_ID)}` +
+    `,"action":${JSON.stringify(input.actionId)},"args":${input.argsBody}` +
+    `,"agent":${JSON.stringify(input.config.agentID)}` +
+    `,"onBehalfOf":${JSON.stringify(input.config.onBehalfOf)}}`;
+
+  const response = await fetchJSON(`${hostOf(input.config)}/tenon/tickets:issue`, {
+    method: 'POST',
+    body,
+    headers: { authorization: `Bearer ${token}` },
+    timeoutMs: input.timeoutMs,
+    signal: input.signal,
+  });
+  if (response.status !== 200) throw normalizeFailure(response.status, response.text);
+
+  const parsed = parseJson(response.text, 'POST /tenon/tickets:issue') as Record<string, unknown>;
+  const ticket = typeof parsed['ticket'] === 'string' ? parsed['ticket'] : '';
+  const auditId = typeof parsed['auditId'] === 'string' ? parsed['auditId'] : '';
+  if (ticket.length === 0 || auditId.length === 0) {
+    throw new TenonCallError({
+      code: 'MALFORMED_TICKET_RESPONSE',
+      errorClass: 'contract_violation',
+      retryable: false,
+      message: `tickets:issue 的响应不是 {ticket, auditId, exp}：${snippet(response.text)}`,
+    });
+  }
+  return { ticket, auditId };
 }
 
 /**

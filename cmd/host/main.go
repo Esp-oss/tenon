@@ -20,6 +20,10 @@
 //	TENON_SESSION_SECRET  签发/校验 token 的密钥；未设置时用 dev 缺省值并打警告，
 //	                   生产必须显式设置（漏设会让启动失败，见 New 的密钥校验）
 //	TENON_INBOUND_DIR  入站队列与 origin 登记表的目录（缺省 out/inbound）
+//	TENON_ORIGIN_RETENTION  origin 凭证保留期（缺省 168h）：到期且未被公告板引用的会被修剪；
+//	                   不修剪的话每说一句话就多一条，长期运行会线性增长
+//	TENON_INBOUND_CONFIRM_TTL  未 ack 确认帧保留期（缺省 1h）：确认帧从不 ack，
+//	                   留太久会把有界入站队列里的用户原话挤掉
 //	TENON_SKILLS_DIR   业务级规则根目录 skills/*/approval.json（缺省 skills）
 //	TENON_UI_DIR       同源静态页根目录；未设置时 GET / 回 503（页面没配是可诊断的部署问题）
 //	TENON_REQUIRE_TRIGGER  =1 时缺 triggerEventId 即 deny（只认 "1"）
@@ -94,6 +98,12 @@ const (
 	envTicketSigningKey = "TENON_HOST_SIGNING_KEY"
 	// envTicketTTL 覆盖票据有效期（缺省 30s，上限 60s）。
 	envTicketTTL = "TENON_TICKET_TTL"
+	// envOriginRetention 覆盖 origin 凭证保留期（缺省 168h = 7 天）。
+	// 它必须明显大于任何计划的可能寿命；低于卡寿命会让长挂起的 request 丢掉来源凭证。
+	envOriginRetention = "TENON_ORIGIN_RETENTION"
+	// envInboundConfirmTTL 覆盖未 ack 确认帧的保留期（缺省 1h）。
+	// 确认帧从不 ack，留太久会把有界入站队列里的用户原话挤掉。
+	envInboundConfirmTTL = "TENON_INBOUND_CONFIRM_TTL"
 	// envHMACSecretFile 是注册/心跳端点的共享密钥文件。名字的唯一定义在 controlplane
 	// （EnvHMACSecretFile），那里还要用它拼 503 的报文，两处写死迟早分叉。
 	envHMACSecretFile = controlplane.EnvHMACSecretFile
@@ -318,6 +328,22 @@ func loadConfig(modules *registry.Registry) (controlplane.Config, *suspendedRule
 			return cfg, nil, fmt.Errorf("%s=%q 不是合法时长：%w", envTicketTTL, ttl, err)
 		}
 		cfg.TicketTTL = d
+	}
+	// 入站治理的两个保留期：坏值拒绝启动，不静默退回缺省——
+	// 「我以为设了 10 分钟」和「其实是 7 天」在磁盘上看起来一样。
+	if raw := strings.TrimSpace(os.Getenv(envOriginRetention)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return cfg, nil, fmt.Errorf("%s=%q 不是合法时长：%w", envOriginRetention, raw, err)
+		}
+		cfg.OriginRetention = d
+	}
+	if raw := strings.TrimSpace(os.Getenv(envInboundConfirmTTL)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return cfg, nil, fmt.Errorf("%s=%q 不是合法时长：%w", envInboundConfirmTTL, raw, err)
+		}
+		cfg.InboundConfirmTTL = d
 	}
 	// 注册/心跳的共享密钥：**读不到就返回错误**，由 main 以 log.Fatalf 收尾（D7）。
 	// 这里绝不退回缺省值：一个猜出来的密钥等于让注册端点对任何知道缺省值的人开放。

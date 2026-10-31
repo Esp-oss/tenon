@@ -206,6 +206,16 @@ type Config struct {
 	TicketSigningKey ed25519.PrivateKey
 	// TicketTTL 是票据有效期，缺省 30s；超过 protocol.TicketMaxTTL 一律按上限截断。
 	TicketTTL time.Duration
+	// OriginRetention 是 origin 凭证的保留期（缺省 7 天）。
+	//
+	// 到期且**未被公告板引用**的凭证会被修剪：不修剪的话，每说一句话就多一条，
+	// 长期运行的宿主的 requests-index.jsonl 与内存映射会线性增长。
+	OriginRetention time.Duration
+	// InboundConfirmTTL 是入站队列里未 ack 的确认帧保留期（缺省 1 小时）。
+	//
+	// 确认帧从不 ack（公告板批准走设计 §10.2 选项 A），不清就会把用户原话从
+	// 有界队列里挤掉。过期确认对应的卡早已到期，留着只占位。
+	InboundConfirmTTL time.Duration
 }
 
 // Server 是组装好的控制平面。构造后并发安全；Handler() 与服务共享同一份状态。
@@ -311,6 +321,17 @@ func New(cfg Config) (*Server, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	// 修剪的「保护名单」来自公告板：仍在待批的 request 凭证，超期也不许丢（见 referencesRequest）。
+	origin.keep = func(rec originRecord) bool { return s.pending.referencesRequest(rec.RequestID) }
+	if cfg.OriginRetention > 0 {
+		origin.retention = cfg.OriginRetention
+	}
+	if cfg.InboundConfirmTTL > 0 {
+		inboundQueue.confirmRetention = cfg.InboundConfirmTTL
+	}
+	// 启动时先修剪一次：上一条注释里的「上限」只在 Register 触发太慢，
+	// 长跑的宿主要是几个月没重启，文件会一直带着旧账。
+	origin.compactNow()
 	s.inbound, s.origin = inboundQueue, origin
 	if _, err := s.policyEngine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
 		_ = store.Close()

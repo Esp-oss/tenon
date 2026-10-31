@@ -170,6 +170,27 @@ func hasCapability(m *Manifest, cap string) bool {
 	return false
 }
 
+// isWriteAction 判断某个动作是否为写。manifest 为 nil（C1 已失败）时返回 false：
+// 那种情况下整轮结论已经失败，后续用例怎么记都不会改变它。
+func isWriteAction(m *Manifest, action string) bool {
+	if m == nil {
+		return false
+	}
+	for _, a := range m.Actions {
+		if a.ID == action {
+			return a.Kind == "write"
+		}
+	}
+	return false
+}
+
+// ticketWriteSkip 是「enforce 实例上判不了写路径」的统一说明。
+//
+// enforce 的模块只接受宿主签发的票据，而套件不持有宿主私钥，也不该持有。
+// 这里必须 SKIP 而不是 PASS：曾出现过两次 403 + 响应体一致被 C2 判成「幂等通过」——
+// 那等于一次幂等语义都没验，却给出了绿色结论。判不了就说判不了。
+const ticketWriteSkip = "模块声明 ticket 能力（enforce）：套件不持宿主私钥，构造不出合法票据，本条在 enforce 实例上没有判定；写路径请在 TENON_TICKET_MODE=warn 的实例上跑"
+
 func firstWriteAction(m *Manifest) string {
 	for _, a := range m.Actions {
 		if a.Kind == "write" {

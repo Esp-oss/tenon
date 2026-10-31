@@ -23,12 +23,20 @@ export interface BoardCard {
   expiresAt: string;
   /** `awaiting_approval` 或终态（`done`/`rejected`/`expired`/`stale`）。 */
   state: string;
+  /**
+   * 审批依据：每步的**参数摘要**（不推参数原文）。
+   *
+   * P0-1 起这是签票的前置条件：宿主在第一次看到卡片时把这份摘要冻结，
+   * `tickets:issue` 逐条比对；不推它，宿主就没有「人批准的是哪一版参数」的证据，
+   * 签票会以 APPROVAL_REQUIRED 拒绝（不是静默放行）。
+   */
+  steps?: Array<{ stepId: string; action: string; argsHash: string }>;
 }
 
 /** 摘要上限：卡片是给人扫一眼的，不是审计（审计那边有完整记录）。 */
 const SUMMARY_LIMIT = 160;
 
-/** 待批卡片：摘要 + 需要的角色 + 有效期。 */
+/** 待批卡片：摘要 + 需要的角色 + 有效期 + 审批依据（步骤参数摘要）。 */
 export function pendingCard(plan: PendingPlan): BoardCard {
   return {
     planId: plan.planId,
@@ -36,6 +44,9 @@ export function pendingCard(plan: PendingPlan): BoardCard {
     requiredRoles: plan.requiredRoles,
     expiresAt: plan.expiresAt,
     state: 'awaiting_approval',
+    // 与 orchestrate 的 STEP_ID 一致（最小版只有一步）。摘要用挂起时算好的那份，
+    // 不能在这里重算：签票比对的是「人看到参数那一刻」的字节。
+    steps: [{ stepId: 's1', action: `${plan.module}.${plan.action}`, argsHash: plan.inputHash }],
   };
 }
 

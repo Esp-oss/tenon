@@ -178,9 +178,9 @@ func Run(ctx context.Context, opts Options) Report {
 	rep.Results = append(rep.Results, c1)
 
 	fix := opts.Fixtures.Pick(opts.ModuleID)
-	rep.Results = append(rep.Results, checkIdempotency(ctx, client, opts.Target, fix)...)
-	rep.Results = append(rep.Results, checkUnknownField(ctx, client, opts.Target, fix)...)
-	rep.Results = append(rep.Results, checkErrorClass(ctx, client, opts.Target, fix)...)
+	rep.Results = append(rep.Results, checkIdempotency(ctx, client, opts.Target, manifest, fix)...)
+	rep.Results = append(rep.Results, checkUnknownField(ctx, client, opts.Target, manifest, fix)...)
+	rep.Results = append(rep.Results, checkErrorClass(ctx, client, opts.Target, manifest, fix)...)
 	rep.Results = append(rep.Results, checkDryRunOptional(ctx, client, opts.Target, manifest, raws)...)
 	rep.Results = append(rep.Results, checkLint(opts.LintRoot))
 	rep.Results = append(rep.Results, checkTicketEnforcement(ctx, client, opts.Target, manifest, fix)...)
@@ -277,7 +277,7 @@ func checkManifest(ctx context.Context, client *http.Client, opts Options) (mani
 
 // --- 场景驱动用例（需要 fixtures）---
 
-func checkIdempotency(ctx context.Context, client *http.Client, target string, fix *ModuleFixture) []Result {
+func checkIdempotency(ctx context.Context, client *http.Client, target string, m *Manifest, fix *ModuleFixture) []Result {
 	res := Result{Case: "C2", Title: "幂等：同 Idempotency-Key 提交两次只产生一次副作用"}
 	if fix == nil {
 		res.Status = Skip
@@ -294,6 +294,13 @@ func checkIdempotency(ctx context.Context, client *http.Client, target string, f
 	if inv == nil {
 		res.Status = Skip
 		res.Detail = "fixtures 里没有标记 idempotent 的调用"
+		return []Result{res}
+	}
+	// enforce 下写请求进不了业务层：两次都是 403，响应当然"一致"。
+	// 那种一致证明不了幂等，只能证明门在。判不了就 SKIP（见 ticketWriteSkip）。
+	if m != nil && hasCapability(m, "ticket") && isWriteAction(m, inv.Action) {
+		res.Status = Skip
+		res.Detail = ticketWriteSkip
 		return []Result{res}
 	}
 	key := "tenon:conformance/" + inv.Name
@@ -315,7 +322,7 @@ func checkIdempotency(ctx context.Context, client *http.Client, target string, f
 	return []Result{res}
 }
 
-func checkUnknownField(ctx context.Context, client *http.Client, target string, fix *ModuleFixture) []Result {
+func checkUnknownField(ctx context.Context, client *http.Client, target string, m *Manifest, fix *ModuleFixture) []Result {
 	res := Result{Case: "C3", Title: "未知字段必须被忽略（前向兼容）"}
 	if fix == nil {
 		res.Status = Skip
@@ -332,6 +339,12 @@ func checkUnknownField(ctx context.Context, client *http.Client, target string, 
 	if inv == nil {
 		res.Status = Skip
 		res.Detail = "fixtures 里没有标记 unknownFieldTolerated 的调用"
+		return []Result{res}
+	}
+	// 无票的 403 也"不是 400"，但那只证明票据闸门在、没有证明未知字段被忽略。
+	if m != nil && hasCapability(m, "ticket") && isWriteAction(m, inv.Action) {
+		res.Status = Skip
+		res.Detail = ticketWriteSkip
 		return []Result{res}
 	}
 	var obj map[string]any
@@ -355,7 +368,7 @@ func checkUnknownField(ctx context.Context, client *http.Client, target string, 
 	return []Result{res}
 }
 
-func checkErrorClass(ctx context.Context, client *http.Client, target string, fix *ModuleFixture) []Result {
+func checkErrorClass(ctx context.Context, client *http.Client, target string, m *Manifest, fix *ModuleFixture) []Result {
 	res := Result{Case: "C9", Title: "错误分类：class/code/retryable 与状态码一致"}
 	if fix == nil {
 		res.Status = Skip
@@ -369,6 +382,13 @@ func checkErrorClass(ctx context.Context, client *http.Client, target string, fi
 			continue
 		}
 		checked++
+		// enforce 下业务错误根本到不了：模块先验票，返回的是 policy_denied/TICKET_MISSING。
+		// 那不是 fixture 写错了，而是这个实例判不了这条——写路径要在 warn 实例上跑。
+		if m != nil && hasCapability(m, "ticket") && isWriteAction(m, inv.Action) {
+			out = append(out, Result{Case: "C9." + inv.Name, Title: "错误分类 " + inv.Action,
+				Status: Skip, Detail: ticketWriteSkip})
+			continue
+		}
 		h := map[string]string{"Idempotency-Key": "tenon:conformance/err/" + inv.Name}
 		body, status, err := doJSON(ctx, client, http.MethodPost, target+"/tenon/actions/"+inv.Action, inv.Args, h)
 		r := Result{Case: "C9." + inv.Name, Title: "错误分类 " + inv.Action}

@@ -3,6 +3,7 @@ package controlplane
 import (
 	"encoding/json"
 	"sync"
+	"time"
 )
 
 // queuedFrame 是队列里的一帧：序号由队列分配，帧体原样保留。
@@ -12,6 +13,12 @@ import (
 type queuedFrame struct {
 	Seq   int64           `json:"seq"`
 	Frame json.RawMessage `json:"frame"`
+	// ReceivedAt 是宿主收到这一帧的时间（0 表示旧版本写入的记录）。
+	//
+	// 只用于入站队列的**确认帧保留期**：确认帧从不 ack（设计 §10.2 选项 A），
+	// 没有时间戳就没法只清掉过期的确认、保住用户原话。旧文件没有这个字段，
+	// 读回时是零值 ⇒ 永不过期，升级不会误删历史。
+	ReceivedAt time.Time `json:"receivedAt,omitempty"`
 }
 
 // Queue 是可回放的帧队列：序号单调递增，Ack 掉已确认的前缀。

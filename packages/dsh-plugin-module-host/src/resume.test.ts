@@ -22,6 +22,9 @@ const config = (hostURL: string, stateDir: string, extra: Partial<ModuleHostConf
   onBehalfOf: 'user:bob',
   timeoutMs: 5_000,
   stateDir,
+  // 公告板推送与签票都要 agent 身份（P0-1）；没有它，签票直接 fail-closed。
+  agentUser: 'agent',
+  agentPassword: 'agent-dev',
   ...extra,
 });
 
@@ -109,10 +112,11 @@ test('续跑：有资格 + allowed-once → 按原 planId/幂等键执行，归�
         'POST /tenon/policies:evaluate',
         'GET /tenon/modules',
         'POST /tenon/actions/inventory.DeductStock:dry-run',
-        'POST /tenon/audit',
+        'POST /tenon/tickets:issue',
         'POST /tenon/actions/inventory.DeductStock',
         'POST /tenon/audit',
         'POST /tenon/audit',
+        'POST /tenon/pending',
       ],
     );
 
@@ -120,14 +124,16 @@ test('续跑：有资格 + allowed-once → 按原 planId/幂等键执行，归�
     const action = host.requests.find((request) => request.path === '/tenon/actions/inventory.DeductStock');
     assert.equal(action?.headers['idempotency-key'], `tenon:${planId}/s1`);
 
-    // 四段审计：计划级 dispatched（挂起时）+ step 两段 + 计划级 result。
+    // 三段审计：计划级 dispatched（挂起时）+ step result（插件）+ 计划级 result。
+    // 步骤级 dispatched 已由宿主在签票时写，不在插件这一侧。
     const audits = host.bodies('/tenon/audit') as Array<Record<string, unknown>>;
     assert.deepEqual(
       audits.map((record) => `${record['stage']}/${String(record['stepId'])}`),
-      ['dispatched/null', 'dispatched/s1', 'result/s1', 'result/null'],
+      ['dispatched/null', 'result/s1', 'result/null'],
     );
+    assert.equal((audits[1]!['decision'] as Record<string, unknown>)['approvedBy'], 'user:bob');
     assert.equal((audits[2]!['decision'] as Record<string, unknown>)['approvedBy'], 'user:bob');
-    assert.equal(audits[3]!['auditId'], audits[0]!['auditId'], '计划级两段共用挂起时的 auditId');
+    assert.equal(audits[2]!['auditId'], audits[0]!['auditId'], '计划级两段共用挂起时的 auditId');
 
     assert.equal(loadArchived(stateDir, planId)?.state, 'done');
     assert.equal(loadArchived(stateDir, planId)?.approvedBy, 'user:bob');

@@ -13,6 +13,7 @@ import type { ModuleHostConfig } from './config.js';
 import { startFakeHost, type FakeHandler } from './fake-host.js';
 import { resetTokenCache } from './host-auth.js';
 import { loadArchived, loadPending, savePending, type PendingPlan } from './pending.js';
+import type { WakeEvent } from './wake.js';
 
 const PLAN_ID = 'pln_AAAAAAAAAAAAAAAA';
 const APPROVERS = ['role:warehouse_manager'];
@@ -119,7 +120,7 @@ function confirmFrame(overrides: Record<string, unknown> = {}): Record<string, u
   };
 }
 
-test('confirm approve + 有角色 → 真执行，审计 approvedBy 来自帧', async () => {
+test('confirm approve + 有角色 → 真执行，审计 approvedBy 来自帧，并发出唤醒事件', async () => {
   resetTokenCache();
   const h = await harness();
   const stateDir = freshState();
@@ -127,7 +128,11 @@ test('confirm approve + 有角色 → 真执行，审计 approvedBy 来自帧', 
     seedPending(stateDir);
     h.frames.push({ seq: 1, frame: confirmFrame() });
 
-    const poller = createConfirmPoller({ config: config(h.host.origin, stateDir) });
+    const events: WakeEvent[] = [];
+    const poller = createConfirmPoller({
+      config: config(h.host.origin, stateDir),
+      onExecuted: (event) => events.push(event),
+    });
     const result = await poller.tick();
 
     assert.equal(result.confirms, 1);
@@ -136,9 +141,17 @@ test('confirm approve + 有角色 → 真执行，审计 approvedBy 来自帧', 
     assert.equal(loadArchived(stateDir, PLAN_ID)?.state, 'done');
     assert.equal(loadArchived(stateDir, PLAN_ID)?.approvedBy, 'user:bob');
 
+    // 唤醒事件只发一次，且带「谁批的」与执行结论——它是后台会话唯一能拿到的上下文。
+    assert.equal(events.length, 1);
+    assert.equal(events[0]!.planId, PLAN_ID);
+    assert.equal(events[0]!.by, 'user:bob');
+    assert.equal(events[0]!.decision, 'approve');
+    assert.ok(events[0]!.detail.length > 0, '执行结论要带进唤醒消息');
+
     const audits = h.host.bodies('/tenon/audit') as Array<Record<string, unknown>>;
-    const stepDispatched = audits.find((record) => record['stepId'] === 's1' && record['stage'] === 'dispatched');
-    assert.equal((stepDispatched?.['decision'] as Record<string, unknown>)['approvedBy'], 'user:bob');
+    // 步骤级 dispatched 由宿主在签票时写；插件只写 result，审批人必须落在 result 上。
+    const stepResult = audits.find((record) => record['stepId'] === 's1' && record['stage'] === 'result');
+    assert.equal((stepResult?.['decision'] as Record<string, unknown>)['approvedBy'], 'user:bob');
   } finally {
     await h.close();
   }
@@ -152,11 +165,16 @@ test('confirm approve 但角色不够 → 不执行，待批仍在（宿主验�
     seedPending(stateDir);
     h.frames.push({ seq: 1, frame: confirmFrame({ by: 'user:carol', roles: ['role:sales'] }) });
 
-    const poller = createConfirmPoller({ config: config(h.host.origin, stateDir) });
+    const events: WakeEvent[] = [];
+    const poller = createConfirmPoller({
+      config: config(h.host.origin, stateDir),
+      onExecuted: (event) => events.push(event),
+    });
     const result = await poller.tick();
 
     assert.equal(result.confirms, 1);
     assert.equal(result.applied, 0);
+    assert.equal(events.length, 0, '没执行就没有唤醒事件');
     assert.equal(h.actions, 0, '角色不够就不该有动作请求');
     assert.equal(loadPending(stateDir, PLAN_ID)?.state, 'awaiting_approval');
     assert.ok(result.notes.some((note) => /不持有/.test(note)), `notes 应说明原因：${result.notes.join('｜')}`);
@@ -173,10 +191,16 @@ test('confirm reject → 归档 rejected，绝不执行', async () => {
     seedPending(stateDir);
     h.frames.push({ seq: 1, frame: confirmFrame({ decision: 'reject' }) });
 
-    const poller = createConfirmPoller({ config: config(h.host.origin, stateDir) });
+    const events: WakeEvent[] = [];
+    const poller = createConfirmPoller({
+      config: config(h.host.origin, stateDir),
+      onExecuted: (event) => events.push(event),
+    });
     const result = await poller.tick();
 
     assert.equal(result.applied, 1);
+    assert.equal(events.length, 1, '驳回同样要唤醒：会话该知道「没办」');
+    assert.equal(events[0]!.decision, 'reject');
     assert.equal(h.actions, 0);
     assert.equal(loadArchived(stateDir, PLAN_ID)?.state, 'rejected');
     assert.equal(loadPending(stateDir, PLAN_ID), null);
@@ -221,16 +245,27 @@ test('重放：重启后从头读旧帧，已归档就幂等返回，不重复�
     seedPending(stateDir);
     h.frames.push({ seq: 1, frame: confirmFrame() });
 
-    const first = createConfirmPoller({ config: config(h.host.origin, stateDir) });
+    const events: WakeEvent[] = [];
+    const first = createConfirmPoller({
+      config: config(h.host.origin, stateDir),
+      onExecuted: (event) => events.push(event),
+    });
     await first.tick();
     assert.equal(h.actions, 1);
+    assert.equal(events.length, 1, '首次执行发一次唤醒事件');
 
     // 新轮询器 = 新进程：游标归零，会重新读到同一帧。
-    const replay = createConfirmPoller({ config: config(h.host.origin, stateDir) });
+    const replayEvents: WakeEvent[] = [];
+    const replay = createConfirmPoller({
+      config: config(h.host.origin, stateDir),
+      onExecuted: (event) => replayEvents.push(event),
+    });
     const again = await replay.tick();
 
     assert.equal(again.confirms, 1);
     assert.equal(again.applied, 0, '已归档的计划不该再产生动作');
+    assert.equal(replayEvents.length, 0, '重放不该再唤醒一次（否则每次重启都刷一句）');
+    assert.equal(events.length, 1, '首轮的唤醒事件仍是那一条');
     assert.equal(h.actions, 1, '动作只发生过一次');
     assert.equal(
       h.host.sequence().some((entry) => entry.includes('/tenon/requests/ack')),

@@ -17,6 +17,7 @@ import { createConfirmPoller } from './confirm.js';
 import { hasAgentCredentials } from './host-auth.js';
 import { resumePlan, rolesIntersect, runAction, type ApprovalPort } from './orchestrate.js';
 import { assertPlanId, listPending } from './pending.js';
+import { createWakeRegistry } from './wake.js';
 
 /** 插件名（cordis 的 `name` 导出）。 */
 export const name = 'tenon-module-host';
@@ -265,6 +266,10 @@ export const RESUME_DESCRIPTION =
  * @param config 部署配置（身份与审批资格只来自这里，见 config.ts）。
  */
 export function apply(ctx: ToolHostContext, config: ModuleHostConfig): void {
+  // 唤醒登记表：挂起时记下「提出这条计划的会话句柄」，公告板批准落地后用它 followup。
+  // 只在同一进程存活期内有效——重启后没有句柄就只完成业务、不唤醒（见 wake.ts 的限制说明）。
+  const wake = createWakeRegistry((line) => console.warn(line));
+
   ctx.tools.register(
     defineTool({
       name: 'tenon_action',
@@ -293,6 +298,9 @@ export function apply(ctx: ToolHostContext, config: ModuleHostConfig): void {
             approval: ctx.approval,
             agent: exec?.agent,
           });
+          if (outcome.status === 'needs_approval' && outcome.planId) {
+            wake.remember(outcome.planId, exec?.agent);
+          }
           return {
             status: outcome.status,
             planId: outcome.planId,
@@ -370,6 +378,9 @@ export function apply(ctx: ToolHostContext, config: ModuleHostConfig): void {
             agent: exec?.agent,
             signal: exec?.signal,
           });
+          if (outcome.status === 'needs_approval' && outcome.planId) {
+            wake.remember(outcome.planId, exec?.agent);
+          }
           return {
             status: outcome.status,
             planId: outcome.planId,
@@ -393,6 +404,8 @@ export function apply(ctx: ToolHostContext, config: ModuleHostConfig): void {
       const poller = createConfirmPoller({
         config,
         log: (line) => console.warn(line),
+        // 公告板批准落地后，唤醒提出这条计划的会话（同进程内有效，见 wake.ts）。
+        onExecuted: (event) => wake.notify(event),
       });
       poller.start();
       return () => poller.stop();

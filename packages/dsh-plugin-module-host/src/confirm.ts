@@ -17,6 +17,7 @@ import { DEFAULT_STATE_DIR, DEFAULT_TIMEOUT_MS, type ModuleHostConfig } from './
 import { agentTokenFor } from './host-auth.js';
 import { rejectPendingPlan, resumePlan } from './orchestrate.js';
 import { loadArchived } from './pending.js';
+import type { WakeEvent } from './wake.js';
 
 /** 一次 tick 的结果（给人看的三行，也方便用例断言）。 */
 export interface TickResult {
@@ -35,6 +36,13 @@ export interface ConfirmPollerOptions {
   intervalMs?: number;
   /** 一行日志；缺省丢弃（测试里通常传入收集器）。 */
   log?: (line: string) => void;
+  /**
+   * 确认**真的落地**之后的回调（执行成功或驳回成功）。
+   *
+   * 它是「批准后唤醒」的接入点：插件把 `exec.agent` 按 planId 存起来，
+   * 这里用 `agent.followup` 唤醒提出计划的那个会话。回调抛错不会影响业务结果。
+   */
+  onExecuted?: (event: WakeEvent) => void;
 }
 
 /** 轮询器：手动 `tick()` 供测试与一次性调用，`start()`/`stop()` 管定时器。 */
@@ -109,8 +117,17 @@ export function createConfirmPoller(options: ConfirmPollerOptions): ConfirmPolle
       if (type !== 'tenon.confirm') continue;
 
       result.confirms += 1;
-      const handled = await handleConfirm(config, frame, notes, log);
-      if (handled) result.applied += 1;
+      const event = await handleConfirm(config, frame, notes, log);
+      if (event !== null) {
+        result.applied += 1;
+        // 唤醒回调查完就断：它只负责「告诉提出计划的会话」，失败不能改写业务结论。
+        // 回调内部的 try/catch 在插件侧（wake.notify）；这里再包一层防测试注入的裸回调。
+        try {
+          options.onExecuted?.(event);
+        } catch (error) {
+          log(`tenon 确认：唤醒回调异常（业务已完成）：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     }
     return result;
   }
@@ -165,14 +182,14 @@ function readFrames(body: Json): Array<{ seq: number; frame: Record<string, unkn
 /**
  * 处理一条 confirm 帧。
  *
- * @returns 是否真的产生了动作（执行成功 / 驳回成功）。
+ * @returns 真的产生了动作时返回唤醒事件（执行成功 / 驳回成功），否则 null。
  */
 async function handleConfirm(
   config: ModuleHostConfig,
   frame: Record<string, unknown>,
   notes: string[],
   log: (line: string) => void,
-): Promise<boolean> {
+): Promise<WakeEvent | null> {
   const planId = typeof frame['planId'] === 'string' ? frame['planId'] : '';
   const by = typeof frame['by'] === 'string' ? frame['by'] : '';
   const decision = typeof frame['decision'] === 'string' ? frame['decision'] : '';
@@ -182,7 +199,7 @@ async function handleConfirm(
 
   if (planId.length === 0 || by.length === 0) {
     notes.push('收到一条缺 planId 或 by 的 confirm，已跳过');
-    return false;
+    return null;
   }
 
   // 已归档就跳过：没有 ack 意味着重启后会重读旧帧，这一句就是幂等的入口。
@@ -192,11 +209,11 @@ async function handleConfirm(
   try {
     if (loadArchived(stateDir, planId) !== null) {
       notes.push(`${planId} 已归档，跳过重放`);
-      return false;
+      return null;
     }
   } catch (error) {
     notes.push(`${planId} 的归档记录读不动（${error instanceof Error ? error.message : String(error)}）`);
-    return false;
+    return null;
   }
 
   try {
@@ -204,15 +221,15 @@ async function handleConfirm(
       const outcome = await rejectPendingPlan(config, planId, by);
       if (outcome === 'rejected') {
         log(`tenon 确认：${planId} 被 ${by} 驳回`);
-        return true;
+        return { planId, by, decision: 'reject', detail: '' };
       }
       notes.push(`${planId} 已不在待批（驳回被忽略）`);
-      return false;
+      return null;
     }
 
     if (decision !== 'approve') {
       notes.push(`${planId} 的 decision=${JSON.stringify(decision)} 不认识，已跳过`);
-      return false;
+      return null;
     }
 
     const outcome = await resumePlan({
@@ -222,13 +239,13 @@ async function handleConfirm(
     });
     if (outcome.status === 'executed') {
       log(`tenon 确认：${planId} 由 ${by} 批准并执行`);
-      return true;
+      return { planId, by, decision: 'approve', detail: outcome.detail };
     }
     notes.push(`${planId} 未执行：${outcome.detail}`);
-    return false;
+    return null;
   } catch (error) {
     // 单帧失败不该打断整轮：队列里可能还有别的 confirm。
     notes.push(`${planId} 处理失败（${error instanceof Error ? error.message : String(error)}）`);
-    return false;
+    return null;
   }
 }

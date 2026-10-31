@@ -379,6 +379,9 @@ test('tenon_resume：挂起后经人批 → 工具层返回 executed，审计带
       hostURL: host.origin,
       stateDir,
       operatorRoles: ['role:warehouse_manager'],
+      // 公告板推送（冻结参数摘要）与签票都要 agent 身份。
+      agentUser: 'agent',
+      agentPassword: 'agent-dev',
     };
     const suspended = (await toolNamed('tenon_action', config).execute(
       { module: 'inventory', action: 'DeductStock', args: { sku: 'STD-1001', qty: 12 } },
@@ -397,11 +400,12 @@ test('tenon_resume：挂起后经人批 → 工具层返回 executed，审计带
     assert.equal(approval.calls, 1);
 
     // 工具层没有把身份/审批人的东西漏进返回值形状之外的地方：审计里的 approvedBy 来自配置。
+    // 步骤级 dispatched 由宿主在签票时写，这里只写 result。
     const audits = host.bodies('/tenon/audit') as Array<Record<string, unknown>>;
-    const stepDispatched = audits.find(
-      (record) => record['stage'] === 'dispatched' && record['stepId'] === 's1',
+    const stepResult = audits.find(
+      (record) => record['stage'] === 'result' && record['stepId'] === 's1',
     );
-    assert.equal((stepDispatched?.['decision'] as Record<string, unknown>)['approvedBy'], 'user:alice');
+    assert.equal((stepResult?.['decision'] as Record<string, unknown>)['approvedBy'], 'user:alice');
   } finally {
     await host.close();
   }

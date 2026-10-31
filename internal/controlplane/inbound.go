@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -31,14 +32,45 @@ type originRecord struct {
 
 // originStore 是 origin 登记表。**必须独立落盘**（I8）：若跟着内存队列丢掉，
 // 重启后未完成的 request 会被判成 event，从而绕过「对话发起必须审批」。
+//
+// 登记表是「事件 id → 这次请求是谁说的」的凭证，只在计划生命周期内被查。它按
+// **保留期 + 上限**修剪：不修剪的话，每说一句话就多一条，长期运行会线性增长
+// （内存与 requests-index.jsonl 都长）。修剪有一条安全边界：仍被公告板引用的
+// requestId 一律保留，且保留期必须远大于任何计划的可能寿命——否则一条还在挂起的
+// request 会因「查不到来源」被判成 event，绕过「对话发起必须审批」，那是把 GC
+// 做成了安全缺口。
 type originStore struct {
 	mu      sync.RWMutex
 	path    string
 	byEvent map[string]originRecord
+
+	retention  time.Duration
+	maxEntries int
+	now        func() time.Time
+	// keep 返回 true 表示这条凭证仍被引用（公告板上的待批卡），不能因为超期而丢。
+	keep func(originRecord) bool
+	// sinceCompact 是距上次修剪的新增条数：不必每登记一条就重写整份文件。
+	sinceCompact int
 }
 
+const (
+	// defaultOriginRetention 是 origin 凭证的缺省保留期。
+	//
+	// 7 天远大于卡的缺省寿命（15 分钟）与任何正常审批等待；把它调低到卡寿命附近
+	// 会让「挂了很久才批」的计划失去来源凭证。到期且未被公告板引用的才丢。
+	defaultOriginRetention = 7 * 24 * time.Hour
+	// defaultOriginMaxEntries 是硬上限（防止保留期内被灌爆）。超出时从最旧的
+	// 未引用记录开始丢——宁可丢来源凭证也不能让宿主内存无界增长。
+	defaultOriginMaxEntries = 50000
+	// originCompactEvery 是「每新增多少条触发一次修剪」的粒度。
+	originCompactEvery = 256
+)
+
 func newOriginStore(path string) (*originStore, error) {
-	st := &originStore{path: path, byEvent: map[string]originRecord{}}
+	st := &originStore{
+		path: path, byEvent: map[string]originRecord{},
+		retention: defaultOriginRetention, maxEntries: defaultOriginMaxEntries, now: time.Now,
+	}
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		return st, nil
@@ -57,6 +89,16 @@ func newOriginStore(path string) (*originStore, error) {
 		st.byEvent[rec.EventID] = rec
 	}
 	return st, sc.Err()
+}
+
+// compactNow 在装配完成后调用一次：启动时就把过期的旧账修掉（keep 必须先设置好）。
+func (st *originStore) compactNow() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if err := st.compactLocked(); err != nil {
+		// 修剪失败不影响服务：登记表本身仍可读，下一次 Register 会再试。
+		log.Printf("controlplane: origin 登记表启动修剪失败（不影响服务）：%v", err)
+	}
 }
 
 // Register 追加一条登记并落盘。落盘失败即返回错误：调用方不该在凭证没留下时就入队。
@@ -83,6 +125,115 @@ func (s *originStore) Register(rec originRecord) error {
 		return err
 	}
 	s.byEvent[rec.EventID] = rec
+	s.sinceCompact++
+	if s.sinceCompact >= originCompactEvery || len(s.byEvent) > s.maxEntries {
+		if err := s.compactLocked(); err != nil {
+			// 修剪失败不退回「登记失败」：凭证已经 append 落盘，它在本次运行内仍然有效；
+			// 下一次登记会继续尝试重写。
+			log.Printf("controlplane: origin 登记表修剪失败（条目 %d，稍后重试）：%v", len(s.byEvent), err)
+		}
+	}
+	return nil
+}
+
+// compactLocked 按保留期与上限修剪，并原子重写登记表（调用方持写锁）。
+func (st *originStore) compactLocked() error {
+	now := st.now()
+	type entry struct {
+		rec originRecord
+		at  time.Time
+	}
+	kept := make([]entry, 0, len(st.byEvent))
+	dropped := 0
+	for _, rec := range st.byEvent {
+		protected := st.keep != nil && st.keep(rec)
+		at, err := time.Parse(time.RFC3339, rec.At)
+		if !protected && err == nil && now.Sub(at) > st.retention {
+			dropped++
+			continue
+		}
+		kept = append(kept, entry{rec: rec, at: at})
+	}
+	// 最旧的排在前面：上限裁剪从头部丢，重写出的文件也按时间有序（便于人看）。
+	sort.Slice(kept, func(i, j int) bool {
+		if kept[i].at.Equal(kept[j].at) {
+			return kept[i].rec.EventID < kept[j].rec.EventID
+		}
+		return kept[i].at.Before(kept[j].at)
+	})
+	for len(kept) > st.maxEntries {
+		idx := -1
+		for i := range kept {
+			if st.keep == nil || !st.keep(kept[i].rec) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			break // 全被引用：宁可超上限也不丢还在用的凭证
+		}
+		kept = append(kept[:idx], kept[idx+1:]...)
+		dropped++
+	}
+	if dropped == 0 {
+		st.sinceCompact = 0
+		return nil
+	}
+	records := make([]originRecord, 0, len(kept))
+	for _, e := range kept {
+		records = append(records, e.rec)
+	}
+	if err := st.rewriteLocked(records); err != nil {
+		return err
+	}
+	next := make(map[string]originRecord, len(records))
+	for _, rec := range records {
+		next[rec.EventID] = rec
+	}
+	st.byEvent = next
+	st.sinceCompact = 0
+	log.Printf("controlplane: origin 登记表修剪 %d 条（保留 %d 条；保留期 %s，上限 %d）",
+		dropped, len(next), st.retention, st.maxEntries)
+	return nil
+}
+
+// rewriteLocked 原子重写登记表：先写临时文件再改名，半份文件等于把凭证弄丢。
+func (st *originStore) rewriteLocked(records []originRecord) error {
+	if err := os.MkdirAll(filepath.Dir(st.path), 0o755); err != nil {
+		return err
+	}
+	tmp := st.path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+		}
+	}()
+	w := bufio.NewWriter(f)
+	for _, rec := range records {
+		raw, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(append(raw, '\n')); err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, st.path); err != nil {
+		return err
+	}
+	ok = true
 	return nil
 }
 

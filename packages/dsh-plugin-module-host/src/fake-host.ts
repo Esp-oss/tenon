@@ -34,6 +34,28 @@ export interface FakeHost {
 }
 
 /**
+ * 假宿主的默认回包：登录与签票。
+ *
+ * 这两条是 P0-1 之后每条执行路径都会用到的**传输层前置**，与用例要验的业务无关；
+ * 让每个用例都手写一遍只会把「验闸门」变成「验样板」。用例仍可用显式 route 覆盖
+ * （比如模拟签票失败），显式回包优先于这里的兜底。
+ */
+function defaultHostReply(request: FakeRequest, ticketSeq: () => number): FakeResponse | undefined {
+  const route = `${request.method} ${new URL(request.path, 'http://placeholder').pathname}`;
+  if (route === 'POST /tenon/session') {
+    return {
+      status: 200,
+      body: { token: 'tok-agent', user: 'user:agent', roles: ['role:agent'], exp: 4_000_000_000 },
+    };
+  }
+  if (route === 'POST /tenon/tickets:issue') {
+    const n = ticketSeq();
+    return { status: 200, body: { ticket: `tkt_test_${n}`, auditId: `aud_ticket_${n}`, exp: 4_000_000_000 } };
+  }
+  return undefined;
+}
+
+/**
  * 起一个假宿主。
  * @param handler 回包脚本；可用第二参数 `origin` 让 `GET /tenon/modules` 指向自己。
  * @returns 已监听的假宿主。
@@ -43,6 +65,7 @@ export async function startFakeHost(handler: FakeHandler): Promise<FakeHost> {
   // 先声明后赋值：回包脚本需要知道「自己是谁」（模块的 baseURL 指向本服务），而端口在
   // listen 之后才有。请求只会在 listen 之后到达，因此脚本读到的一定是已赋值的值。
   let origin = '';
+  let ticketCounter = 0;
   const server: Server = createServer((incoming, response) => {
     const chunks: Buffer[] = [];
     incoming.on('data', (chunk: Buffer) => chunks.push(chunk));
@@ -54,7 +77,7 @@ export async function startFakeHost(handler: FakeHandler): Promise<FakeHost> {
         body: Buffer.concat(chunks).toString('utf8'),
       };
       requests.push(request);
-      const reply = handler(request, origin) ?? {
+      const reply = handler(request, origin) ?? defaultHostReply(request, () => (ticketCounter += 1)) ?? {
         status: 500,
         body: {
           tenonError: {

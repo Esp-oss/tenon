@@ -118,6 +118,24 @@ tenon lint --path .                                 # C10 扫描，见 tools/lin
 
 M0.5（当前）：模块侧 **C1 / C2 / C3 / C8 / C9 / C10 已实现**；宿主侧 **C4 / C5 在宿主模式下可判定**（`Options.HostTarget` 非空时），模块模式仍**显式记为 SKIP 并写明原因**——SKIP 不等于 PASS，报告会明说「不能视为整体合规」，`--strict` 下 SKIP 让退出码变 2。**D1 永远是 SKIP**：它需要会推理的规划器（LLM），规则式规划器会让它变成假命题。
 
+### 执行票据（0.2.0）之后：一个实例判不了全部写路径
+
+C11 只在 `TENON_TICKET_MODE=enforce` 时判定（无票/伪造票必须 403）；而同一份 enforce 实例上，
+**写路径的 C2/C3/C9 判不了**——套件不持有宿主私钥，构造不出票据，请求会停在闸门上。那种情况下
+这三条记为 SKIP 并写明原因，不再把「两次 403 一样」判成「幂等通过」（那是假绿）。完整判定要跑两次：
+
+```bash
+# enforce 实例（无票拒写、C11/C12、宿主侧 C4/C5）
+tenon conformance run --target http://127.0.0.1:8081 --host http://127.0.0.1:8080 \
+  --module inventory --fixtures conformance/fixtures/mini-erp.json --source-dir .
+# warn 实例（写路径能到业务层：C2/C3/C9）
+tenon conformance run --target http://127.0.0.1:8091 \
+  --module inventory --fixtures conformance/fixtures/mini-erp.json
+```
+
+单实例时结论只能是「已跑用例通过，存在 SKIP」，不能宣称整体合规；`--strict` 仍会因 D1（以及
+C2/C3/C9 的 SKIP）退出 2，这是设计行为，不是回归。
+
 实测（`go test ./conformance/ -count=1 -v`）：
 
 - 模块模式（合规假模块，无 fixtures / `LintRoot`）：`C1`、`C8` PASS；`C2`、`C3`、`C9` SKIP（缺 fixtures）；`C10` SKIP（未给源码目录）；`C4`、`C5`、`D1` SKIP。`exit=0`，`--strict` 下 `2`。

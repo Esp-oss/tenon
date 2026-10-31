@@ -21,6 +21,9 @@ const config = (hostURL: string, extra: Partial<ModuleHostConfig> = {}): ModuleH
   agentID: 'ag_dsh_test',
   onBehalfOf: 'user:alice',
   timeoutMs: 5_000,
+  // P0-1 起写动作要先换票；换票用 agent 服务账号（与 Go 侧同一身份）。
+  agentUser: 'agent',
+  agentPassword: 'agent-dev',
   ...extra,
 });
 
@@ -95,12 +98,14 @@ test('1. auto：六步顺序、审计两段与执行请求的头部/摘要', asy
     assert.deepEqual(outcome.result, { ok: true, remaining: 115 });
     assert.match(outcome.detail, /已执行 inventory\.DeductStock/);
 
-    // 六步顺序，一步不多一步不少。
+    // 顺序：发现 → 策略 → 预演 → **登录换 token** → 签票 → 执行 → result 审计。
+    // 步骤级 dispatched 由宿主在签票时写，本插件不再自己写（P0-1）。
     assert.deepEqual(host.sequence(), [
       'GET /tenon/modules',
       'POST /tenon/policies:evaluate',
       'POST /tenon/actions/inventory.DeductStock:dry-run',
-      'POST /tenon/audit',
+      'POST /tenon/session',
+      'POST /tenon/tickets:issue',
       'POST /tenon/actions/inventory.DeductStock',
       'POST /tenon/audit',
     ]);
@@ -113,42 +118,47 @@ test('1. auto：六步顺序、审计两段与执行请求的头部/摘要', asy
     assert.deepEqual(policyBody.plan.steps, [
       { stepId: 's1', action: 'inventory.DeductStock', args: ARGS },
     ]);
-    const policyText = host.requests[1]?.body ?? '';
+    const policyText = host.requests[2]?.body ?? '';
     assert.ok(!policyText.includes('"origin"'), 'origin 不得自报：宿主自己判定来源');
     assert.ok(!policyText.includes('triggerEventId'), '本轮没有触发事件，不该伪造 triggerEventId');
 
-    // 执行请求：Tenon-Version 与 Idempotency-Key。
-    const actionRequest = host.requests[4];
+    // 签票请求：args 必须与执行请求体逐字一致（票上的 argsHash 绑定的是那串字节）。
+    const issueRequest = host.requests[4];
+    assert.ok(issueRequest, '缺少签票请求');
+    assert.equal(issueRequest.headers['authorization'], 'Bearer tok-agent');
+    const issued = JSON.parse(issueRequest.body) as Record<string, unknown>;
+    assert.deepEqual(issued['args'], ARGS);
+    assert.equal(issued['planId'], outcome.planId);
+    assert.equal(issued['stepId'], 's1');
+    assert.equal(issued['agent'], 'ag_dsh_test');
+    assert.equal(issued['onBehalfOf'], 'user:alice');
+
+    // 执行请求：Tenon-Version、Idempotency-Key 与执行票据。
+    const actionRequest = host.requests[5];
     assert.ok(actionRequest, '缺少执行请求');
     assert.equal(actionRequest.headers['tenon-version'], '0.1');
     assert.equal(actionRequest.headers['idempotency-key'], `tenon:${outcome.planId}/s1`);
+    assert.equal(actionRequest.headers['tenon-ticket'], 'tkt_test_1');
     assert.equal(actionRequest.headers['content-type'], 'application/json');
 
-    // 两段审计：共用 auditId、dispatched 先于执行、result 带出参摘要。
+    // 只有一段 result 审计：dispatched 已收归宿主（签票时写），这里只收尾。
     const audits = host.bodies('/tenon/audit') as unknown as AuditRecord[];
-    assert.equal(audits.length, 2);
-    const dispatched = audits[0] as AuditRecord;
-    const settled = audits[1] as AuditRecord;
-    assert.equal(dispatched.stage, 'dispatched');
+    assert.equal(audits.length, 1);
+    const settled = audits[0] as AuditRecord;
     assert.equal(settled.stage, 'result');
-    assert.equal(dispatched.auditId, settled.auditId);
-    assert.match(dispatched.auditId, /^aud_[A-Za-z0-9_-]{4,}$/);
-    assert.equal(dispatched.planId, outcome.planId);
-    assert.equal(dispatched.stepId, 's1');
-    assert.equal(dispatched.action, 'inventory.DeductStock');
-    assert.equal(dispatched.idempotencyKey, `tenon:${outcome.planId}/s1`);
-    assert.equal(dispatched.inputHash, digestOf(actionRequest.body));
-    assert.equal(dispatched.actor.type, 'agent');
-    assert.equal(dispatched.actor.id, 'ag_dsh_test');
-    assert.equal(dispatched.actor.onBehalfOf, 'user:alice');
-    assert.equal(dispatched.decision.outcome, 'auto');
-    assert.equal(dispatched.decision.policyId, 'pol-stock-auto');
-    assert.equal(dispatched.decision.grantId, null, '本轮不调 grant，不得伪造 grantId');
-    assert.equal(dispatched.decision.approvedBy, null, 'auto 路径没有人批');
-    assert.equal(dispatched.result.status, 'unknown');
-    assert.deepEqual(dispatched.trigger, { eventId: null, correlationId: null });
-    assert.deepEqual(dispatched.effects, { entities: [] });
-    assert.deepEqual(dispatched.tokenUsage, { in: 0, out: 0 });
+    assert.equal(settled.auditId, 'aud_ticket_1', 'result 必须接在宿主 dispatched 的 auditId 上');
+    assert.equal(settled.planId, outcome.planId);
+    assert.equal(settled.stepId, 's1');
+    assert.equal(settled.action, 'inventory.DeductStock');
+    assert.equal(settled.idempotencyKey, `tenon:${outcome.planId}/s1`);
+    assert.equal(settled.inputHash, digestOf(actionRequest.body));
+    assert.equal(settled.actor.type, 'agent');
+    assert.equal(settled.actor.id, 'ag_dsh_test');
+    assert.equal(settled.actor.onBehalfOf, 'user:alice');
+    assert.equal(settled.decision.outcome, 'auto');
+    assert.equal(settled.decision.policyId, 'pol-stock-auto');
+    assert.equal(settled.decision.grantId, null, '本轮不调 grant，不得伪造 grantId');
+    assert.equal(settled.decision.approvedBy, null, 'auto 路径没有人批');
     assert.equal(settled.result.status, 'ok');
     // outputHash 是出参**原始字节**的摘要（Go 的 hashPayload 同一意图）。
     assert.equal(settled.result.outputHash, digestOf(JSON.stringify({ ok: true, remaining: 115 })));
@@ -234,11 +244,14 @@ test('3. approve：真挂起（落盘 + 计划级审计），不预演、不执�
     assert.deepEqual(outcome.requiredRoles, ['role:warehouse_manager']);
     assert.equal(outcome.result, null);
 
-    // 序列：发现 → 策略 → 计划级审计；**没有**预演、没有动作调用。
+    // 序列：发现 → 策略 → 计划级审计 → 公告板（登录 + 推卡带步骤摘要）。
+    // **没有**预演、没有动作调用；步骤级 dispatched 由宿主在签票时写，这里也不该有。
     assert.deepEqual(host.sequence(), [
       'GET /tenon/modules',
       'POST /tenon/policies:evaluate',
       'POST /tenon/audit',
+      'POST /tenon/session',
+      'POST /tenon/pending',
     ]);
 
     // 盘上真的有一条待批，且 I7 第三步已回写。
@@ -364,31 +377,47 @@ test('3c. 有资格 + allowed-once：当场批准后按原计划执行，审计�
     assert.equal(approval.calls[0]!['toolName'], 'tenon_action');
     assert.match(String(approval.calls[0]!['reason']), /role:warehouse_manager/);
 
-    // 序列：计划级 dispatched → 预演 → step dispatched → 动作 → step result → 计划级 result。
+    // 序列：计划级 dispatched → 公告板（带步骤摘要，供签票比对）→ 预演 → 签票 → 动作 → step result → 计划级 result。
     assert.deepEqual(host.sequence(), [
       'GET /tenon/modules',
       'POST /tenon/policies:evaluate',
       'POST /tenon/audit',
+      'POST /tenon/session',
+      'POST /tenon/pending',
       'POST /tenon/actions/inventory.DeductStock:dry-run',
-      'POST /tenon/audit',
+      'POST /tenon/tickets:issue',
       'POST /tenon/actions/inventory.DeductStock',
       'POST /tenon/audit',
       'POST /tenon/audit',
+      'POST /tenon/pending',
+    ]);
+
+    // 卡片上的 steps 是签票的审批依据：宿主第一次看到时冻结，之后逐条比对。
+    const cards = host.bodies('/tenon/pending') as Array<Record<string, unknown>>;
+    const awaiting = cards.find((card) => card['state'] === 'awaiting_approval');
+    assert.ok(awaiting, '应推过一张 awaiting_approval 卡片');
+    assert.deepEqual(awaiting!['steps'], [
+      {
+        stepId: 's1',
+        action: 'inventory.DeductStock',
+        argsHash: digestOf('{"qty":12,"sku":"STD-1001"}'),
+      },
     ]);
 
     const audits = host.bodies('/tenon/audit') as Array<Record<string, unknown>>;
     assert.deepEqual(
       audits.map((record) => `${record['stage']}/${String(record['stepId'])}`),
-      ['dispatched/null', 'dispatched/s1', 'result/s1', 'result/null'],
+      ['dispatched/null', 'result/s1', 'result/null'],
     );
-    // step 级两段都写了同一个审批人。
+    // step 级 result 与计划级 result 都带真实审批人。
     for (const record of [audits[1]!, audits[2]!]) {
       assert.equal((record['decision'] as Record<string, unknown>)['outcome'], 'approve');
       assert.equal((record['decision'] as Record<string, unknown>)['approvedBy'], 'user:alice');
     }
-    // 计划级 result 也带审批人，且与挂起时的 dispatched 共用 auditId。
-    assert.equal((audits[3]!['decision'] as Record<string, unknown>)['approvedBy'], 'user:alice');
-    assert.equal(audits[3]!['auditId'], audits[0]!['auditId']);
+    // 步骤级 result 接在宿主签票时写的 dispatched 后面（同一个 auditId）。
+    assert.equal(audits[1]!['auditId'], 'aud_ticket_1');
+    // 计划级 result 与挂起时的 dispatched 共用 auditId。
+    assert.equal(audits[2]!['auditId'], audits[0]!['auditId']);
 
     // 幂等键与挂起时一致（`tenon:<planId>/s1`），因此重复续跑会被模块幂等挡住。
     const actionRequest = host.requests.find((request) => request.path === '/tenon/actions/inventory.DeductStock');
@@ -434,11 +463,13 @@ test('3d. 有资格但人拒了：不执行，待批仍在（可换人续跑）'
     assert.equal(outcome.status, 'needs_approval');
     assert.match(outcome.detail, /rejected/);
     assert.match(outcome.detail, /未执行/);
-    // 拒批不能变成执行：只有计划级审计那一次，没有预演与动作。
+    // 拒批不能变成执行：计划级审计 + 公告板（登录/推卡），没有预演、没有动作、没有签票。
     assert.deepEqual(host.sequence(), [
       'GET /tenon/modules',
       'POST /tenon/policies:evaluate',
       'POST /tenon/audit',
+      'POST /tenon/session',
+      'POST /tenon/pending',
     ]);
     assert.ok(loadPending(stateDir, outcome.planId) !== null, '拒批之后待批必须还在，等换人处理');
   } finally {
@@ -476,7 +507,7 @@ test('3e. approvers 为空：拒绝挂起（不制造一张谁都批不掉的卡
   }
 });
 
-test('4. I7：dispatched 审计写失败 → 绝不执行 action', async () => {
+test('4. 签票失败（宿主审计写不进去）→ 绝不执行 action', async () => {
   const handler: FakeHandler = (request, origin) => {
     switch (`${request.method} ${request.path}`) {
       case 'GET /tenon/modules':
@@ -485,9 +516,10 @@ test('4. I7：dispatched 审计写失败 → 绝不执行 action', async () => {
         return { status: 200, body: { outcome: 'auto', decidedBy: ['pol-auto'], reasons: [] } };
       case 'POST /tenon/actions/inventory.DeductStock:dry-run':
         return { status: 200, body: { dryRun: { status: 'ok' } } };
-      case 'POST /tenon/audit':
+      case 'POST /tenon/tickets:issue':
+        // 宿主在签票前写 dispatched；写不进去就不签票（P0-1 的「没有记录就没有执行」）。
         return {
-          status: 500,
+          status: 503,
           body: {
             tenonError: {
               class: 'retryable',
@@ -509,25 +541,26 @@ test('4. I7：dispatched 审计写失败 → 绝不执行 action', async () => {
       runAction({ config: config(host.origin), module: 'inventory', action: 'DeductStock', args: ARGS }),
     );
     assert.equal(error.code, 'AUDIT_WRITE_FAILED');
-    assert.match(error.message, /未执行任何动作/);
-    // 关键断言：序列里没有执行请求。审计没落盘，副作用就不许发生。
+    assert.equal(error.retryable, true);
+    // 关键断言：序列里没有执行请求。票没签出来，副作用就不许发生。
     assert.deepEqual(host.sequence(), [
       'GET /tenon/modules',
       'POST /tenon/policies:evaluate',
       'POST /tenon/actions/inventory.DeductStock:dry-run',
-      'POST /tenon/audit',
+      'POST /tenon/session',
+      'POST /tenon/tickets:issue',
     ]);
     assert.equal(
       host.sequence().filter((entry) => entry === 'POST /tenon/actions/inventory.DeductStock').length,
       0,
-      'I7 被违反：审计失败后仍然发出了执行请求',
+      '签票失败后仍然发出了执行请求',
     );
   } finally {
     await host.close();
   }
 });
 
-test('5. 预演失败：不写 dispatched 审计、不执行', async () => {
+test('5. 预演失败：不签票、不执行', async () => {
   const handler: FakeHandler = (request, origin) => {
     switch (`${request.method} ${request.path}`) {
       case 'GET /tenon/modules':
@@ -620,13 +653,12 @@ test('7. 执行失败：result 审计仍写（status=error），错误码取自 
     assert.equal(error.errorClass, 'business_rejection');
 
     const audits = host.bodies('/tenon/audit') as unknown as AuditRecord[];
-    assert.equal(audits.length, 2, '失败路径也必须写 result 段');
-    assert.equal(audits[0]?.stage, 'dispatched');
-    assert.equal(audits[1]?.stage, 'result');
-    assert.equal(audits[0]?.auditId, audits[1]?.auditId);
-    assert.equal(audits[1]?.result.status, 'error');
-    assert.equal(audits[1]?.result.errorClass, 'business_rejection');
-    assert.equal(audits[1]?.result.outputHash, null);
+    assert.equal(audits.length, 1, '失败路径也必须写 result 段（dispatched 由宿主在签票时写）');
+    assert.equal(audits[0]?.stage, 'result');
+    assert.equal(audits[0]?.auditId, 'aud_ticket_1');
+    assert.equal(audits[0]?.result.status, 'error');
+    assert.equal(audits[0]?.result.errorClass, 'business_rejection');
+    assert.equal(audits[0]?.result.outputHash, null);
   } finally {
     await host.close();
   }
