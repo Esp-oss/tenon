@@ -45,6 +45,10 @@ func main() {
 		code, err = runLint(os.Args[2:])
 	case "validate":
 		code, err = runValidate(os.Args[2:])
+	case "keygen":
+		code, err = runKeygen(os.Args[2:])
+	case "reconcile":
+		code, err = runReconcile(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -66,12 +70,15 @@ func usage() {
   tenon d1 run --host <url> --quote <url> --inventory <url> --procurement <url> [选项]
   tenon lint --path <dir>
   tenon validate --schema <name> --instance <file|->  [--spec-dir <dir>]
+  tenon keygen --out <私钥路径> --pub <公钥路径> [--force]
+  tenon reconcile --host-audit <路径> --module <id>=<url> [--module ...] [--json <out>]
 
 子命令：
   conformance  对被测实现跑一致性用例（C1/C2/C3/C8/C9/C10；C4/C5/D1 记 SKIP 并说明原因）
   d1           D1 差异测试：摘掉一个模块后，agent 的规划必须自适应改变并转人工
   lint         C10 反模式扫描（事件/错误码 → action 的硬编码映射）
   validate     用 spec/0.1 的 schema 校验一份 JSON 实例
+  keygen       生成宿主签名密钥对（Ed25519 私钥 + 模块信任集公钥）
 
 退出码：0 成功 / 1 有用例失败 / 2 用法或环境错误（--strict 下 SKIP 也算失败）
 `)

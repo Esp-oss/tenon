@@ -2,27 +2,36 @@
 //
 // 它只回答一个问题：现在有哪些模块、各自在哪、是否参与调度。消费方有四个：
 //
-//   - GET /tenon/modules（管理面）→ List()，看得见全部，含已摘除的；
-//   - agent 的能力发现 → Enabled()，只看得见还在场的模块；
+//   - 注册/心跳端点（POST /tenon/registry/register|heartbeat）→ Upsert / Touch；
+//   - GET /tenon/modules 与 agent 的能力发现 → Enabled()，只看得见「活着且没被人工摘掉」的；
 //   - POST /tenon/admin/modules（仅 TENON_TEST_MODE=1）→ Upsert / SetEnabled；
-//   - cmd/host 启动时的 TENON_MODULES → ParseModules() 后逐个 Upsert。
+//   - cmd/host 的后台清扫循环（每 HeartbeatInterval 一次）→ Sweep，把失联的判成 lost；
+//   - cmd/host 注册的 OnRegistered 钩子 → 模块注册成功后补校验被挂起的业务规则（裁决 ①a）。
 //
 // 设计文档 §3 的 D1 靠「摘除模块」而不是「改 agent」：SetEnabled(id, false) 把条目
 // 留在表里但让它从 Enabled() 里消失，于是同一事件下 agent 能看到的模块不同，而 agent
 // 一行代码都不用动。
 //
-// 两条约束写死在这里：
-//   - 不持久化。M0.5 明确是内存态，进程重启即回到启动配置。
-//   - 并发安全。HTTP 处理与测试并发读写，所有方法共用一把 sync.RWMutex。
+// 注册只有一条路径：模块自己 POST 申报。没有启动配置、没有 static 条目、没有环境变量
+// （D5）——不心跳的模块就是不可见，没有例外。
+//
+// 三条约束写死在这里：
+//   - 不持久化（D6）。进程重启即回到空表，模块在下一个心跳周期内收到 409 重申报后回来。
+//   - 并发安全。HTTP 处理、后台清扫与测试并发读写，所有方法共用一把 sync.RWMutex。
+//   - 事件链只记跃迁。表本身不落盘，但「谁在什么时候注册/失联/被摘除」要留痕：可选的
+//     registrylog 哈希链在每次状态跃迁时写一条，心跳本身不写（见 logEvent）。
 package registry
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
+	"log"
 	"sort"
-	"strings"
 	"sync"
+	"time"
+
+	"tenon.dev/internal/controlplane/registrylog"
 )
 
 // ErrNotFound 表示 SetEnabled 指定的模块从未登记过。
@@ -31,12 +40,38 @@ import (
 // 与「开关写入失败」（不该发生），而不是去匹配错误文本。
 var ErrNotFound = errors.New("registry: 模块未登记")
 
+// 模块存活状态。存活由心跳刷新，人工开关与它正交——两者都满足才可见。
+const (
+	StateAlive = "alive"
+	StateLost  = "lost"
+
+	// HeartbeatInterval 是模块心跳间隔，也是 host 后台清扫循环的节拍。
+	//
+	// host（判定失联）与模块侧（推送心跳）共用这一个常量：两边各写一个 5 * time.Second
+	// 字面量，将来只改一处就会让「几个心跳算过期」的语义悄悄失准。
+	HeartbeatInterval = 5 * time.Second
+
+	// DefaultTTL 是心跳过期时间：3 个心跳周期。
+	//
+	// 允许连丢两次心跳才判 lost：单次丢包、一次 GC 停顿或调度抖动不该让模块从能力
+	// 清单里消失（那会让 agent 的规划凭空少一个模块）；而连丢三次基本就是进程没了。
+	DefaultTTL = 3 * HeartbeatInterval
+)
+
 // ModuleEntry 是注册表里的一行，也是 GET /tenon/modules 的响应元素。
 // 字段标签即线上形状：{"id": ..., "baseURL": ..., "enabled": ...}。
 type ModuleEntry struct {
 	ID      string `json:"id"`
 	BaseURL string `json:"baseURL"`
 	Enabled bool   `json:"enabled"`
+	// State 由心跳决定（alive/lost）；Enabled 由人工决定。两者都满足才参与调度。
+	State string `json:"state"`
+	// DeclarationHash 是模块申报的能力摘要哈希；心跳带它来比对，不一致就要求重申报。
+	DeclarationHash string `json:"declarationHash,omitempty"`
+	// LastSeen 是最后一次心跳时刻（host 单调时钟写入），用于 TTL 清扫。
+	LastSeen time.Time `json:"lastSeen"`
+	// Manifest 是模块申报的完整摘要，供诊断与后续按能力路由。
+	Manifest json.RawMessage `json:"manifest,omitempty"`
 }
 
 // Registry 是并发安全的内存注册表。零值可直接用（内部表惰性初始化），
@@ -44,11 +79,117 @@ type ModuleEntry struct {
 type Registry struct {
 	mu      sync.RWMutex
 	entries map[string]ModuleEntry
+	// Log 是可选的注册事件链。nil 表示不记录（单测与不需要审计面的进程）。
+	//
+	// 字段是导出的，但**必须在并发使用之前**装配好（host 启动期，或直接走
+	// NewRegistryWithLog）；注册表不会为它加第二把锁——跃迁与写事件本来就在同一把
+	// 写锁下串行。
+	Log *registrylog.Log
+	// hookMu 保护 registeredHooks。它与 mu 分开：回调在锁外执行，注册钩子是装配期的
+	// 写、注册请求路径上的读，两件事不该共用一把锁互相拖慢。
+	hookMu sync.Mutex
+	// registeredHooks 是 Upsert 成功后的同步回调（见 OnRegistered）。
+	registeredHooks []func(ModuleEntry)
 }
 
 // NewRegistry 返回一个空注册表。
 func NewRegistry() *Registry {
 	return &Registry{entries: make(map[string]ModuleEntry)}
+}
+
+// NewRegistryWithLog 返回一个把注册事件写进 path 的注册表——host 的接线入口。
+//
+// 为什么由注册表自己开日志，而不是让装配方先 Open 再塞进来：注册表是唯一知道「什么算
+// 跃迁」的地方，日志跟它一起构造就不会出现「表在跳、日志没人接」的静默状态（spec D7 对
+// 「静默不可用」零容忍）。打开失败必须让它失败：宁可起不来，也不要在没有事件链的情况下
+// 跑起来冒充有审计面。
+//
+// 返回的 *Registry 持有文件句柄，进程退出前应调用 Close。
+func NewRegistryWithLog(path string) (*Registry, error) {
+	l, err := registrylog.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	r := NewRegistry()
+	r.Log = l
+	return r, nil
+}
+
+// Close 关闭事件链文件；没接日志时是空操作。表本身不落盘，关掉之后注册/心跳照常工作，
+// 只是不再有事件记录。
+func (r *Registry) Close() error {
+	if r.Log == nil {
+		return nil
+	}
+	return r.Log.Close()
+}
+
+// logEvent 把一条跃迁写进事件链。调用方必须已持有写锁。
+//
+// 在锁内写文件是刻意的：这样日志顺序与跃迁顺序一致，两个并发跃迁不会把事件写反。代价是
+// 跃迁期间写锁被 I/O 占着——但跃迁本来就稀疏（注册一次、失联一次、人工开关一次），而
+// 5s 一次的心跳路径根本不写日志。
+//
+// 写失败只记一行 stderr，不改变方法的返回值：事件链是观测面，注册/心跳的成败由注册表
+// 说了算（spec §7）。链坏了要人去修，不该让模块因此注册不上。
+func (r *Registry) logEvent(ev registrylog.Event) {
+	if r.Log == nil {
+		return
+	}
+	if err := r.Log.Append(ev, time.Now()); err != nil {
+		log.Printf("registry: 写入注册事件失败（%s/%s）：%v", ev.Event, ev.ModuleID, err)
+	}
+}
+
+// LogEvent 写一条**不属于状态跃迁**的注册事件（如 rule-dropped）。
+//
+// 注册表只决定「什么算跃迁」，不认识业务规则；业务规则补校验失败由装配方（cmd/host）
+// 判定后经由这里落链。错误处置与 logEvent 完全一致：写失败只记日志，不改变调用方的
+// 业务处置——事件链是观测面。r 或 r.Log 为 nil 时是安全的空操作。
+func (r *Registry) LogEvent(ev registrylog.Event) {
+	if r == nil {
+		return
+	}
+	r.logEvent(ev)
+}
+
+// OnRegistered 注册一个「模块登记成功后」的同步回调。
+//
+// 用途只有一个：模块注册成功时触发业务规则的补校验（裁决 ①a）。注册表刻意不认识规则
+// 引擎（不 import controlplane/policy、也不 import cmd/host），所以这里留一个通用的钩子，
+// 由装配方注入自己的动作。
+//
+// 三条约定：
+//   - **同步**：Upsert 返回前回调已经跑完。补校验的结果（规则生效/被丢弃）必须早于注册
+//     响应落地，否则模块会先看到 200，而规则还没生效。
+//   - **在写锁之外**：回调里要做 HTTP 拉动作定义（≤5s）。持锁回调会把并发的注册、心跳、
+//     可见性查询全部堵住一个网络往返，那是把观测/派生逻辑的延迟转嫁给所有人。
+//   - **不影响注册结果**：回调 panic 会被吞掉并记日志。注册已经写进表，不能因为一个
+//     观察者写坏而让模块收到 500 去重试。
+func (r *Registry) OnRegistered(fn func(ModuleEntry)) {
+	if fn == nil {
+		return
+	}
+	r.hookMu.Lock()
+	defer r.hookMu.Unlock()
+	r.registeredHooks = append(r.registeredHooks, fn)
+}
+
+// notifyRegistered 依次调用注册钩子。调用方必须**已经**释放 mu。
+func (r *Registry) notifyRegistered(e ModuleEntry) {
+	r.hookMu.Lock()
+	hooks := append([]func(ModuleEntry){}, r.registeredHooks...)
+	r.hookMu.Unlock()
+	for _, fn := range hooks {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("registry: 模块 %q 的注册回调 panic（注册本身已生效）：%v", e.ID, rec)
+				}
+			}()
+			fn(e)
+		}()
+	}
 }
 
 // Upsert 登记一个新模块，或更新已登记模块的地址。
@@ -64,22 +205,58 @@ func NewRegistry() *Registry {
 //
 // 空 ID 被丢弃也同样是有意的：注册表不存无名条目，否则 GET /tenon/modules 会吐
 // 出 id 为空的记录。校验归 HTTP 层（应当回 400），这里只保证表本身干净。
+//
+// 事件链上，这是唯一会「让模块从无到有」的入口：新建记 registered，声明哈希变了记
+// re-registered（spec §7），哈希没变就什么都不记——重复注册不该把日志刷成噪声。
+// 顺带一提，注册本身就是「现在是 alive 的证据」，所以一个 lost 的模块以相同哈希重新注册
+// 只记 recovered，不额外记一条「复活」。
+//
+// 写表之后、**锁外**触发 OnRegistered 钩子（见 notifyRegistered）：钩子要发 HTTP 请求，
+// 不能持锁做 I/O。重复注册同样触发——模块重启后会重申报，补校验要能再跑一次（幂等：
+// 已经生效的规则不在 pending 里，钩子什么都不做）。
 func (r *Registry) Upsert(e ModuleEntry) {
 	if e.ID == "" {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.entries == nil {
 		r.entries = make(map[string]ModuleEntry)
 	}
+	now := time.Now()
+	var stored ModuleEntry
 	if cur, ok := r.entries[e.ID]; ok {
+		kind := ""
+		switch {
+		case cur.DeclarationHash != e.DeclarationHash:
+			kind = registrylog.EventReRegistered
+		case cur.State != "" && cur.State != StateAlive:
+			kind = registrylog.EventRecovered
+		}
 		cur.BaseURL = e.BaseURL
+		// 空哈希表示「这次调用不携带声明」（例如管理面手工 Upsert）：保留已知声明，
+		// 否则 Touch 会因「登记哈希为空」而接受任意哈希，声明校验被静默旁路一个 TTL。
+		if e.DeclarationHash != "" {
+			cur.DeclarationHash = e.DeclarationHash
+			cur.Manifest = e.Manifest
+		}
+		// 注册即视为刚心跳过：否则模块刚起来还要等一个 TTL 才可见。
+		cur.State = StateAlive
+		cur.LastSeen = now
 		r.entries[e.ID] = cur
-		return
+		stored = cur
+		if kind != "" {
+			r.logEvent(registrylog.Event{Event: kind, ModuleID: e.ID, DeclarationHash: cur.DeclarationHash})
+		}
+	} else {
+		e.Enabled = true
+		e.State = StateAlive
+		e.LastSeen = now
+		r.entries[e.ID] = e
+		stored = e
+		r.logEvent(registrylog.Event{Event: registrylog.EventRegistered, ModuleID: e.ID, DeclarationHash: e.DeclarationHash})
 	}
-	e.Enabled = true
-	r.entries[e.ID] = e
+	r.mu.Unlock()
+	r.notifyRegistered(stored)
 }
 
 // SetEnabled 打开或关闭一个已登记模块。
@@ -97,6 +274,12 @@ func (r *Registry) SetEnabled(id string, enabled bool) error {
 	if cur.Enabled != enabled {
 		cur.Enabled = enabled
 		r.entries[id] = cur
+		kind := registrylog.EventManualDisabled
+		if enabled {
+			kind = registrylog.EventManualEnabled
+		}
+		// 只有真的变了才写：重复点两次开关是同一个决策，链上留两条会让人以为发生了两次。
+		r.logEvent(registrylog.Event{Event: kind, ModuleID: id, DeclarationHash: cur.DeclarationHash})
 	}
 	return nil
 }
@@ -129,7 +312,8 @@ func (r *Registry) Enabled() []ModuleEntry {
 func (r *Registry) snapshot(onlyEnabled bool) []ModuleEntry {
 	out := make([]ModuleEntry, 0, len(r.entries))
 	for _, e := range r.entries {
-		if onlyEnabled && !e.Enabled {
+		// 可见 = 人工开着 && 心跳还活着。空 State 视为 alive，兼容未经过 Upsert 的旧条目。
+		if onlyEnabled && (!e.Enabled || (e.State != "" && e.State != StateAlive)) {
 			continue
 		}
 		out = append(out, e)
@@ -138,71 +322,73 @@ func (r *Registry) snapshot(onlyEnabled bool) []ModuleEntry {
 	return out
 }
 
-// ParseModules 解析启动配置 TENON_MODULES 的 id=url,id=url 形式，返回一份待
-// Upsert 的条目（全部 enabled，登记即参与调度）。
+// Touch 记录一次心跳。
 //
-// 容错边界都是刻意选的，宁可少猜也不要猜错：
-//   - 空串、只有逗号和空白 → 无模块，返回空切片且不报错（「没配」是合法状态）；
-//   - 空项（连续逗号、首尾逗号）跳过，不算错误；
-//   - 每项、id、url 三段的两端空白都裁掉，" a = http://x " 等价于 "a=http://x"；
-//   - 地址末尾的单个 '/' 去掉，避免后续拼 /tenon/... 时出现双斜杠；
-//   - 其余一律报错并指明「第几项」与原始文本：缺 '='、id 为空、地址为空/非法/
-//     scheme 不是 http(s)/缺主机名/带查询串或锚点、id 重复。
+// 返回 (true, "") 表示存活已刷新；返回 (false, reason) 表示模块必须先重申报：
+//   - "unknown-module"：host 不认识这个 id（通常是 host 重启后注册表为空）；
+//   - "declaration-changed"：申报的声明哈希与登记的不一致（模块升级了或者发错了）。
 //
-// 最后一条（id 重复）报错而不是后者覆盖前者：配置里同名两次基本是笔误，静默覆盖
-// 只会让排查变成猜谜。要求「部分可用」的调用方应当自己降级，而不是让解析器吞错。
-func ParseModules(s string) ([]ModuleEntry, error) {
-	out := make([]ModuleEntry, 0, strings.Count(s, ",")+1)
-	seen := make(map[string]int, cap(out))
-	for i, item := range strings.Split(s, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		pos := i + 1 // 报错用 1-based 序号，与配置文本里数第几段对齐
-		id, rawURL, ok := strings.Cut(item, "=")
-		if !ok {
-			return nil, fmt.Errorf("TENON_MODULES 第 %d 项 %q 缺少 '='", pos, item)
-		}
-		id = strings.TrimSpace(id)
-		rawURL = strings.TrimSpace(rawURL)
-		if id == "" {
-			return nil, fmt.Errorf("TENON_MODULES 第 %d 项 %q 的模块 id 为空", pos, item)
-		}
-		if first, dup := seen[id]; dup {
-			return nil, fmt.Errorf("TENON_MODULES 第 %d 项 %q 与第 %d 项重复了 id %q", pos, item, first, id)
-		}
-		base, err := parseBaseURL(rawURL)
-		if err != nil {
-			return nil, fmt.Errorf("TENON_MODULES 第 %d 项 %q：%w", pos, item, err)
-		}
-		seen[id] = pos
-		out = append(out, ModuleEntry{ID: id, BaseURL: base, Enabled: true})
+// 注意：Touch 不改变 Enabled——人工摘除是粘性的，心跳救不回来。
+//
+// 事件链上只有 lost → alive 这一次跃迁记 recovered；已经 alive 的心跳成功什么都不写，
+// 否则 3 个模块 × 每 5s 就能把日志刷成几万行，真正的断裂埋在噪声里。
+func (r *Registry) Touch(id, hash string) (bool, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cur, ok := r.entries[id]
+	if !ok {
+		return false, "unknown-module"
 	}
-	return out, nil
+	if cur.DeclarationHash != "" && hash != cur.DeclarationHash {
+		return false, "declaration-changed"
+	}
+	wasLost := cur.State != "" && cur.State != StateAlive
+	cur.State = StateAlive
+	cur.LastSeen = time.Now()
+	r.entries[id] = cur
+	if wasLost {
+		r.logEvent(registrylog.Event{Event: registrylog.EventRecovered, ModuleID: id, DeclarationHash: cur.DeclarationHash})
+	}
+	return true, ""
 }
 
-// parseBaseURL 校验并规范化一个模块基地址。
+// Sweep 把超过 TTL 没心跳的模块标记为 lost，返回被标记的 id（按字典序）。
+// 只改存活状态，不动 Enabled——人工开关的语义不受 TTL 影响。
 //
-// 只接受 http/https：模块是进程间 HTTP 调用，别的 scheme 一定是用错了。
-// 允许带路径前缀（网关部署时模块挂在 /inventory 下），但不允许查询串或锚点——
-// 基地址随后要往上拼 /tenon/actions/... ，带这类尾巴拼出来必然是错的。
-func parseBaseURL(raw string) (string, error) {
-	if raw == "" {
-		return "", errors.New("模块地址为空")
+// 每个转 lost 的模块写一条事件；已经是 lost 的跳过，所以清扫循环每 5s 跑一次也不会
+// 重复记同一次失联。
+func (r *Registry) Sweep(now time.Time) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var lost []string
+	for id, e := range r.entries {
+		if e.State == StateLost {
+			continue
+		}
+		if e.LastSeen.IsZero() || now.Sub(e.LastSeen) > DefaultTTL {
+			e.State = StateLost
+			r.entries[id] = e
+			lost = append(lost, id)
+		}
 	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", fmt.Errorf("模块地址 %q 不是合法 URL：%w", raw, err)
+	sort.Strings(lost)
+	// 排序之后才写事件：map 遍历顺序随机，日志顺序也该稳定，否则同样的状态两次清扫会
+	// 写出顺序不同的链（链本身仍然有效，但人没法比对）。
+	for _, id := range lost {
+		r.logEvent(registrylog.Event{Event: registrylog.EventLost, ModuleID: id, DeclarationHash: r.entries[id].DeclarationHash})
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("模块地址 %q 的 scheme 必须是 http 或 https", raw)
+	return lost
+}
+
+// DebugSetLastSeen 只给测试用：把 LastSeen 拨到指定时刻，便于断言 TTL 行为。
+// 生产代码不该调用它——时间只能由心跳写入。
+func (r *Registry) DebugSetLastSeen(id string, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cur, ok := r.entries[id]
+	if !ok {
+		return
 	}
-	if u.Host == "" {
-		return "", fmt.Errorf("模块地址 %q 缺少主机名", raw)
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("模块地址 %q 不应带查询串或锚点", raw)
-	}
-	return strings.TrimSuffix(u.String(), "/"), nil
+	cur.LastSeen = at
+	r.entries[id] = cur
 }

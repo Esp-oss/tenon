@@ -205,6 +205,59 @@ func TestRunAgainstCompliantFakeModule(t *testing.T) {
 	t.Logf("pass=%d fail=%d skip=%d", pass, fail, skip)
 }
 
+// 票据强制（enforce）下，写路径的 C2/C3/C9 必须判 SKIP，而不是「两次 403 一致 → PASS」。
+//
+// 假模块故意在收到请求时直接 500：如果 runner 还敢发请求，这条用例会同时暴露两件事——
+// 它没识别出 enforce，也没意识到自己手里没有票。
+func TestTicketEnforcedWriteChecksSkipInsteadOfFalsePass(t *testing.T) {
+	m := &Manifest{
+		Capabilities: []string{"ticket"},
+		Actions:      []ActionSummary{{ID: "fakeinv.DeductStock", Kind: "write"}},
+	}
+	fix := &ModuleFixture{Module: "fakeinv", Invocations: []Invocation{
+		{
+			Name: "deduct-ok", Action: "fakeinv.DeductStock",
+			Args:   json.RawMessage(`{"sku":"S1","qty":1,"referenceNo":"R1"}`),
+			Expect: Expectation{Status: 200, Idempotent: true, UnknownKey: true},
+		},
+		{
+			Name: "deduct-too-much", Action: "fakeinv.DeductStock",
+			Args: json.RawMessage(`{"sku":"S1","qty":999,"referenceNo":"R2"}`),
+			Expect: Expectation{
+				Status: 422, ErrorClass: "business_rejection", ErrorCode: "STOCK_INSUFFICIENT",
+			},
+		},
+	}}
+
+	hit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	client := srv.Client()
+	results := checkIdempotency(ctx, client, srv.URL, m, fix)
+	results = append(results, checkUnknownField(ctx, client, srv.URL, m, fix)...)
+	results = append(results, checkErrorClass(ctx, client, srv.URL, m, fix)...)
+
+	if len(results) != 3 {
+		t.Fatalf("期望 C2/C3/C9 各一条，实际 %d 条：%+v", len(results), results)
+	}
+	for _, r := range results {
+		if r.Status != Skip {
+			t.Errorf("%s 在 enforce 下应判 SKIP（不持私钥），实际 %q：%s", r.Case, r.Status, r.Detail)
+		}
+		if !strings.Contains(r.Detail, "warn") {
+			t.Errorf("%s 的 SKIP 说明要指出该在哪跑（warn 实例）：%s", r.Case, r.Detail)
+		}
+	}
+	if hit {
+		t.Fatalf("判 SKIP 之前不该发任何请求（无票的写请求会白撞一次闸门）")
+	}
+}
+
 // 反向用例：manifest 摘要里塞 inputSchema 必须判 C1 FAIL——
 // 这正是「按需拉取、控上下文」被破坏时的可观测信号。
 func TestC1FailsWhenManifestLeaksInputSchema(t *testing.T) {

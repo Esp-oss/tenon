@@ -43,6 +43,8 @@ func TestMain(m *testing.M) {
 	}
 	_ = os.Setenv(module.EnvAuditPath, filepath.Join(dir, "audit.jsonl"))
 	_ = os.Setenv(module.EnvHMACSecretFile, filepath.Join(dir, "absent-secret.txt"))
+	// 本包测的是报价业务逻辑，不是票据；票据强制由 internal/module 的用例判定。
+	_ = os.Setenv(module.EnvTicketMode, module.TicketModeWarn)
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -558,14 +560,15 @@ func TestManifestSummariesOmitInputSchema(t *testing.T) {
 	if mf.Module.ID != moduleID || mf.Module.Version != moduleVersion || mf.Module.Title == "" {
 		t.Fatalf("module 摘要不对：%+v", mf.Module)
 	}
-	if len(mf.Actions) != 2 {
-		t.Fatalf("动作摘要应有 2 条，得到 %d：%s", len(mf.Actions), raw)
+	// 三条：建单、按单号查、全量列表（列表是业务页面要的只读能力）。
+	if len(mf.Actions) != 3 {
+		t.Fatalf("动作摘要应有 3 条，得到 %d：%s", len(mf.Actions), raw)
 	}
 
 	// 摘要字段集合：六个必填字段之外，summaryTemplate 可选（0.2.0 加的字段）。
 	// 多出别的字段就是 manifest 与 schema 不一致；少了必填字段同理。
 	requiredKeys := []string{"id", "version", "title", "kind", "risk", "dryRun"}
-	optionalKeys := map[string]bool{"summaryTemplate": true}
+	optionalKeys := map[string]bool{"summaryTemplate": true, "requiredArgs": true}
 	kinds := make(map[string]string, len(mf.Actions))
 	for _, summary := range mf.Actions {
 		for _, k := range requiredKeys {
@@ -679,6 +682,7 @@ func assertTemplateArgs(t *testing.T, a module.Action) {
 	}
 	var schema struct {
 		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
 	}
 	if err := json.Unmarshal(a.InputSchema, &schema); err != nil {
 		t.Fatalf("%s 的 inputSchema 读不出：%v", a.ID, err)
@@ -686,6 +690,22 @@ func assertTemplateArgs(t *testing.T, a module.Action) {
 	for _, name := range module.TemplatePlaceholders(a.SummaryTemplate) {
 		if _, ok := schema.Properties[name]; !ok {
 			t.Fatalf("%s 的模板占位符 {%s} 不在 inputSchema.properties 里", a.ID, name)
+		}
+	}
+	// 必填字段：规划期写 args 的唯一依据，必须真的来自 inputSchema.required。
+	if len(a.RequiredArgs) == 0 {
+		t.Fatalf("%s 没声明 requiredArgs（规划期无法保证 args 完整）", a.ID)
+	}
+	for _, name := range a.RequiredArgs {
+		found := false
+		for _, r := range schema.Required {
+			if r == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s 的 requiredArgs 含 %q，但它不在 inputSchema.required 里", a.ID, name)
 		}
 	}
 }

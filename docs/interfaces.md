@@ -65,6 +65,8 @@ flowchart LR
 
 本仓库早先的一处不一致已消除：`tools/lint` 与 `conformance/` 都只做协议与工具职责，运维接口不进它们的断言。
 
+`POST /tenon/registry/register` 与 `POST /tenon/registry/heartbeat`（§4.4.2）属**协议接口**，并且是 R1 新增的**写入口**：它们带 HMAC 鉴权，未配置密钥时宿主拒绝启动。它们与测试面 `/tenon/admin/modules` 不是一回事——后者只在 `TENON_TEST_MODE=1` 挂载，用于人工开关与全量视图，不进协议。
+
 ---
 
 ## 3. 模块侧接口（每个模块容器实现这 6 个）
@@ -86,7 +88,8 @@ flowchart LR
 | `Tenon-Version: 0.1` | 双向 | 写操作 ✅ | 写路径缺头即 400（见 §3.7）；只读/预演/事件缺头按 0.1 宽松处理 |
 | `Tenon-Min-Version` | 双向 | 可选 | 低于此版本宁可失败，也不要静默降级 |
 | `Idempotency-Key` | 请求 | 写操作 ✅ | 同一键重复提交必须返回**首次结果**，绝不产生重复副作用 |
-| `X-Tenon-Grant` | 请求 | 写操作 ✅ | 授权凭证；规范要求模块**再校验一次**，M0.5 只承认不校验（§9 缺口 3） |
+| `X-Tenon-Grant` | 请求 | 写操作 ✅ | 0.1 的授权凭证；模块只承认不校验（§9 缺口 3）。**0.2.0 起由 `Tenon-Ticket` 取代** |
+| `Tenon-Ticket` | 请求 | 写操作 ✅（0.2.0） | 宿主签发的 Ed25519 执行票据，`v1.<payload>.<sig>`；模块持公钥验签，无票即 403。载荷见 `spec/0.1/schemas/ticket.schema.json`，有效期 ≤60 秒 |
 | `X-Tenon-Signature` | 请求 | 事件投递 ✅ | `t=<unix>,v1=<hex>`，见 §3.4 |
 
 ### 3.2 执行与幂等
@@ -94,7 +97,7 @@ flowchart LR
 ```
 POST /tenon/actions/inventory.DeductStock
 Idempotency-Key: tenon:pln_01JB.../s2
-X-Tenon-Grant: gr-01J...
+Tenon-Ticket: v1.eyJ2IjoxLCJ0aWQiOiJ0a3RfMDAwMSIsImtpZCI6...
 Tenon-Version: 0.1
 Content-Type: application/json
 
@@ -136,7 +139,7 @@ POST /tenon/actions/inventory.DeductStock:dry-run
 |---|---|---|
 | 动作不支持预演（未声明 `dryRun.supported`） | **404 空体**（无错误信封） | 按 `unsupported` 处理并**强制审批**（fail-closed，见 §10） |
 | 动作 id 不存在 | 404 + `tenonError(UNKNOWN_ACTION)` | 同上，不得当作放行 |
-| 预演成功但结论不是 `verified`（`unsafe`/`pending`） | 200 + 该结论 | 强制审批；**只有 `verified` 允许自动执行** |
+| 预演成功但结论不是 `verified`（`unsafe`/`pending`） | 200 + 该结论 | 不自动执行；**只有 `verified` 允许自动执行**。`unsafe` 可带裁决有界重规划，`pending` 直接转人工（§10） |
 
 一句话：**404 不等于免检。** 把 404 读成「没有预演就放行」，等于让供应商删掉端点即可绕过预演。
 
@@ -184,6 +187,8 @@ GET /tenon/events?direction=out&since=<cursor>&limit=100
 
 也就是说 `openssl rand -hex 32` 产出的 64 字符文本，整体作为 key 使用（不是把它解成 32 字节）。这是**跨实现的隐性约定**；将来若要改成解码 hex，必须同时升级 `Tenon-Version` 并在 `versioning.md` 里写明迁移。
 
+宿主的注册/心跳验签（§4.4.2）用的是同一份文件与同一条取材口径，另加两条容错：允许 UTF-8 BOM（PowerShell 的 UTF-8 编码会写 BOM，留着会让 key 开头多三个字节，症状是「两边明明同一个值却验签失败」）、允许行尾换行与首尾空白；**不允许多行**——那说明文件里混进了别的东西（注释、说明、第二个密钥），替调用方猜哪一行是密钥比直接报错危险。
+
 ### 3.7 版本头的处理分档
 
 `versioning.md` §4.3 写「缺版本视为 0.1」，而 §3.1 的表格要求写操作必须带 `Tenon-Version`。M0.5 的实际取值是按**是否有副作用**分档：
@@ -202,7 +207,7 @@ GET /tenon/events?direction=out&since=<cursor>&limit=100
 
 ---
 
-## 4. 宿主侧接口（`host` 容器实现这 14 个）
+## 4. 宿主侧接口（`host` 容器实现这 16 个）
 
 | # | 方法 | 路径 | 语义 | 调用方 |
 |---|---|---|---|---|
@@ -210,7 +215,7 @@ GET /tenon/events?direction=out&since=<cursor>&limit=100
 | 2 | `POST` | `/tenon/grants:evaluate` | 授权评估（G3 闸门） | agent / 诊断 |
 | 3 | `POST` | `/tenon/audit` | **写审计**（两段写的写入口），200 表示已落盘 | agent |
 | 4 | `GET` | `/tenon/audit?planId=&since=&limit=` | 审计查询（支撑 C4） | agent / 运维 / 外部审计方 |
-| 5 | `GET` | `/tenon/modules` | 注册表读取（**管理面视图**，§4.4） | agent |
+| 5 | `GET` | `/tenon/modules` | 注册表读取（**可见视图**：`enabled && alive`，§4.4） | agent |
 | 6 | `POST` | `/tenon/intents` | 共驾帧入队（出站：agent → 界面） | 共驾前端 / agent |
 | 7 | `GET` | `/tenon/intents/poll?after=` | 回放未确认的帧 | 无 WS 的客户端 |
 | 8 | `POST` | `/tenon/intents/ack` | 确认到某个序号，此后不再回放 | 无 WS 的客户端 |
@@ -220,8 +225,10 @@ GET /tenon/events?direction=out&since=<cursor>&limit=100
 | 12 | `POST` | `/tenon/requests/ack` | 确认入站游标，此后不再回放 | agent |
 | 13 | `POST` | `/tenon/pending` | 待批公告板上推（幂等 upsert，§4.7） | agent |
 | 14 | `GET` | `/tenon/pending` | 待批公告板读取（只读 read-model） | 共驾前端 |
+| 15 | `POST` | `/tenon/registry/register` | **模块自注册**（HMAC 验签 + 声明哈希校验，§4.4.2） | 模块 |
+| 16 | `POST` | `/tenon/registry/heartbeat` | 模块心跳（HMAC 验签；不相符回 409 要求重申报，§4.4.2） | 模块 |
 
-另有测试面 `POST /tenon/admin/modules`（仅 `TENON_TEST_MODE=1`，见 §7）。
+另有测试面（仅 `TENON_TEST_MODE=1`，见 §7）：`POST`/`GET /tenon/admin/modules`（注册表全量视图与人工开关）。
 
 另有同源静态页，**不在协议面**（不参与 `Tenon-Version` 协商、不进 §5 调用矩阵、不要求 token）：`GET /`（页面本体）与 `GET /ui/…`（页面引用的资源）。未配置 `TENON_UI_DIR`、或该目录不可用 → **503** 并写明原因（「页面没配」是可诊断的部署问题，伪装成 404 会让运维去查路由，查错方向）；已配置的目录里确实没有该文件 → 404；非 `GET`/`HEAD` → 405。P1 只做路由与目录，页面内容属 P3。
 
@@ -271,6 +278,24 @@ POST /tenon/policies:evaluate
 - 求值出错（规则配置坏、`action` 不是 `<module>.<Action>` 词法）→ 200 + `deny` + `POLICY_EVALUATION_FAILED`（与「策略拒绝」「无命中」区分开，排障时不会把配置错误看成业务判定）。
 - 策略本身不可被 agent 读取或改写，只能请求评估。
 
+### 4.2.1 签发执行票据（P0-1）
+
+```
+POST /tenon/tickets:issue          Authorization: Bearer <agent token（role:agent）>
+{ "planId": "pln_01J...", "stepId": "s2", "action": "inventory.DeductStock",
+  "args": {...}, "agent": "ag_fulfillment", "onBehalfOf": "user:alice" }
+→ 200 { "ticket": "v1...", "auditId": "aud_01J...", "exp": 1793400030 }
+```
+
+宿主按序做三件事，任一步失败都不签票：
+
+1. **策略**：`deny` → 403 `POLICY_DENIED`；`approve` → 403 `APPROVAL_REQUIRED`（批准证据未落地前不签）。
+2. **授权**：拒绝 → 403 `GRANT_DENIED`；**配额在这里扣一次**，调用方的预检应传 `charge:false`。
+3. **审计前置**：先写 `stage=dispatched`，写失败 → 503 `AUDIT_WRITE_FAILED`。
+
+签出的票绑定 `mod/act/ah（原始请求体摘要）/idem/pid/sid/aud/by/gid/iat/exp`，有效期 ≤60 秒。
+缺 bearer → 401 `AUTH_REQUIRED`；宿主没配签名私钥 → 503 `TICKET_SIGNING_DISABLED`（不降级为无票执行）。
+
 ### 4.3 审计：写与查
 
 **写**（两段写的唯一写入口）：
@@ -283,6 +308,7 @@ POST /tenon/audit
 
 - **200 表示这条记录已经落盘（fsync 之后才应答）。** 非 2xx 时调用方**必须拒绝执行下游调用**：一次没有 `dispatched` 的写是不允许发生的。
 - 必填：`auditId`；`stage` 只能是 `dispatched` 或 `result`（其它值 → 400 `INVALID_AUDIT_STAGE`）。
+- **步骤级 `dispatched`（`stepId` 非空）自 0.2.0 起只能由宿主在签发票据时写入**：调用方再写 → 403 `AUDIT_STAGE_FORBIDDEN`。计划级 `dispatched`（`stepId` 为空）仍由 agent 在挂起时写，用于批准—续跑链路。
 - `hash` / `prevHash` 由宿主计算并**无条件覆盖**调用方给的值：链的唯一权威是宿主的审计存储。
 - 宿主**不做 schema 完整性校验**（见 §9 缺口 6）：字段缺失会照原样落盘，`hash` 覆盖的是「你给的内容」。
 - 落盘失败 → 503 `AUDIT_WRITE_FAILED`（不是「这次没记上」，而是「审计链已不可用」）。
@@ -298,22 +324,98 @@ GET /tenon/audit?planId=pln_01JB...&since=<int>&limit=100
 - `since` 是**写入顺序的 0 基序号**，不是过滤后的序号（只有它在 append-only 日志上稳定）；`nextCursor` 给出下一页应当传入的 `since`。
 - `limit` 缺省 100、上限 500；`since` 不是非负整数 → 400 `INVALID_CURSOR`。
 
-### 4.4 注册表：`GET /tenon/modules` 返回的是管理面视图
+### 4.4 注册表：`GET /tenon/modules` 返回的是**可见视图**
 
 ```
 GET /tenon/modules
-→ 200 { "modules": [ { "id": "inventory", "baseURL": "http://inventory:8081", "enabled": true },
-                     { "id": "procurement", "baseURL": "http://procurement:8082", "enabled": false } ] }
+→ 200 { "modules": [ { "id": "inventory", "baseURL": "http://127.0.0.1:8081",
+                       "enabled": true, "state": "alive",
+                       "declarationHash": "sha256:…",
+                       "lastSeen": "2026-10-27T09:15:00.1234567+08:00" },
+                     { "id": "quote", "baseURL": "http://127.0.0.1:8083", "enabled": true,
+                       "state": "alive", "declarationHash": "sha256:…", "lastSeen": "…" } ] }
 ```
 
 **契约含义（必须照着用）：**
 
-1. **响应含 `enabled:false` 的条目。** 这是管理面视图，不是「可用模块清单」。
-2. **调用方必须自己按 `enabled` 过滤**，再做能力发现。宿主不替调用方裁剪视野——否则「这个模块被摘除了」在审计与排障里不可见，差异测试也就无法解释自己为什么换了路径。
+1. **只含可见条目：`enabled == true` **且** `state == "alive"`。** 被人工摘掉的模块、心跳停了超过 TTL（15s）的模块都不在响应里。响应里因此**不会**出现 `enabled:false` 的条目。
+2. **没有 static 例外。** R1 删除了 `TENON_MODULES`：不存在「启动时登记就能被看见」的路径。不心跳的模块就是不可见——这是 `enabled && alive` 的原文含义，也是 agent 视野的唯一定义。
 3. 条目按 `id` 字典序返回；空注册表返回 `[]` 而不是 `null`。
-4. 注册表在 M0.5 是**纯内存态**：进程重启即回到启动配置（`TENON_MODULES` + 测试面的增删）。
+4. 注册表**纯内存**（D6）：宿主重启即回到空表，模块在 ≤1 个心跳周期内收到 `409` 并重申报后回场（§4.4.2）。这期间存在最多一个心跳周期（≤5s）的「不可见窗口」——验收口径显式断言它存在且不超过 5s。
+5. 调用方仍可再按 `enabled` 过滤一次（旧宿主兼容），但新宿主永远不会吐 `enabled:false`。
 
-把「管理面视图」当成「可用清单」的后果是可测的：差异测试的 B 轮会看见被摘除的模块，于是行为不变，而「行为不变」正是硬编码映射的特征。
+### 4.4.1 两个视图的分工：可见 vs 全量
+
+**要看全量（含 disabled / lost）走测试面** `GET /tenon/admin/modules`（仅 `TENON_TEST_MODE=1`，§7）。两个视图不能合并：在可见视图里「被人工摘除」与「从未登记」无法区分，而 D1 的 B 轮要断言的正是「条目还在、只是不可见」。
+
+| 端点 | 挂载 | 内容 | 谁用 |
+|---|---|---|---|
+| `GET /tenon/modules` | 始终 | `registry.Enabled()`：`enabled && alive` | agent 的能力发现 |
+| `GET /tenon/admin/modules` | 仅 `TENON_TEST_MODE=1` | `registry.List()`：全量，含 `enabled:false` 与 `state:"lost"` | 运维 / 差异测试 / 排障 |
+
+### 4.4.2 模块注册与心跳（全 push）
+
+模块**启动即注册**，之后每 `registry.HeartbeatInterval`（5s）心跳一次。宿主不做主动探活（D1）：失效判定单点在 TTL 清扫里。模块地址由模块自报（`baseURL` 从监听地址折出，通配地址折成 `127.0.0.1`）。
+
+**注册：**
+
+```
+POST /tenon/registry/register
+X-Tenon-Signature: t=<unix>,v1=<hex>
+Content-Type: application/json
+
+{
+  "module": { "id": "inventory", "baseURL": "http://127.0.0.1:8081",
+              "manifest": { …与 GET /.well-known/tenon 同形的能力摘要… } },
+  "declarationHash": "sha256:<64 hex>"
+}
+→ 200 { "accepted": true, "ttlSec": 15 }
+→ 401 签名缺失 / 格式错 / 超 ±300s / 不匹配（理由区分 format / expired / invalid）
+→ 409 { "reRegister": true, "reason": "declaration-mismatch" }   # declarationHash 与 manifest 不是同一份
+```
+
+`declarationHash = "sha256:" + hex(sha256(JCS(manifest)))`。JCS 规范化与审计哈希链**同一份实现**（`internal/protocol.CanonicalJSON`，RFC 8785）——两侧各写一份必然分叉，而其表现是模块永远注册不上（409 declaration-mismatch）。
+
+**心跳：**
+
+```
+POST /tenon/registry/heartbeat
+X-Tenon-Signature: t=<unix>,v1=<hex>
+
+{ "moduleId": "inventory", "declarationHash": "sha256:<64 hex>" }
+→ 200 { "alive": true }
+→ 409 { "reRegister": true, "reason": "unknown-module" | "declaration-changed" }
+→ 401 签名问题
+```
+
+十条必须一起成立，缺一条就有洞：
+
+- 心跳**只**带 `moduleId` 与哈希：完整声明在注册时已经给过，心跳只需回答「还是那一份吗」。省流量，又不出现「心跳到了但声明是旧的」而无人察觉。
+- `409` 不是 `200 + reRegister`：「必须重申报」是契约冲突，不是正常回执。用 200 会把对端重试逻辑引到错误分支。
+- `409` **不改变存活状态**：它表示「你该重新申报」，不是判死。把 409 当死亡会让模块升级期间从 agent 视野里凭空消失。
+- 注册**不改变人工状态**（D2 粘性）：对一个 `disabled` 的模块重新注册只刷新声明与存活状态，仍保持 `disabled`；心跳成功也同样救不回来。
+- 同一 `moduleId` 的 `baseURL` 变化视为**新声明**（哈希变），走重申报路径。
+- 签名覆盖 `"<t>." + 原始请求体`，容差 **±300s**（与 `internal/protocol.SignatureTolerance` 一致）。请求体必须先序列化再签名再原样发送——先反序列化再序列化会得到另一串字节（键序/浮点/空白都变）。
+- 缺密钥时**宿主拒绝启动**（D7，非 0 退出并点名 `TENON_HMAC_SECRET_FILE`），不是「不挂端点」：静默不可用会让运维以为注册在工作、实际模块永远上不了线。
+- 状态机：存活 `alive`/`lost` 由心跳 TTL（15s = 3×5s）决定；人工 `enabled`/`disabled` 由运维决定且粘性。两者都满足才可见。
+- **注册失败不阻塞模块启动**：模块的业务端点照常提供，fail-closed 在宿主侧（看不见就不派回合）。
+- 「模块不主动调宿主」这条旧表述到此为止：`register`/`heartbeat` 是模块 → 宿主的**推送**（§5 已更新）。
+
+### 4.4.3 注册事件链（`TENON_REGISTRY_EVENTS`）
+
+宿主设了 `TENON_REGISTRY_EVENTS` 就把注册**跃迁**追加进一条独立哈希链（append-only，每行一条 JSON）：
+
+```json
+{"at":"2026-10-27T09:15:00.1234567+08:00","event":"registered","moduleId":"inventory",
+ "declarationHash":"sha256:…","prevHash":null,"hash":"sha256:…"}
+```
+
+- `hash = "sha256:" + hex(sha256(JCS(记录去掉 hash 字段)))`，`prevHash` 指向上一条、链首为 `null`；篡改任一行即链断（用例与验收脚本都断言这一点）。
+- 事件类型：`registered`（首次登记）/ `re-registered`（声明哈希变）/ `lost`（TTL 过期）/ `recovered`（lost → alive）/ `manual-disabled` / `manual-enabled` / `rule-dropped`（业务规则补校验失败被丢弃）。
+- **只在跃迁时写**：心跳成功但状态未变不写，否则 5s 一次的心跳会把链刷成噪声，真正的断裂埋在噪声里。
+- **不进业务审计**（D4）：`audit-event.schema.json` 根的 15 个必填字段（`planId`/`stepId`/`action`/`inputHash`/`idempotencyKey`…）与模块生命周期无关，硬塞等于造假数据。
+- 写失败**不改变**注册/心跳结果（事件链是观测面）；但**配了路径却打不开时宿主拒绝启动**——「以为在记、实际没记」比没有更糟。
+- 链可脱离本仓独立复算：`scripts/verify-registration.ps1` 只用 JCS + SHA-256 复算，不调用 `registrylog.Verify`（用被测代码验被测代码会同错同过）。
 
 ### 4.5 共驾三帧（REST 降级通道）
 
@@ -384,11 +486,26 @@ POST /tenon/session
 
 **`durable` 的含义**：`POST /tenon/requests` 回 `{ok, seq, durable}`。`durable:false` 表示这帧**只进了内存、没落盘**（重启会丢），同时宿主日志打一条告警。**这种情况下仍回 200，不回 500**：500 会诱导客户端重试，而 `requestId`/`syntheticEventId` 由宿主签发，重试等于重发用户那句话、造出第二条请求——比「热情地告知没落盘」更坏。消费方可以对 `durable:false` 打点告警，但**不要重试**。
 
+**入队响应回两个 id**：`POST /tenon/requests` → `200 { ok, seq, durable, requestId, syntheticEventId }`。
+
+`requestId` 让人话与后续公告板条目对上（卡片带同一个 id）；`syntheticEventId` 是**来源凭证**——
+`policies:evaluate` 带它才会被判成 `origin=request`，命中「对话发起」类规则。这两个 id 以前只在帧里签发、
+不回给调用方，于是任何「先预检、再落卡」的调用方都带不上来源凭证，规则永不命中（症状是「人在对话里要的事被判无策略匹配」）。
+
 **来源凭证（与 §4.2 的 `origin` 对接）**：收到 `tenon.request` 时宿主**签发** `requestId` 与合成 `syntheticEventId`（`evt_` 前缀）、用 token 的 `sub` 覆写 `by`、盖上 `at`，并把 `syntheticEventId → {requestId, by, at}` 登记进 `requests-index.jsonl`（**独立落盘，不依赖队列实现**）。agent **必须沿用**帧里这两个 id，不得自行生成——自行生成等于让 agent 决定自己要不要被审。客户端自报的 `by`/`requestId` 一律被覆盖。
 
 - 帧类型只收 `tenon.request` 与 `tenon.confirm`（`tenon.context` 不入站）：其它 `type` → 400 `UNKNOWN_FRAME_TYPE`；登记 origin 失败 → 400 `ORIGIN_REGISTER_FAILED`（凭证没留下就不入队）。
 - 队列是**落盘 JSONL**（`requests.jsonl` + `.meta` 序号水位）：重启续号、崩溃留下的半行被跳过、ack 后重写存活部分。容量 1024 帧，溢出丢最旧并**留日志**（入站丢的是「用户说过的话」，与出站丢界面提示不是一个量级）。
 - **重置入站队列要同时删三个文件**：`requests.jsonl`、`requests.jsonl.meta`、`requests-index.jsonl`。前两者是序号水位（只删主文件会让序号从 meta 续上、不回 1）；第三个是**治理状态而非缓存**——判定规则是「未登记即视为 `event`」，单删索引会把在途 request 静默降级成事件驱动，绕开「对话发起必须审批」。所以清索引必须与清空 pending 一起做。
+- **入站治理（两处保留期，2026-11-01）**：
+  - 确认帧从不 ack（公告板批准走「只读不 ack」），所以队列里会积压 `tenon.confirm`。宿主按
+    `TENON_INBOUND_CONFIRM_TTL`（缺省 `1h`）清掉超期确认帧，**只清 confirm、不清 `tenon.request`**
+    （用户原话不设保留期，只受 1024 帧容量约束）。清掉的帧计入 `poll` 响应的 `dropped`。
+  - `requests-index.jsonl` 每说一句话追加一行，必须修剪：按 `TENON_ORIGIN_RETENTION`（缺省 `168h`）
+    + 硬上限（5 万条）修剪，**仍被公告板待批条目引用的凭证不丢**——丢了会让长挂起的 request
+    在续跑时被判成 `event`，绕过「对话发起必须审批」。修剪是原子重写（临时文件 + rename）。
+  - `poll` 返回的每条帧外层多了 `receivedAt`（宿主收帧时间）；旧版本记录没有该字段，读回为空，
+    不参与确认帧过期清理（升级不会误删历史帧）。
 
 ### 4.7 待批公告板（`/tenon/pending`）
 
@@ -413,10 +530,56 @@ GET /tenon/pending
 
 ---
 
+### 4.8 模块自带页面与只读快照（0.1 附加，不进协议面）
+
+模块可以像宿主一样提供业务页面：`GET /` 与 `GET /ui/…`，目录由 `TENON_MODULE_UI_DIR` 指定
+（缺省 `ui/<moduleID>`）。这些路径**不参与 `Tenon-Version` 协商、不要求 token**，非 `GET`/`HEAD` → 405。
+目录不可用 → **503 并点名环境变量**（与宿主 §4 的口径一致：把「页面没配」伪装成 404 会让运维去查路由）。
+
+页面要显示真值，因此 0.1 增加了三条**只读**动作（无副作用、不需要票据、不写审计）：
+
+| 动作 | 形态 |
+|---|---|
+| `inventory.ListStock` | `{items:[{sku,onHand}]}` |
+| `procurement.ListPurchaseRequests` | `{items:[{requestNo,sku,qty,referenceNo,createdAt}]}` |
+| `quote.ListQuotes` | `{items:[{quoteNo,quoteId,status,lines:[{sku,qty}]}]}` |
+
+排序在服务端做（按 id/单号升序）：页面不该为了稳定顺序再排一次，两个排序口径迟早会不一致。
+**页面没有任何写权限**——业务页面上的「让 agent 去做」只是把一句话投到 `POST /tenon/requests`。
+
+### 4.9 MCP 工具面（`tenon-mcp`，0.2 附加）
+
+`cmd/tenon-mcp` 是一个 **stdio MCP 服务端**，把 Tenon 的能力交给对话层（dsh 等）。
+工具名在 dsh 侧投影为 `mcp__tenon__<name>`。
+
+| 工具 | 权限 | 落到哪 | 副作用 |
+|---|---|---|---|
+| `registry_list` | 读 | `GET /tenon/modules` | 无 |
+| `action_invoke` | **仅 `kind=read`** | 模块 `POST /tenon/actions/{id}` | 无 |
+| `plan_preview` | 预检 | `policies:evaluate` → `grants:evaluate(charge:false)` → `:dry-run` | 无（不落卡、不执行） |
+| `request_submit` | 人 | `POST /tenon/requests`（`tenon.request`，Bearer） | 间接：投递一帧后由 agent 自己规划、落卡 |
+| `pending_list` | 人 | `GET /tenon/pending`（Bearer） | 无 |
+| `pending_decide` | 人 | `POST /tenon/requests`（`tenon.confirm`，Bearer） | 间接：批准后由 agent 恢复执行 |
+| `audit_query` | 读 | `GET /tenon/audit?planId=` | 无 |
+
+**没有执行写动作的工具，也没有造卡的工具。** 前者会把策略/授权/预演/票据一次性绕开；
+后者不可行也不该可行：可恢复的卡的依赖 agent 侧的 `argsHash` 冻结快照与本地 `store`，
+而公告板写入要求 `role:agent`（拿到它就等于同时拿到 `tickets:issue`）。
+
+**`request_submit` 不是造卡工具**，它只把**人的原话**投进入站队列（与共驾前端发
+`tenon.request` 完全同一条路径）：计划由 agent 生成、卡由 agent 落，审计里的 plan 归属不变。
+它必须存在——入站帧是唯一能开回合的入口，页面上的输入框收掉之后，没有它就没有任何东西
+可以批准了。工具面因此是 **7 个**，不是 6 个。
+
+人工身份只从环境变量读（`TENON_MCP_HUMAN_TOKEN`，或 `TENON_MCP_USER`/`TENON_MCP_PASSWORD` 惰性登录），
+**不进工具参数**：参数会进模型上下文，token 不该去那里。`401` 后会自动重登一次——否则 dsh 里长活的
+MCP 进程会在 token 过期后表现为「一开始能批、过一会儿不能批」。
+
 ## 5. 调用矩阵
 
 | 调用方 | 被调方 | 通道 | 凭据 |
 |---|---|---|---|
+| **模块** | 宿主 | `POST /tenon/registry/register`、`POST /tenon/registry/heartbeat` | **`X-Tenon-Signature`（HMAC，§4.4.2）** |
 | agent | 宿主 | `GET /tenon/modules` | 内网直连 |
 | agent | 宿主 | `POST /tenon/policies:evaluate`、`POST /tenon/grants:evaluate` | 内网直连 |
 | agent | 宿主 | `POST /tenon/audit`（两段）、`GET /tenon/audit` | 内网直连 |
@@ -431,7 +594,9 @@ GET /tenon/pending
 | conformance | 宿主 + 模块 | 上述只读 + 幂等写 | 测试专用策略/授权 |
 | lint | 文件系统 | 无网络 | — |
 
-**注意：模块不主动调宿主。** 模块只做两件事——响应宿主的请求、在响应里给出结果；它的独立审计写**本地**（§3.8）。模块自产事件走**发件箱**由 agent 轮询，不是推给宿主。
+**模块 → 宿主的唯一通道是注册与心跳**（R1 之后）。除此之外模块不主动调宿主：模块只做两件事——响应宿主的请求、在响应里给出结果；它的独立审计写**本地**（§3.8）。模块自产事件走**发件箱**由 agent 轮询，不是推给宿主。
+
+> §4.4.2 的注册/心跳是**例外且必须存在**：没有它，宿主就没有「谁在场」的真相，只能回到启动时静态登记（已删除）。它带来的是一个方向极窄的写入口（模块只能登记/刷新自己的 id），鉴权与防重放见 §4.4.2 与 §5。
 
 ---
 
@@ -441,18 +606,20 @@ GET /tenon/pending
 |---|---|---|
 | `PORT` | 宿主 + 模块 | 监听端口或完整地址（宿主 8080；模块 8081/8082/8083） |
 | `TENON_MODULE_ID` | 模块 | manifest 的 `module.id` 与审计的 `module` 字段 |
-| `TENON_HMAC_SECRET_FILE` | 模块 | HMAC 密钥文件路径（事件验签）；读不到即拒绝投递、`/readyz` 非 200 |
+| `TENON_HOST` | 模块 | 宿主基地址（如 `http://127.0.0.1:8080`）：模块启动即向它 `POST /tenon/registry/register`，之后每 5s 心跳。**未设置表示「不注册」**——只用于本地单模块调试，启动日志会打警告（宿主将看不到本模块，D5 无 static 兜底） |
+| `TENON_HEARTBEAT_INTERVAL` | 模块 | 覆盖心跳间隔（`time.ParseDuration`，如 `100ms`）。只给测试/演示用：它与宿主的 TTL（3 个周期）是一对，改短改长都会改变「几个心跳算过期」的语义 |
+| `TENON_HMAC_SECRET_FILE` | 模块 **+ 宿主** | HMAC 共享密钥文件路径。模块侧：事件验签 + 注册/心跳签名；宿主侧：**注册/心跳端点验签**。读不到时模块 `/readyz` 非 200；**宿主直接拒绝启动**（D7，非 0 退出并点名本变量）。两侧必须是同一份字节 |
+| `TENON_REGISTRY_EVENTS` | 宿主 | 注册事件链路径（append-only 哈希链 `registry-events.jsonl`，§4.4.3）。未设置则注册表纯内存、不记事件；**配了路径却打不开时宿主拒绝启动**（「以为在记、实际没记」比没有更糟） |
 | `TENON_MODULE_AUDIT_PATH` | 模块 | 模块侧审计 JSONL 路径（缺省 `./audit-<moduleID>.jsonl`） |
 | `TENON_POLICY_FILE` | 宿主 | 策略规则数组文件；**未设置时规则表为空 → 所有动作 fail-closed 成 deny** |
 | `TENON_GRANT_FILE` | 宿主 | `{"grants": [...], "subjects": {...}}`；未设置时没有任何调用被授权 |
 | `TENON_AUDIT_PATH` | 宿主 | 审计 JSONL 路径（缺省 `./audit-host.jsonl`），需持久化卷 |
-| `TENON_MODULES` | 宿主 | 启动时登记的模块，`id=url,id=url` |
-| `TENON_TEST_MODE` | 宿主 | 只认 `"1"`：挂载 `POST /tenon/admin/modules`；其它写法（`true`/`yes`）一律不算 |
+| `TENON_TEST_MODE` | 宿主 | 只认 `"1"`：挂载 `POST`/`GET /tenon/admin/modules`（登记/摘除 + 注册表全量视图）；其它写法（`true`/`yes`）一律不算 |
 | `TENON_USERS_FILE` | 宿主 | dev 账号表 `[{user,password,roles}]`；**未设置 = 登录端点永远 401**（不是「跳过鉴权」） |
 | `TENON_SESSION_SECRET` | 宿主 | token 的 HMAC 密钥；未设置时用 dev 缺省值并打告警。空密钥签出的 token 谁都能伪造，所以装配期拒绝空值（**装配失败，不是「禁用登录」**） |
 | `TENON_INBOUND_DIR` | 宿主 | 入站队列与 origin 登记表目录（缺省 `out/inbound`）；重置要三文件一起删（§4.6） |
-| `TENON_SKILLS_DIR` | 宿主 | 业务级规则根目录（缺省 `skills`，**相对 cwd**，须在仓库根启动）；`skills/*/approval.json` 与平台级规则同 schema、同池合并、取更严 |
-| `TENON_STRICT_RULES` | 宿主 | 只认 `"1"`：任一份 `approval.json` 未生效即**启动失败**；缺省是「告警 + 该份不生效」 |
+| `TENON_SKILLS_DIR` | 宿主 | 业务级规则根目录（缺省 `skills`，**相对 cwd**，须在仓库根启动）；`skills/*/approval.json` 与平台级规则同 schema、同池合并、取更严。引用了**尚未注册**模块的规则先挂起，模块注册后补校验（不丢弃、不阻塞启动） |
+| `TENON_STRICT_RULES` | 宿主 | 只认 `"1"`：任一份 `approval.json` **校验失败**即**启动失败**；「模块还没注册」属挂起，不算失败（裁决 ①a） |
 | `TENON_UI_DIR` | 宿主 | 同源静态页目录；空或不可用 → `GET /` 回 503（§4） |
 | `TENON_REQUIRE_TRIGGER` | 宿主 | 只认 `"1"`：`policies:evaluate` 缺 `triggerEventId` 即 deny（§4.2）。缺省关闭（P1 过渡态） |
 | `TENON_HOST_URL` | agent | 宿主基地址（缺省 `http://127.0.0.1:8080`） |
@@ -469,7 +636,9 @@ GET /tenon/pending
 | `TENON_LLM_MODEL` | agent | 缺省 `deepseek-flash`（`temperature=0`，D1 可重复性依赖它） |
 | `TENON_LLM_TIMEOUT` | agent | 缺省 `60s` |
 
-两处**不再被任何代码读取**的旧变量，别再往部署里写：`TENON_VERSION`（协议版本是编译期常量 `0.1`）与 `TENON_TARGET`（`conformance` 只认 `--target` 参数）。
+`TENON_MODULES` **已被删除**（D5，R1）：没有静态登记路径，没有兼容档位。仍写这个变量的部署什么都不会发生——模块必须自己注册（§4.4.2），否则不可见。
+
+另有两处**不再被任何代码读取**的旧变量，别再往部署里写：`TENON_VERSION`（协议版本是编译期常量 `0.1`）与 `TENON_TARGET`（`conformance` 只认 `--target` 参数）。
 
 机密通过 compose `secrets:` 以文件挂载，开发期：
 
@@ -489,7 +658,8 @@ printf '%s' '<LLM API key>' > docker/secrets/llm.key
 |---|---|---|---|
 | `GET /healthz` | 始终 | 进程存活 | **不检查依赖**。依赖挂了也返回 200，否则编排会误杀 |
 | `GET /readyz` | 始终 | 可以开始接协议请求 | 模块：`hmac_secret` + `audit_file`；宿主：`audit_file` + `policy_engine`。任一不满足 → **503** |
-| `POST /tenon/admin/modules` | 宿主 `TENON_TEST_MODE=1` | 登记/摘除模块：`{id, baseURL?, enabled?}`，返回最新注册表 | 关闭时回 **404**（不是 403——403 等于承认这里本来有个测试面） |
+| `GET /tenon/admin/modules` | 宿主 `TENON_TEST_MODE=1` | **注册表全量视图**（`registry.List()`：含 `enabled:false` 与 `state:"lost"`）。与 `GET /tenon/modules` 是**两个视图**，不能合并 | 关闭时回 **404**（不是 403——403 等于承认这里本来有个测试面） |
+| `POST /tenon/admin/modules` | 宿主 `TENON_TEST_MODE=1` | 登记/摘除模块：`{id, baseURL?, enabled?}`，返回全量注册表 | 同上 |
 | `POST /tenon/admin/reset` | 模块 `TENON_TEST_MODE=1`（`Module.TestMode`） | 抹掉幂等表、收件箱、发件箱与两套游标，再调业务 `Reset()`；返回 `{"reset":true}` | 关闭时该路径**不在路由表里**，请求得到与「不存在」同形的 404 |
 
 `admin/modules` 的开关语义（容易踩）：
@@ -497,6 +667,10 @@ printf '%s' '<LLM API key>' > docker/secrets/llm.key
 - `enabled` 省略 = **不改开关**（所以请求体里用 `*bool`，省略与 `false` 必须能区分）。
 - 先 `Upsert`（新条目一律 `enabled:true`）再 `SetEnabled(false)`，因此「登记同时禁用」可以一次请求表达完。
 - 只给 `enabled` 而模块未登记 → 404 `MODULE_NOT_FOUND`（开关只能作用于已登记的模块，注册只能走 `Upsert`）。
+- **人工开关是粘性的**（D2）：心跳只刷新 `alive`，永远不改 `enabled`。所以「disable 掉的模块被心跳救回来」是不会发生的。
+- `POST` 会触发注册钩子（挂起业务规则的补校验）——测试里用它登记模块时，规则可能因此生效。
+
+> 注意 `GET /tenon/admin/modules` 与 `GET /tenon/modules` 的**用途分工**：前者回答「注册表里有什么」，后者回答「agent 现在能看到什么」。D1 的 B 轮断言用的是前者（条目还在、只是不可见）。
 
 **接线方式：** 模块的 `POST /tenon/admin/reset` 由 `Module.TestMode` 字段控制，三个模块进程都用 `TENON_TEST_MODE=1` 打开它（`cmd/quote`、`cmd/inventory`、`cmd/procurement` 各自读一次，精确匹配 `"1"`）。两侧都实测过：设 `1` → 200 `{"reset":true}`，设 `0`（或不设）→ 与「路径不存在」同形的 404。**这个端点会抹掉幂等记账与两张事件表**，所以 `compose.m0.yaml` 只在测试拓扑里声明它。
 
@@ -518,13 +692,18 @@ printf '%s' '<LLM API key>' > docker/secrets/llm.key
 1. **模块侧审计没有对账端点。** 设计文档要求「审计双写，日切对账」，但 `spec/0.1` 只定义了宿主侧的审计查询。用模块侧独立记录做对账时，宿主要么直连模块拉日志（无协议端点），要么模块反向投递（模块不主动调宿主）。**M1 必须补一个**（推荐：模块侧 `GET /tenon/audit?since=`，与宿主的同名同构）。在这之前，C4 只能断言宿主侧链完整，对账无法机械验证。
 2. **`readyz` 的依赖清单未进协议。** 现在只是运维约定（两侧检查项不同，见 §7），跨实现不保证一致。
 3. **`X-Tenon-Grant` 在模块侧只被「承认」、不被校验。** M0.5 没有 grant 签发与存储，模块无法判断凭证真伪。实现选择是**不做假校验**（伪造一个「已校验」比不校验更危险），凭证校验留到 M1 的治理平面。**这意味着现在的双层授权只有一层。**
-4. **模块 → 宿主没有 push 通道。** 模块自产事件靠 agent **轮询发件箱**（§3.5）拉取，至少一次 + 游标补课；`POST /tenon/events` 的反方向（宿主/外部 → 模块）端点存在但在 M0.5 **没有调用方**。设计文档的时序图把它画成 push，以 §1、§5 为准。
+4. **模块 → 宿主没有业务 push 通道。** 模块自产事件靠 agent **轮询发件箱**（§3.5）拉取，至少一次 + 游标补课；`POST /tenon/events` 的反方向（宿主/外部 → 模块）端点存在但在 M0.5 **没有调用方**。唯一的模块 → 宿主推送是注册/心跳（§4.4.2），它只带 id、地址与声明哈希，不承载任何业务事件。设计文档的时序图把业务事件画成 push，以 §1、§5 为准。
 5. **`tokenUsage` 只能写 `{in:0,out:0}`。** `internal/llm` 不解析 `usage` 字段，agent 的审计记录里这两项是常量零。它不是「用量为零」，而是「没有采集」——按数值做成本统计会得出错误结论。
 6. **审计记录不保证 schema 完整。** 宿主 `POST /tenon/audit` 只校验 `auditId` 与 `stage`，`trigger` / `effects` / `decision` 等字段缺失也照原样落盘并计入哈希链。agent 侧已补齐必填字段（`trigger`/`inputHash`/`idempotencyKey`/`tokenUsage`），但**宿主不强制**：任何第三方写入者都可以落一条缺字段的记录，C4 的「链连续」不等于「记录合法」。
 7. **没有 Go AST 检查「agent 不得硬编码 action」。** C10 的 lint 只覆盖 TS/JS（`.ts/.tsx/.js/.jsx/.mjs/.cjs`）与 skill 正文的 `模块.动作` 形式；Go 写的 agent 靠「只使用 manifest 动态发现的 action id」这条纪律，外加差异测试兜底。这是设计文档 §8 已列的风险，不是遗漏。
 8. **模块侧的测试态开关没有启动期警告。** 宿主开 `TENON_TEST_MODE=1` 会打一行警告，模块不会；忘记删这个变量的环境里 `POST /tenon/admin/reset` 会安静地可用，而它抹掉的正是幂等记账与两张事件表（生产误开 = 丢账）。另外模块侧只认精确的 `"1"`：写成 `true` 静默不生效，排查时容易误判成「端点坏了」。
-9. **差异测试未在真 LLM 上验证。** `tenon d1 run` 与 `internal/d1` 已实现（A 轮全模块在场 → B 轮摘掉 procurement，比对两轮规划出的动作序列），前置接线也都到位（宿主与模块的测试面、agent 的 `TENON_RESULT_FILE` 都能用），但本轮**没有用真凭据跑过 A/B 两轮**。所以 D1 的结论是**未判定**，不是「通过」也不是「失败」——`conformance` 里的 D1 仍是 SKIP。
-10. **`agent` 的观测产物只有结果文件。** 每回合一行（`outcome`/`planId`/规划出的动作序列），不含 token 用量、也不含被丢弃的 Intent 帧；没有轮转与上限，长期跑要外部做日志轮转。
+9. **D1 已在真模型上判定为 `fail`（三次真跑：inconclusive / inconclusive / fail）。** 2026-10-28 用 `deepseek-flash` 跑 `scripts/d1-e2e.ps1` 三次：
+   - 第 1 次 `inconclusive`：A=[`inventory.GetStock`] → completed；B=[`quote.GetQuote`, `inventory.GetStock`] → needs_human（A 从未引用被摘的 `procurement`，命题未被检验）；
+   - 第 2 次 `inconclusive`：A=[`inventory.GetStock`] → completed；B=[`inventory.GetStock`, `inventory.DeductStock`] → needs_human；
+   - 第 3 次（最终脚本版本）**`fail`**：A=[`inventory.GetStock`] → completed；B=[`inventory.GetStock`] → completed。两轮序列**完全相同**，且 B 轮没有转人工——判据 1（序列不同）与判据 3（B 轮转人工）都不成立，理由写明「摘掉模块后行为没变，说明 agent 没在用能力清单」。
+
+   **这不是注册链路的问题**：三轮里 `GET /tenon/modules` 三个模块都可见、`registry-events.jsonl` 无 `lost`、宿主的规则补校验成功从 `procurement` 取到了动作定义（证明它当时确实在场且可达）。根因在模型侧的计划质量：它反复把「查一次库存」当成整个回合的完成，既没有再扣减/采购，也看不出能力清单变了；prompt 只给 action id、不给入参契约（closeout spec §2.4 已把这条列为「须单独评审」的阻塞）。另外三次得出两种结论，说明该模型在 `temperature=0` 下仍不稳定——**单次判定，不宣称统计意义上的稳定**。`conformance` 里的 D1 仍记 SKIP（它不做真模型回放）。
+10. **`agent` 的观测产物只有结果文件。** 每回合一行（`outcome`/`planId`/规划出的动作序列），不含 token 用量、也不含被丢弃的 Intent 帧；没有轮转与上限，长期跑要外部做日志轮转。模型的 `rationale` 也不落盘——D1 判 fail/inconclusive 时要引用它，只能靠回合内日志。
 11. **共驾只有 REST 降级通道。** `GET /tenon/intents` 一律 405，没有实时推送；队列有界（1024 帧），溢出丢最旧的。前端会话凭据也未定（M0.5 是裸连接）。
 12. **宿主不做能力发现。** 它拿不到动作定义，因此既不能判断 `kind`，也不能给读动作开「只读即放行」的特例：读动作必须在策略文件里逐个登记（`config/policies.dev.json` 给 `inventory.GetStock`、`quote.GetQuote` 各写了一条 `auto` 规则）。漏登记一个动作的后果是该动作所在的整份 plan 被判 deny——闸门上的响失败，不是静默放行。M1 接入 manifest 后可以放宽。
 13. **进程内路径未覆盖。** `quote` 是 Go 侧车（§1），D18 的「进程内 + 跨进程两条路径各测一次」本轮只完成了跨进程那条。
@@ -538,10 +717,15 @@ G1 是「预演闸门」：每个 **write** 动作在执行前先 `:dry-run`，�
 | 预演结果 | agent 行为 | 是否产生副作用 |
 |---|---|---|
 | 200 + `verified` | 放行，继续 | 是 |
-| 200 + `unsafe` / `pending` / `unsupported` | **转人工**（`needs_human`） | 否 |
+| 200 + `unsafe` | **有界重新规划**（带这条裁决回填，最多 2 轮，与业务拒绝共用预算）；用尽仍不可行才**转人工** | 否 |
+| 200 + `pending` / `unsupported` | **转人工**（`needs_human`） | 否 |
 | **404（端点不存在）** | **转人工**（等价 `unsupported`） | 否 |
 | 404 + `UNKNOWN_ACTION` | **转人工**（动作不存在，计划的前提就不成立） | 否 |
 | 5xx / 超时 / 响应不是 `{"dryRun":{...}}` | **失败**（`failed`，fail-closed） | 否 |
+
+`unsafe` 与其余非 `verified` 结论分档，是因为它是**事实性**裁决：模块按当前状态算出来「这一步不成立」（例如可用量不足），这是运行时才算得出的新信息。一次都不回填就转人工，等于刚学到的东西白学——D1 的实测里模型在还没有库存事实时就规了扣减，预演判 `unsafe` 后整轮放弃，A/B 两轮的动作序列因此完全相同，看上去像「没用能力清单」。
+
+回填不给旁路留口子：换出来的写动作要自己再过一遍预演，没有哪一步能跳过闸门；`unsafe` 期间一个步骤都没有执行，也不会留下半截副作用。`pending`（说不清）与 `unsupported`/404（能力缺失）保持直接转人工——前者该由人判，后者若可重规划就等于「删掉端点能换免检」。
 
 三条必须一起成立，缺一条就有洞：
 
@@ -578,9 +762,16 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
   --quote http://127.0.0.1:8083 --inventory http://127.0.0.1:8081 \
   --procurement http://127.0.0.1:8082 \
   --agent-result out/agent-result.jsonl --report out/d1.json
+
+# 6. 注册验收（spec §10 七条口径；自带模块/宿主编排，不需要 LLM 凭据）
+powershell -NoProfile -File scripts/verify-registration.ps1
+
+# 7. 一键编排：D1（真模型）与浏览器验收
+powershell -NoProfile -File scripts/d1-e2e.ps1          # 注意：TENON_MODULES 已删除，模块靠 TENON_HOST 自注册
+powershell -NoProfile -File scripts/verify-ui.ps1       # 同上，宿主被要求先看到三模块才往下跑
 ```
 
-验收顺序：`host` 与各模块 `/readyz` 全 200 → `conformance` 跑 C1–C5/C8/C9/C10（宿主模式）→ `lint` 对仓库零命中 → D1 需真 LLM 凭据再跑一次 `d1 run`（接线已就位，见 §7）。
+验收顺序：`host` 与各模块 `/readyz` 全 200 → **`GET /tenon/modules` 里三个模块都可见**（R1 之后「端口通」不等于「注册上了」）→ `conformance` 跑 C1–C5/C8/C9/C10（宿主模式）→ `lint` 对仓库零命中 → `scripts/verify-registration.ps1` 全断言通过 → D1 需真 LLM 凭据再跑一次 `d1 run`（接线已就位，见 §7）。
 
 ### 已经验过 / 还没验过
 
@@ -594,11 +785,12 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 | 模块侧 `direction=out` 发件箱 | ✅ `cmd/quote` 单测覆盖（`quote.completed` 入箱 + 游标）；端到端「事件 → agent 开回合」未验 |
 | agent 缺 `TENON_ON_BEHALF_OF` 启动即失败 | ✅ 实测 exit 1 + 明确报错 |
 | 模块 `TENON_TEST_MODE=1` 挂载 `admin/reset` | ✅ 实测：设 `1` → 200 `{"reset":true}`；设 `0` → 404 |
-| `tenon d1 run` 已实现（A/B 两轮 + 报告） | ✅ 子命令与 `internal/d1` 在仓库里（`--agent-result`/`--report` 参数齐全）；**未在真 LLM 上跑过** |
+| `tenon d1 run` 已实现（A/B 两轮 + 报告） | ✅ 子命令与 `internal/d1` 在仓库里（`--agent-result`/`--report` 参数齐全）；**已在真模型（`deepseek-flash`）上跑过三次**（2026-10-28，`scripts/d1-e2e.ps1`） |
+| R1 注册验收（spec §10 七条口径） | ✅ `scripts/verify-registration.ps1` 17 条断言全过（2026-10-28）：注册即可见 / 错哈希 409 / 15s+清扫内 lost 且事件链有 `lost` / 重启回场 / disable 粘性 + enable 恢复 / 宿主重启窗口 0 个可见→3.0s 回场且模块日志有 `unknown-module` / 链复算与篡改检测 / 缺密钥启动失败 |
+| 模块 ↔ 宿主 HMAC 实际握手 | ✅ 已验（2026-10-28）：注册/心跳就是这条方向；`verify-registration.ps1` 覆盖 200 / 401（无签名）/ 409（`declaration-mismatch`、`declaration-changed`、`unknown-module`） |
 | `host` 完整镜像启动 | ❌ 未验（运行时基础镜像与命名卷可写性都未在容器内验过） |
-| 模块 ↔ 宿主 HMAC 实际握手 | ❌ 未验：M0.5 没有调用方走这个方向（§3.4） |
-| `compose.m0.yaml` 端到端 `up` | ❌ 未验 |
-| D1 差异测试结论（pass/fail） | ❌ 未判定：没有用真凭据跑过 A/B 两轮（§9 缺口 9） |
+| `compose.m0.yaml` 端到端 `up` | ❌ 未验；且 `compose.yaml` / `compose.m0.yaml` / `README.md` 仍写着已删除的 `TENON_MODULES`（部署文件待同步，见 §6） |
+| D1 差异测试结论 | ❌ **`fail`**（第 3 次真跑，最终脚本版本）：A/B 计划序列相同（都是 `[inventory.GetStock]`）、B 轮未转人工；注册链路已排除，根因见 §9 缺口 9 |
 | `-race` 并发验证 | ❌ 本机不跑（`CGO_ENABLED=0` 且无 gcc/clang），见设计增量 §10 |
 
 **上表的❌不许当成已实现来宣称。**

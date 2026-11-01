@@ -11,13 +11,16 @@
 //	POST /tenon/grants:evaluate            单动作授权评估
 //	POST /tenon/audit                      追加一条审计记录（两段写的写入口）
 //	GET  /tenon/audit?planId=&since=&limit= 审计查询（游标是写入顺序序号）
-//	GET  /tenon/modules                    注册表（管理面视图，含已摘除条目）
+//	POST /tenon/registry/register          模块自注册（HMAC 验签 + 声明哈希校验）
+//	POST /tenon/registry/heartbeat         模块心跳（HMAC 验签；不同步时 409 要求重申报）
+//	GET  /tenon/modules                    注册表可见视图（只含 enabled && alive）
 //	GET  /healthz                          存活探针（不检查依赖）
 //	GET  /readyz                           就绪探针（审计可写 + 策略可用）
 //	POST /tenon/intents                    共驾帧入队
 //	GET  /tenon/intents/poll?after=        按序回放未确认的帧
 //	POST /tenon/intents/ack                确认到某个序号，此后不再回放
 //	POST /tenon/admin/modules              登记/摘除模块（仅 TENON_TEST_MODE=1）
+//	GET  /tenon/admin/modules              注册表全量视图（仅 TENON_TEST_MODE=1，含 disabled/lost）
 //	GET  /                                 同源静态页（P1 只做路由，页面内容在 P3）
 //	GET  /ui/…                             静态页引用的资源（只读 TENON_UI_DIR 之内）
 //
@@ -41,8 +44,19 @@
 //     时按 1 计（宁可多占配额，也不给「无法计量」留一个免费口子）；
 //   - **协议版本头**：host 端点全部宽松处理（缺失视为 0.1，存在且不是 0.1 则 400），
 //     响应一律带 Tenon-Version/Tenon-Min-Version。本轮只实现 0.1，不做版本协商；
-//   - **GET /tenon/modules 返回管理面视图**（registry.List，含 enabled=false 的条目）：
-//     D1 的 B 轮要能看见「被摘除」这件事。调用方（agent）按 enabled 过滤后再做能力发现；
+//   - **GET /tenon/modules 只返回可见条目**（registry.Enabled，`enabled && alive`，D5）：
+//     没有 static 例外——不心跳的模块就是看不见。管理面视图（含已摘除 / lost 条目）走
+//     测试面的 GET /tenon/admin/modules（或 POST 的回执），且那个端点仅 TENON_TEST_MODE=1
+//     挂载：D1 的 B 轮必须能区分「条目被摘除」与「条目不存在」；
+//   - **注册/心跳的鉴权失败回 401，不回 400/403**：这是「你是谁」的问题，混进报文校验
+//     （400）或权限判定（403）会让对端按错的方向修。理由再分三档（format/expired/invalid）
+//     并写进 details.reason：缺签名、密钥不一致、时钟漂移三种原因的处置完全不同；
+//   - **409 ≠ 400**：注册时报文结构没问题、只是 declarationHash 与 manifest 不是同一份，
+//     以及心跳时 host 与模块不同步，都回 409 + {reRegister, reason}。这是契约冲突，
+//     调用方唯一正确的反应是「重申报」，不是「改报文重试」；
+//   - **不带密钥时这两个端点回 503 而不是 404**：路径存在但当前不可用，与「宿主根本不
+//     提供这个能力」是两件事。D7 的「缺密钥拒绝启动」落在 cmd/host（生产进程），
+//     本包留 503 是为了让测试能构造不带密钥的宿主，同时不把不可用伪装成不存在；
 //   - **读动作必须逐个登记**：G2 闸门对未命中的动作一律 deny（fail-closed），所以
 //     config/policies.dev.json 显式给 inventory.GetStock、quote.GetQuote 各写了一条
 //     outcome=auto 的低优先级规则。这里**刻意不做**「kind=read 即自动放行」的特例：
@@ -60,6 +74,9 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,6 +89,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"tenon.dev/internal/controlplane/audit"
@@ -118,6 +136,19 @@ const (
 	// maxInboundFrames 是入站队列容量。**独立于 maxIntentFrames**：后者是出站内存队列
 	// 的容量语义，给「人说过的话」复用它，会让两件事的理由互相矛盾。
 	maxInboundFrames = 1024
+	// EnvHMACSecretFile 是模块注册/心跳共享密钥文件的环境变量名。
+	//
+	// 它由装配侧（cmd/host）读取并在缺失时拒绝启动（D7）。导出到这里是因为 503 的报文
+	// 必须点名「去设哪个变量」——那是运维唯一需要的线索，而同一个字符串写两遍迟早分叉。
+	EnvHMACSecretFile = "TENON_HMAC_SECRET_FILE"
+	// 验签失败的三种理由，写进 tenonError.details.reason（spec §5）。
+	signatureReasonFormat  = "format"
+	signatureReasonExpired = "expired"
+	signatureReasonInvalid = "invalid"
+	// 409 的三种理由，写进 {reRegister, reason}（spec §3.2 与 §3.1）。
+	reasonUnknownModule       = "unknown-module"
+	reasonDeclarationChanged  = "declaration-changed"
+	reasonDeclarationMismatch = "declaration-mismatch"
 )
 
 // Config 是宿主控制平面的一次装配输入。
@@ -133,9 +164,20 @@ type Config struct {
 	Subjects map[string][]string
 	// AuditPath 是审计 JSONL 路径，必填：审计链是宿主唯一不可省的持久状态。
 	AuditPath string
-	// Modules 是启动时登记的模块（TENON_MODULES 的解析结果）。
-	Modules []registry.ModuleEntry
-	// TestMode 为 true 时挂载 POST /tenon/admin/modules。
+	// Registry 是模块注册表的共享实例，可为 nil（本包自建一个空表）。
+	//
+	// 装配侧（cmd/host）需要它来做加载期的业务规则校验（要按模块取 baseURL 拉动作定义），
+	// 而运行期的可见性看的是同一张表——传同一个实例，加载期与运行期就只有一份真相。
+	// 注册本身仍只有 module 自注册一条路径（D5）：这里给的是**表**，不是静态条目，
+	// 空的进来就是空的，没有任何「启动即登记」的捷径。
+	Registry *registry.Registry
+	// HMACSecret 是模块自注册/心跳两个端点的共享密钥（EnvHMACSecretFile 的内容）。
+	//
+	// 为空时这两个端点回 503 而不是 404：路径存在、只是没配密钥。生产由 cmd/host 在
+	// 启动时拒绝（D7 缺密钥即拒绝启动），本包留这条 503 是给测试态与未来的装配方一个
+	// 「说得清原因」的出口——静默「不挂端点」会让运维以为注册在工作。
+	HMACSecret []byte
+	// TestMode 为 true 时挂载 GET/POST /tenon/admin/modules。
 	TestMode bool
 	// Users 是 dev 账号表；为空表示登录端点永远失败（fail-closed）。
 	Users []User
@@ -156,23 +198,53 @@ type Config struct {
 	// 本字段只在装配侧（cmd/host）读取：是否容忍坏的 approval.json 是部署决定，
 	// New() 不替调用方做这个判断，因此引擎行为不受它影响。
 	StrictRules bool
+	// TicketSigningKey 是签发执行票据的 Ed25519 私钥。
+	//
+	// 为空时签发端点回 503 TICKET_SIGNING_DISABLED，**不做降级签票**：没有密钥
+	// 就没有"宿主批准过"这回事。生产装配方（cmd/host）在缺密钥时直接拒绝启动；
+	// 本包留 503 是给测试态与未来装配方一个说得清原因的出口。
+	TicketSigningKey ed25519.PrivateKey
+	// TicketTTL 是票据有效期，缺省 30s；超过 protocol.TicketMaxTTL 一律按上限截断。
+	TicketTTL time.Duration
+	// OriginRetention 是 origin 凭证的保留期（缺省 7 天）。
+	//
+	// 到期且**未被公告板引用**的凭证会被修剪：不修剪的话，每说一句话就多一条，
+	// 长期运行的宿主的 requests-index.jsonl 与内存映射会线性增长。
+	OriginRetention time.Duration
+	// InboundConfirmTTL 是入站队列里未 ack 的确认帧保留期（缺省 1 小时）。
+	//
+	// 确认帧从不 ack（公告板批准走设计 §10.2 选项 A），不清就会把用户原话从
+	// 有界队列里挤掉。过期确认对应的卡早已到期，留着只占位。
+	InboundConfirmTTL time.Duration
 }
 
 // Server 是组装好的控制平面。构造后并发安全；Handler() 与服务共享同一份状态。
 type Server struct {
-	policyEngine  *policy.PolicyEngine
-	grantEngine   *grant.GrantEngine
-	auditStore    *audit.Store
-	auditPath     string
-	modules       *registry.Registry
-	testMode      bool
-	intents       Queue
-	users         []User
+	// policyMu 保护 policyEngine / policyCount：业务规则可能**在运行期**变多。
+	//
+	// 裁决 ①a 之后，business rule 的加载分两段：启动时能校验的先进引擎，引用尚未注册
+	// 模块的挂起等模块注册后补校验；补校验通过就要让新规则真的参与求值。引擎本身不可变
+	// （policy.PolicyEngine 构造后只读），所以这里换的是指针——读侧每次求值取一次快照，
+	// 保证一份 plan 的多个 step 永远看同一份规则。
+	policyMu     sync.RWMutex
+	policyEngine *policy.PolicyEngine
+	grantEngine  *grant.GrantEngine
+	auditStore   *audit.Store
+	auditPath    string
+	modules      *registry.Registry
+	testMode     bool
+	intents      Queue
+	users        []User
+	// sessionSecret 用于校验 token；hmacSecret 用于验注册/心跳的签名。两者是不同用途的
+	// 密钥（一个是会话凭据，一个是端点鉴权），刻意不复用。
 	sessionSecret []byte
+	hmacSecret    []byte
 	// inbound 是落盘的入站队列（人 → agent）。它与 intents 是两条独立队列：出站的 Ack
 	// 是累积游标，两个消费者共用一条会互相吞帧。
-	inbound     Queue
-	origin      *originStore
+	inbound Queue
+	origin  *originStore
+	// policyCount 是 policyEngine 里的规则条数，随引擎一起被 policyMu 保护；
+	// /readyz 用它回答「规则加载了几条」。
 	policyCount int
 	grantCount  int
 	// requireTrigger 为 true 时缺 triggerEventId 直接 deny（TENON_REQUIRE_TRIGGER=1）。
@@ -182,6 +254,9 @@ type Server struct {
 	uiDir string
 	// pending 是待批公告板：只读 read-model，agent 推、前端看。刻意不落盘（可重建）。
 	pending *pendingBoard
+	// ticketKey 是签发执行票据的私钥；ticketTTL 是票据有效期。
+	ticketKey ed25519.PrivateKey
+	ticketTTL time.Duration
 }
 
 // New 装配控制平面。审计日志打不开或策略规则自检不过都会返回错误：宿主不该带着
@@ -194,6 +269,12 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("controlplane: %w", err)
 	}
+	// 注册表由装配方给就用它的（加载期规则校验与运行期可见性共用一份），否则自建空表。
+	// 两条路径都是**空表起步**：注册只有模块自注册一条，本包不提供任何静态登记入口。
+	modules := cfg.Registry
+	if modules == nil {
+		modules = registry.NewRegistry()
+	}
 	s := &Server{
 		policyEngine: policy.NewPolicyEngine(cfg.Policies),
 		// WithSubjects 显式装配（传空表也一样）：交集规则要求「委托人有权」，
@@ -201,8 +282,9 @@ func New(cfg Config) (*Server, error) {
 		grantEngine: grant.NewGrantEngine(cfg.Grants, grant.WithSubjects(cfg.Subjects)),
 		auditStore:  store,
 		auditPath:   cfg.AuditPath,
-		modules:     registry.NewRegistry(),
+		modules:     modules,
 		testMode:    cfg.TestMode,
+		hmacSecret:  cfg.HMACSecret,
 		intents:     newMemoryQueue(maxIntentFrames),
 		policyCount: len(cfg.Policies),
 		grantCount:  len(cfg.Grants),
@@ -211,9 +293,9 @@ func New(cfg Config) (*Server, error) {
 		uiDir:          cfg.UIDir,
 		// 公告板是纯内存 read-model：可丢、可重建，重建靠 agent 每 tick 的幂等 upsert。
 		pending: newPendingBoard(),
-	}
-	for _, entry := range cfg.Modules {
-		s.modules.Upsert(entry)
+		// 票据密钥缺失不在这里报错：测试态可以不签票，但签发端点会拒绝而不是降级。
+		ticketKey: cfg.TicketSigningKey,
+		ticketTTL: ticketTTLOrDefault(cfg.TicketTTL),
 	}
 	// 会话密钥没有安全缺省值：空密钥签出的 token 任何人都能伪造，宁可拒绝启动。
 	// 关掉审计句柄再返回，否则调用方拿不到 Server，文件却已经被这个失败的构造打开。
@@ -239,6 +321,17 @@ func New(cfg Config) (*Server, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	// 修剪的「保护名单」来自公告板：仍在待批的 request 凭证，超期也不许丢（见 referencesRequest）。
+	origin.keep = func(rec originRecord) bool { return s.pending.referencesRequest(rec.RequestID) }
+	if cfg.OriginRetention > 0 {
+		origin.retention = cfg.OriginRetention
+	}
+	if cfg.InboundConfirmTTL > 0 {
+		inboundQueue.confirmRetention = cfg.InboundConfirmTTL
+	}
+	// 启动时先修剪一次：上一条注释里的「上限」只在 Register 触发太慢，
+	// 长跑的宿主要是几个月没重启，文件会一直带着旧账。
+	origin.compactNow()
 	s.inbound, s.origin = inboundQueue, origin
 	if _, err := s.policyEngine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
 		_ = store.Close()
@@ -273,6 +366,37 @@ func (s *Server) VerifyChain() error { return s.auditStore.VerifyChain() }
 // Registry 返回模块注册表，供调用方读取 Enabled()（agent 的能力发现就靠它）。
 func (s *Server) Registry() *registry.Registry { return s.modules }
 
+// policySnapshot 取当前策略引擎与规则条数的一致性快照。
+//
+// 一次 plan 求值只取一次：中途若发生 ReplacePolicies，整份 plan 仍按同一份规则判，
+// 不会出现「前三个 step 用旧规则、后两个用新规则」的半新半旧结论。
+func (s *Server) policySnapshot() (*policy.PolicyEngine, int) {
+	s.policyMu.RLock()
+	defer s.policyMu.RUnlock()
+	return s.policyEngine, s.policyCount
+}
+
+// ReplacePolicies 用一批新规则替换运行期的策略引擎（裁决 ①a 的「纳入生效规则集」）。
+//
+// 只由装配侧在业务规则补校验通过后调用：规则文件引用的模块在 host 启动时还没注册，
+// 加载期只能挂起；模块注册后补校验通过，新规则必须真的进入求值，否则「生效」只是日志
+// 里的一句话。
+//
+// 先把新规则整体编译并跑一次自检，**不通过就不换**：换上一个编译不过的引擎会让之后
+// 每次 policies:evaluate 都 fail-closed 成 deny——一次补校验写坏不该把整个闸门关死。
+// 换的操作是加写锁的指针交换，在途求值只多等一次指针拷贝。
+func (s *Server) ReplacePolicies(rules []policy.PolicyRule) error {
+	engine := policy.NewPolicyEngine(rules)
+	if _, err := engine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
+		return fmt.Errorf("controlplane: 新规则集自检未通过，拒绝替换：%w", err)
+	}
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	s.policyEngine = engine
+	s.policyCount = len(rules)
+	return nil
+}
+
 // ServeHTTP 按路径分派。每个处理函数自己判定方法，好让「路径存在但方法不对」回 405
 // 而不是 404。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -301,12 +425,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.servePoliciesEvaluate(w, r)
 	case "/tenon/grants:evaluate":
 		s.serveGrantsEvaluate(w, r)
+	case "/tenon/tickets:issue":
+		s.serveTicketIssue(w, r)
 	case "/tenon/session":
 		s.serveSession(w, r)
 	case "/tenon/audit":
 		s.serveAudit(w, r)
 	case "/tenon/modules":
 		s.serveModules(w, r)
+	case "/tenon/registry/register":
+		// 模块自注册（全 push）：声明哈希与 manifest 必须自洽，否则 409 要求重申报。
+		s.serveRegistryRegister(w, r)
+	case "/tenon/registry/heartbeat":
+		// 心跳只带哈希：与登记的声明不一致时回 409，让模块拿完整声明重来一遍。
+		s.serveRegistryHeartbeat(w, r)
 	case "/tenon/intents":
 		// WS 升级留 M1（见包注释）：这里只接受 REST 入队，GET 一律 405。
 		s.serveIntentEnqueue(w, r)
@@ -363,7 +495,8 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 		missing = append(missing, "audit_file")
 		details = append(details, "audit_file: "+err.Error())
 	}
-	if _, err := s.policyEngine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
+	engine, policyCount := s.policySnapshot()
+	if _, err := engine.Evaluate(context.Background(), policy.PolicyRequest{Action: selfCheckAction}); err != nil {
 		missing = append(missing, "policy_engine")
 		details = append(details, "policy_engine: "+err.Error())
 	}
@@ -378,7 +511,7 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ready":    true,
 		"checks":   []string{"audit_file", "policy_engine"},
-		"policies": s.policyCount,
+		"policies": policyCount,
 		"grants":   s.grantCount,
 		"modules":  len(s.modules.List()),
 	})
@@ -497,8 +630,9 @@ func (s *Server) evaluatePlan(ctx context.Context, plan planView, origin string)
 		return defaultDeny()
 	}
 	evals := make([]policy.PolicyEvaluation, 0, len(plan.Steps))
+	engine, _ := s.policySnapshot()
 	for _, step := range plan.Steps {
-		got, err := s.policyEngine.Evaluate(ctx, policy.PolicyRequest{
+		got, err := engine.Evaluate(ctx, policy.PolicyRequest{
 			Action: step.Action,
 			Args:   step.Args,
 			Origin: origin,
@@ -608,6 +742,11 @@ type grantEvaluateRequest struct {
 	OnBehalfOf string          `json:"onBehalfOf"`
 	Action     string          `json:"action"`
 	Args       json.RawMessage `json:"args"`
+	// Charge 为 false 时只预检、不记账。
+	//
+	// 缺省（nil）保持 0.1 的「预检即扣」语义，不改变既有调用方行为；
+	// 计划阶段的估算应显式传 false，真正的扣减发生在签发执行票据时。
+	Charge *bool `json:"charge,omitempty"`
 }
 
 // serveGrantsEvaluate 对单次调用做授权评估。拒绝是 200 + allowed:false（interfaces.md §4.1：
@@ -641,7 +780,13 @@ func (s *Server) serveGrantsEvaluate(w http.ResponseWriter, r *http.Request) {
 		writeTenonError(w, *perr)
 		return
 	}
-	result, err := s.grantEngine.Evaluate(req.Agent, req.OnBehalfOf, req.Action, amount)
+	var result grant.GrantResult
+	var err error
+	if req.Charge != nil && !*req.Charge {
+		result, err = s.grantEngine.EvaluateNoCharge(req.Agent, req.OnBehalfOf, req.Action, amount)
+	} else {
+		result, err = s.grantEngine.Evaluate(req.Agent, req.OnBehalfOf, req.Action, amount)
+	}
 	if err != nil {
 		// 引擎错误是「授权数据读不懂」（窗口/计量单位不在支持范围），不是一次判定：
 		// GrantResult 的拒绝原因被 schema 锁死为四态，无法承载它，所以走 503。
@@ -755,6 +900,16 @@ func (s *Server) serveAuditAppend(w http.ResponseWriter, r *http.Request) {
 			"审计记录缺少 auditId"))
 		return
 	}
+	// 步骤级 dispatched 是"执行前置"的唯一凭据，只能由签发票据时产生。
+	// 若还允许 agent 自己写，审计前置就退化成 agent 的自觉，票据也就白验了。
+	//
+	// 计划级 dispatched（stepId 为空）不在此列：挂起/续跑链路依赖它，
+	// 且它不对应任何副作用。收归宿主留到 P1。
+	if rec.Stage == audit.StageDispatched && strings.TrimSpace(rec.StepID) != "" {
+		writeTenonError(w, *newError(protocol.ClassPolicyDenied, "AUDIT_STAGE_FORBIDDEN",
+			"步骤级 dispatched 只能由宿主签发票据时写入；调用方只能写 stage=result"))
+		return
+	}
 	switch rec.Stage {
 	case audit.StageDispatched, audit.StageResult:
 	default:
@@ -846,19 +1001,27 @@ func parseLimit(raw string) (int, *protocol.Error) {
 
 // ---------- 注册表 ----------
 
-// modulesResponse 是 GET /tenon/modules 的响应体。用结构体包一层而不是直接输出数组，
+// modulesResponse 是 GET /tenon/modules（可见视图）与测试面 /tenon/admin/modules
+// （全量视图：GET 回执与 POST 回执）的响应体。用结构体包一层而不是直接输出数组，
 // 是为了留出后续加字段的余地（0.1 的 module-manifest 与注册表都在长）。
+//
+// 同一个结构体承载两个视图：GET 给 Enabled()（可见），admin 给 List()（全量，含 disabled/lost），
+// 调用方按端点区分。真正的契约约束在 http.go 的端点注释里，别只看字段名。
 type modulesResponse struct {
 	Modules []registry.ModuleEntry `json:"modules"`
 }
 
-// serveModules 返回管理面视图：含 enabled=false 的条目（D1 的 B 轮要看得见「被摘除」）。
+// serveModules 返回**可见**条目：enabled && alive（D5，无 static 例外）。
+//
+// 用的是 Enabled() 而不是 List()：不心跳的模块、以及被人工摘掉的模块，都不该出现在
+// agent 的能力发现里——「注册表里有一条」不等于「它现在在场」。管理面要看全量（含
+// disabled/lost）就走测试面的 GET /tenon/admin/modules 或 POST 的回执，那里编码 List()。
 func (s *Server) serveModules(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, http.MethodGet)
 		return
 	}
-	writeJSON(w, http.StatusOK, modulesResponse{Modules: s.modules.List()})
+	writeJSON(w, http.StatusOK, modulesResponse{Modules: s.modules.Enabled()})
 }
 
 // adminModulesRequest 是 POST /tenon/admin/modules 的请求体。
@@ -872,13 +1035,27 @@ type adminModulesRequest struct {
 	Enabled *bool   `json:"enabled"`
 }
 
-// serveAdminModules 登记模块或摘除/恢复它（仅 TEST_MODE 挂载）。
+// serveAdminModules 是测试面的注册表端点（仅 TEST_MODE 挂载）：
 //
-// 顺序是有意的：先 Upsert（新条目一律 enabled）再 SetEnabled(false)，这样「登记同时
+//	GET  → 全量视图（List，含 disabled 与 lost）
+//	POST → 登记模块或摘除/恢复它
+//
+// GET 与 `GET /tenon/modules` 是**两个视图**，不能合并：后者是 agent 的可见视图
+// （enabled && alive），被人工摘掉的模块必须消失；而 D1 的 B 轮要断言的是「条目还在、
+// 只是 enabled=false」——在可见视图里那个模块根本不存在，两种情形区分不开。所以管理面
+// 单独给一条全量读路径，且与写端点同样只在测试态挂载。
+//
+// POST 的顺序是有意的：先 Upsert（新条目一律 enabled）再 SetEnabled(false)，这样「登记同时
 // 禁用」能一次请求表达完；而只给 enabled 的请求绝不动地址。
 func (s *Server) serveAdminModules(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w, http.MethodPost)
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, modulesResponse{Modules: s.modules.List()})
+		return
+	case http.MethodPost:
+		// 写端点：继续走下面的校验。
+	default:
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 		return
 	}
 	if perr := preflight(r); perr != nil {
@@ -931,13 +1108,20 @@ func (s *Server) serveAdminModules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 回执给全量（List）：D1 的 B 轮摘掉模块后要能看见「条目还在、只是不可见」，
+	// 这与 GET /tenon/modules 的可见视图是两件事。
 	writeJSON(w, http.StatusOK, modulesResponse{Modules: s.modules.List()})
 }
 
-// normalizeBaseURL 校验并规范化管理面给的模块地址。
+// normalizeBaseURL 校验并规范化模块地址（注册端点与测试面的 admin 端点共用这一份）。
 //
-// 规则与 registry 里那份一致（http/https、有主机名、无查询串或锚点、去掉结尾 '/'），
-// 但 registry 没有导出它，而管理面必须自己给出 400 的理由与字段名，所以这里重写一份。
+// 规则：只接受 http/https（模块是进程间 HTTP 调用，别的 scheme 一定是用错了）、必须有
+// 主机名、不许带查询串或锚点（地址随后要往上拼 /tenon/actions/...，带这类尾巴拼出来
+// 必然是错的）、去掉结尾的单个 '/'（避免双斜杠）。允许带路径前缀，网关部署时模块就挂在
+// /inventory 之下。
+//
+// 放在本包而不是 registry：校验失败要回 400 且点名 baseURL 字段，而 registry 只存值、
+// 不产生 HTTP 语义。TENON_MODULES 移除后这里是**唯一**一份模块地址校验实现（D5）。
 func normalizeBaseURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -957,6 +1141,271 @@ func normalizeBaseURL(raw string) (string, error) {
 		return "", fmt.Errorf("模块地址 %q 不应带查询串或锚点", raw)
 	}
 	return strings.TrimSuffix(u.String(), "/"), nil
+}
+
+// ---------- 模块注册与心跳（全 push，spec §3 / §5） ----------
+
+// registryModule 是注册报文里的 module 段（spec §3.1）。
+type registryModule struct {
+	ID      string `json:"id"`
+	BaseURL string `json:"baseURL"`
+	// Manifest 是模块的能力摘要，与 /.well-known/tenon 同形；这里只做「哈希能否自洽」的
+	// 校验，不解析其内部结构（那是 internal/spec 的事，且本轮不据此路由）。
+	Manifest json.RawMessage `json:"manifest"`
+}
+
+// registryRegisterRequest 是 POST /tenon/registry/register 的请求体。
+type registryRegisterRequest struct {
+	Module registryModule `json:"module"`
+	// DeclarationHash 形如 sha256:<64 hex>，必须等于 sha256(JCS(manifest))。
+	DeclarationHash string `json:"declarationHash"`
+}
+
+// registryRegisterResponse 是注册成功的回执。ttlSec 与 registry.DefaultTTL 同源：
+// 模块侧据此决定心跳间隔，两处各自写死会悄悄错配（TTL 比心跳短 = 永远 lost）。
+type registryRegisterResponse struct {
+	Accepted bool `json:"accepted"`
+	TTLSec   int  `json:"ttlSec"`
+}
+
+// registryHeartbeatRequest 是 POST /tenon/registry/heartbeat 的请求体。
+type registryHeartbeatRequest struct {
+	ModuleID        string `json:"moduleId"`
+	DeclarationHash string `json:"declarationHash"`
+}
+
+// registryHeartbeatResponse 是心跳成功的回执。
+type registryHeartbeatResponse struct {
+	Alive bool `json:"alive"`
+}
+
+// registryReRegisterResponse 是 409 的报文：告诉模块「别重试心跳，重申报」。
+//
+// 用扁平结构而不是 tenonError 信封，是因为它承载的是一条**指令**（reRegister），
+// 不是一个错误分类——对端读到 reason 就该去 POST /register。
+type registryReRegisterResponse struct {
+	ReRegister bool   `json:"reRegister"`
+	Reason     string `json:"reason"`
+}
+
+// serveRegistryRegister 登记一个模块（spec §3.1）。
+//
+// 校验顺序是有意的：验签（你是谁）→ 报文结构（说得清楚吗）→ 声明哈希（说的是同一份
+// 东西吗）→ 落表。任何一步失败都不留半条记录——「半真半假的申报」一旦进表，心跳就会
+// 用一个与 manifest 无关的哈希继续刷新它，从此没人能发现这份声明是假的。
+func (s *Server) serveRegistryRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if !s.registryAuthReady(w) {
+		return
+	}
+	body := s.readVerifiedBody(w, r)
+	if body == nil {
+		return
+	}
+	var req registryRegisterRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeTenonError(w, *newError(protocol.ClassContractViolation, "SCHEMA_MISMATCH",
+			"请求体必须是 {module:{id,baseURL,manifest}, declarationHash}："+err.Error()))
+		return
+	}
+	id := strings.TrimSpace(req.Module.ID)
+	if id == "" {
+		writeTenonError(w, *newError(protocol.ClassContractViolation, "MISSING_MODULE_ID",
+			"注册报文缺少 module.id"))
+		return
+	}
+	base, err := normalizeBaseURL(req.Module.BaseURL)
+	if err != nil {
+		e := newError(protocol.ClassContractViolation, "INVALID_MODULE_BASE_URL", err.Error())
+		e.Details = map[string]any{"module": id}
+		writeTenonError(w, *e)
+		return
+	}
+	manifest := bytes.TrimSpace(req.Module.Manifest)
+	if len(manifest) == 0 || bytes.Equal(manifest, []byte("null")) {
+		writeTenonError(w, *newError(protocol.ClassContractViolation, "MISSING_MANIFEST",
+			"注册报文缺少 module.manifest：没有声明的注册无法被校验，只增地址等于绕开哈希校验"))
+		return
+	}
+	declared := normalizeDeclarationHash(req.DeclarationHash)
+	if declared == "" {
+		writeTenonError(w, *newError(protocol.ClassContractViolation, "MISSING_DECLARATION_HASH",
+			"注册报文缺少 declarationHash"))
+		return
+	}
+	want, err := declarationHashOf(manifest)
+	if err != nil {
+		writeTenonError(w, *newError(protocol.ClassContractViolation, "INVALID_MANIFEST",
+			"module.manifest 无法规范化（必须是 JSON 值且数字在 float64 范围内）："+err.Error()))
+		return
+	}
+	if declared != want {
+		// 409 而不是 400：报文结构没错，错的是「你带来的哈希与这份 manifest 不是同一份」。
+		// 这种不一致通常意味着对端用了另一套规范化（或缓存了旧声明），重发报文能修好。
+		log.Printf("controlplane: 模块 %q 的声明哈希与 manifest 不符（declared=%s 期望 %s），已拒绝注册",
+			id, declared, want)
+		writeJSON(w, http.StatusConflict, registryReRegisterResponse{
+			ReRegister: true, Reason: reasonDeclarationMismatch,
+		})
+		return
+	}
+	// Upsert 保留既有 Enabled（D2 粘性）：对一个被人工摘掉的模块重新注册，只刷新声明与
+	// 存活状态，不把它偷偷放回调度。登记哈希存**规范化后的值**，这样心跳侧不必再做大小写
+	// 归一就能比对上（registry.Touch 做的是精确比较）。
+	s.modules.Upsert(registry.ModuleEntry{
+		ID:              id,
+		BaseURL:         base,
+		DeclarationHash: want,
+		Manifest:        manifest,
+	})
+	writeJSON(w, http.StatusOK, registryRegisterResponse{
+		Accepted: true,
+		TTLSec:   int(registry.DefaultTTL / time.Second),
+	})
+}
+
+// serveRegistryHeartbeat 刷新一个模块的存活（spec §3.2）。
+//
+// 心跳刻意只带 moduleId + declarationHash：完整声明在注册时已经给过，心跳只需要回答
+// 「还是那一份吗」。答案是否（或 host 根本不认识这个 id）就回 409 要求重申报——
+// 用 200 + reRegister 会把「契约冲突」说成「正常回执」，对端的重试逻辑会一直走错分支。
+func (s *Server) serveRegistryHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodPost)
+		return
+	}
+	if !s.registryAuthReady(w) {
+		return
+	}
+	body := s.readVerifiedBody(w, r)
+	if body == nil {
+		return
+	}
+	var req registryHeartbeatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeTenonError(w, *newError(protocol.ClassContractViolation, "SCHEMA_MISMATCH",
+			"请求体必须是 {moduleId, declarationHash}："+err.Error()))
+		return
+	}
+	id := strings.TrimSpace(req.ModuleID)
+	if id == "" {
+		writeTenonError(w, *newError(protocol.ClassContractViolation, "MISSING_MODULE_ID",
+			"心跳报文缺少 moduleId"))
+		return
+	}
+	declared := normalizeDeclarationHash(req.DeclarationHash)
+	if declared == "" {
+		// 空哈希必须在这里拦住：registry.Touch 只在「登记哈希非空」时才比对，而登记哈希
+		// 恰恰可以为空（管理面或旧路径登记的条目），于是一个不带声明的心跳会退化成
+		// 「任何哈希都对」——那等于给没有声明的请求发存活。
+		writeTenonError(w, *newError(protocol.ClassContractViolation, "MISSING_DECLARATION_HASH",
+			"心跳报文缺少 declarationHash：心跳必须证明「还是那一份声明」"))
+		return
+	}
+	ok, reason := s.modules.Touch(id, declared)
+	if !ok {
+		// registry 只会给出这两种理由；真出现第三种，说明两侧契约分叉了。记一条日志而不是
+		// 静默透传：否则模块侧会拿着一个没人认识的 reason 去猜该做什么。
+		if reason != reasonUnknownModule && reason != reasonDeclarationChanged {
+			log.Printf("controlplane: 模块 %q 的心跳被拒，registry 给出了未知理由 %q", id, reason)
+		}
+		// reason 原样透传（unknown-module / declaration-changed）：模块侧据此决定是「重申报」
+		// 还是「先查自己的 manifest 版本」，多一层翻译只会失真。
+		writeJSON(w, http.StatusConflict, registryReRegisterResponse{ReRegister: true, Reason: reason})
+		return
+	}
+	writeJSON(w, http.StatusOK, registryHeartbeatResponse{Alive: true})
+}
+
+// registryAuthReady 检查共享密钥是否装配好；未装配时写好 503 并返回 false。
+//
+// 503 而不是 404：路径存在、当前不可用。D7 的「拒绝启动」落在 cmd/host（生产进程），
+// 这里留一条说得清原因的 503，是为了不让「没配密钥」表现成「宿主没这个端点」。
+func (s *Server) registryAuthReady(w http.ResponseWriter) bool {
+	if len(s.hmacSecret) > 0 {
+		return true
+	}
+	writeTenonError(w, *newError(protocol.ClassRetryable, "REGISTRY_AUTH_UNAVAILABLE",
+		"模块注册/心跳端点未配置共享密钥：请设置 "+EnvHMACSecretFile+
+			"（指向一个非空密钥文件）后重启宿主。缺密钥时宿主拒绝启动，不应走到这里"))
+	return false
+}
+
+// readVerifiedBody 是注册/心跳共用的前置：读**原始字节** → 验签 → 交给调用方解析。
+//
+// 顺序不能反：签名覆盖的是原始字节，先反序列化再序列化会得到另一串（键序、浮点格式、
+// 空白都会变），验签必然失败。返回 nil 表示错误响应已经写好了。
+func (s *Server) readVerifiedBody(w http.ResponseWriter, r *http.Request) json.RawMessage {
+	if perr := preflight(r); perr != nil {
+		writeTenonError(w, *perr)
+		return nil
+	}
+	body, perr := readBody(r)
+	if perr != nil {
+		writeTenonError(w, *perr)
+		return nil
+	}
+	if perr := s.verifySignature(r, body); perr != nil {
+		// 401 而不是 protocol.StatusFor(class)：四类 class 里没有「鉴权失败」，最接近的是
+		// policy_denied（不可重试、不得继续），但它映射到 403。状态码由这里显式给。
+		writeTenonErrorStatus(w, http.StatusUnauthorized, *perr)
+		return nil
+	}
+	return body
+}
+
+// verifySignature 校验 X-Tenon-Signature（spec §5：HMAC-SHA256，容差 ±300s）。
+//
+// 三类理由分开记：format（头缺失或写法不对）、expired（时间戳超差）、invalid（结构对
+// 但算不出同一个 HMAC）。分开是因为处置完全不同——补签名、对时钟、还是核对密钥。
+func (s *Server) verifySignature(r *http.Request, body []byte) *protocol.Error {
+	header := strings.TrimSpace(r.Header.Get(protocol.HeaderSignature))
+	err := protocol.Verify(s.hmacSecret, header, body, time.Now(), protocol.SignatureTolerance)
+	if err == nil {
+		return nil
+	}
+	code, reason := "SIGNATURE_FORMAT", signatureReasonFormat
+	switch {
+	case errors.Is(err, protocol.ErrSignatureExpired):
+		code, reason = "SIGNATURE_EXPIRED", signatureReasonExpired
+	case errors.Is(err, protocol.ErrSignatureInvalid):
+		code, reason = "SIGNATURE_INVALID", signatureReasonInvalid
+	}
+	e := newError(protocol.ClassPolicyDenied, code, "验签失败（"+reason+"）："+err.Error())
+	e.Details = map[string]any{"reason": reason, "header": protocol.HeaderSignature}
+	return e
+}
+
+// normalizeDeclarationHash 把申报来的哈希归一成可比较的形式：去两端空白 + 小写。
+//
+// 两侧都必须过这一步，否则会出现「注册时宽容、心跳时严格」的不对称：注册用 EqualFold
+// 接受了大写十六进制、登记成小写之后，同一个模块带大写哈希来心跳就会被判成
+// declaration-changed，于是一个算式完全正确的模块陷入「409 → 重申报 → 409」的死循环。
+// 十六进制大小写不改变哈希语义，归一化是安全的；真正的不一致仍然会比对出来。
+func normalizeDeclarationHash(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
+// declarationHashOf 算声明哈希：sha256: + hex(sha256(JCS(manifest)))（spec §3.1）。
+//
+// 必须先反序列化成通用 JSON 值再走 protocol.CanonicalJSON：manifest 的键序与空白由
+// 各模块自己决定，直接对原始字节求 sha256 会让同一份声明在不同生成器（甚至不同版本的
+// 序列化库）之间算出不同值，哈希就失去「同一份声明只有一个值」的意义。模块侧用同一个
+// protocol.CanonicalJSON，两侧才可能得出同一个哈希。
+func declarationHashOf(manifest json.RawMessage) (string, error) {
+	var v any
+	if err := json.Unmarshal(manifest, &v); err != nil {
+		return "", err
+	}
+	canon, err := protocol.CanonicalJSON(v)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canon)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 // ---------- 共驾帧（REST 降级通道） ----------

@@ -5,9 +5,18 @@
       "agent": "ag_fulfillment",
       "allow": [
         {
+          "module": "quote",
+          "actions": [
+            "quote.GetQuote",
+            "quote.ListQuotes",
+            "quote.CreateStandardPartQuote"
+          ]
+        },
+        {
           "module": "inventory",
           "actions": [
             "inventory.GetStock",
+            "inventory.ListStock",
             "inventory.DeductStock",
             "inventory.ReleaseStock"
           ],
@@ -18,7 +27,10 @@
         },
         {
           "module": "procurement",
-          "actions": ["procurement.CreatePurchaseRequest"],
+          "actions": [
+            "procurement.CreatePurchaseRequest",
+            "procurement.ListPurchaseRequests"
+          ],
           "constraints": {
             "window": "PT1H",
             "maxUnitsPerWindow": 100
@@ -30,10 +42,25 @@
   ],
   "subjects": {
     "user:alice": [
+      "quote.GetQuote",
+      "quote.ListQuotes",
+      "quote.CreateStandardPartQuote",
       "inventory.GetStock",
+      "inventory.ListStock",
       "inventory.DeductStock",
       "inventory.ReleaseStock",
-      "procurement.CreatePurchaseRequest"
+      "procurement.CreatePurchaseRequest",
+      "procurement.ListPurchaseRequests"
+    ],
+    "user:bob": [
+      "inventory.GetStock",
+      "inventory.ListStock",
+      "inventory.DeductStock",
+      "inventory.ReleaseStock",
+      "procurement.CreatePurchaseRequest",
+      "procurement.ListPurchaseRequests",
+      "quote.GetQuote",
+      "quote.ListQuotes"
     ]
   }
 }

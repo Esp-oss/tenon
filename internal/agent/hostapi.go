@@ -98,6 +98,21 @@ func (c *HostClient) currentToken() string {
 	return c.token
 }
 
+// Token 返回可用的宿主 token；还没有就登录一次。供主循环签发票据使用。
+func (c *HostClient) Token(ctx context.Context) (string, error) {
+	if tok := c.currentToken(); tok != "" {
+		return tok, nil
+	}
+	if err := c.relogin(ctx); err != nil {
+		return "", err
+	}
+	tok := c.currentToken()
+	if tok == "" {
+		return "", fmt.Errorf("agent: 登录后仍没有 token")
+	}
+	return tok, nil
+}
+
 // do 带 token 发请求；遇 401 重登一次再重试该请求。
 //
 // 只重试一次：重登之后仍 401 说明凭证或角色就是不对，再登下去就是打自己的登录接口。

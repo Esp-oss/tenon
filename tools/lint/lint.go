@@ -39,8 +39,12 @@ var codeExts = map[string]bool{
 	".ts": true, ".tsx": true, ".js": true, ".jsx": true, ".mjs": true, ".cjs": true,
 }
 
-// skipDirs 逐字跳过：都是依赖树与版本库元数据，不是接入方源码。
-var skipDirs = map[string]bool{"node_modules": true, ".git": true}
+// skipDirs 逐字跳过：都是依赖树、版本库元数据与本地产物，不是接入方源码。
+//
+// `out/` 是 .gitignore 的构建/验收产物。把它算进来会有具体后果：verify-ui 会在
+// out/ui-verify/edge-profile 下留一份 Edge 用户目录，里面的第三方扩展 JS 会被规则 1
+// 判成"事件订阅里写 action"——门禁因此常红，而真正该看的源码零命中。
+var skipDirs = map[string]bool{"node_modules": true, ".git": true, "out": true}
 
 // ruleSet 选择一次扫描启用哪几条规则。
 type ruleSet struct {

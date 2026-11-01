@@ -34,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +64,11 @@ const (
 	EnvHMACSecretFile = "TENON_HMAC_SECRET_FILE"
 	// EnvAuditPath 模块侧审计 JSONL 路径；缺省 ./audit-<moduleID>.jsonl。
 	EnvAuditPath = "TENON_MODULE_AUDIT_PATH"
+	// EnvTrustedKeys 是宿主签名公钥的信任集文件（{"<kid>":"<base64>"}）。
+	// 读不到就不验票：enforce 下等于拒绝一切写，warn 下只记日志。
+	EnvTrustedKeys = "TENON_TRUSTED_KEYS"
+	// EnvTicketMode 取 enforce（缺省）或 warn（仅本机联调）。
+	EnvTicketMode = "TENON_TICKET_MODE"
 )
 
 const (
@@ -139,15 +145,18 @@ type Action struct {
 	Title   string `json:"title"`
 	// SummaryTemplate 是给人看的一句话模板（module-manifest / action schema 的可选字段）。
 	// 占位符只从本次 args 取值：它渲染的是「这一次要做什么」，不是动作说明书。
-	SummaryTemplate string           `json:"summaryTemplate,omitempty"`
-	Kind            string           `json:"kind"` // read | write
-	InputSchema     json.RawMessage  `json:"inputSchema"`
-	OutputSchema    json.RawMessage  `json:"outputSchema,omitempty"`
-	Risk            Risk             `json:"risk"`
-	Idempotency     *Idempotency     `json:"idempotency,omitempty"`
-	Compensation    *Compensation    `json:"compensation,omitempty"`
-	TimeoutMs       int              `json:"timeoutMs,omitempty"`
-	DryRun          DryRunCapability `json:"dryRun"`
+	SummaryTemplate string `json:"summaryTemplate,omitempty"`
+	// RequiredArgs 是「调起来至少要给哪些字段」，取自 InputSchema.required。
+	// 只给字段名不给类型：类型由模块侧入参校验兜住，agent 侧只需要知道必须写什么。
+	RequiredArgs []string         `json:"requiredArgs,omitempty"`
+	Kind         string           `json:"kind"` // read | write
+	InputSchema  json.RawMessage  `json:"inputSchema"`
+	OutputSchema json.RawMessage  `json:"outputSchema,omitempty"`
+	Risk         Risk             `json:"risk"`
+	Idempotency  *Idempotency     `json:"idempotency,omitempty"`
+	Compensation *Compensation    `json:"compensation,omitempty"`
+	TimeoutMs    int              `json:"timeoutMs,omitempty"`
+	DryRun       DryRunCapability `json:"dryRun"`
 }
 
 // Module 是一个模块的声明与回调集合。
@@ -168,6 +177,11 @@ type Module struct {
 	Handle func(ctx context.Context, actionID string, args json.RawMessage) (json.RawMessage, *protocol.Error)
 	// DryRun 可选：返回预期 diff（DryRunReport 对象）。为 nil 表示所有 action 都不支持预演。
 	DryRun func(ctx context.Context, actionID string, args json.RawMessage) (json.RawMessage, *protocol.Error)
+
+	// TrustedKeys 是宿主签名公钥的信任集。为空表示"没配"，此时 enforce 拒写。
+	TrustedKeys protocol.KeySet
+	// TicketMode 取 enforce（缺省）或 warn（仅本机联调）。
+	TicketMode string
 
 	// TestMode 打开仅测试态的管理端点 POST /tenon/admin/reset（设计增量 §2.3）。
 	// 用途单一：D1 差异测试要跑 A/B 两轮，两轮输入必须完全相同，因此需要一个
@@ -190,7 +204,16 @@ type Module struct {
 	idem     map[string]*idemRecord
 	eventLog []storedEvent
 	eventIDs map[string]struct{}
-	seq      int64
+	// ticketUses 记录票据 id → 幂等键，用于"一票只服务一笔业务"的判定。
+	ticketUses map[string]string
+
+	// 审计链状态。auditMu 独立于 m.mu：事件入箱与写动作都会追加审计，
+	// 共用一把锁会把两条互不相关的路径串行化，也会引入新的锁序。
+	auditMu    sync.Mutex
+	auditHead  string
+	auditSeq   int64
+	auditReady bool
+	seq        int64
 
 	// 发件箱：模块自己产生的事件，供 agent 用 direction=out 轮询（设计增量 §2.2）。
 	// 用独立互斥锁而不是复用 mu：EmitEvent 的常见调用点就在 Handle 回调内部，
@@ -303,6 +326,7 @@ func (m *Module) resetState() {
 	m.idem = make(map[string]*idemRecord)
 	m.eventLog = nil
 	m.eventIDs = make(map[string]struct{})
+	m.ticketUses = make(map[string]string)
 	m.seq = 0
 
 	// 发件箱与它的去重索引必须在同一个临界区里成对清空：只清其中一个，
@@ -435,6 +459,18 @@ type auditRecord struct {
 	ErrorCode      string `json:"errorCode"`
 	EventID        string `json:"eventId,omitempty"`
 	EventType      string `json:"eventType,omitempty"`
+
+	// 以下字段用于"两侧对得上账"（P0-2）：前五个来自宿主签发的票据，
+	// 后三个是链上的位置与指纹。旧版本写的记录没有它们，读取侧按 legacy 处理。
+	AuditID     string `json:"auditId,omitempty"`
+	PlanID      string `json:"planId,omitempty"`
+	StepID      string `json:"stepId,omitempty"`
+	ApprovedBy  string `json:"approvedBy,omitempty"`
+	TicketID    string `json:"ticketId,omitempty"`
+	Seq         int64  `json:"seq,omitempty"`
+	PrevHash    string `json:"prevHash,omitempty"`
+	Hash        string `json:"hash,omitempty"`
+	LegacyCount int    `json:"legacyCount,omitempty"`
 }
 
 // manifest 是 GET /.well-known/tenon 的响应体（module-manifest.schema.json）。
@@ -460,10 +496,12 @@ type actionSummary struct {
 	Title   string `json:"title"`
 	// SummaryTemplate 必须出现在摘要线：agent 的能力发现只读这条（D15），
 	// 少了它，agent 每次渲染白话都要回拉完整 Action。
-	SummaryTemplate string           `json:"summaryTemplate,omitempty"`
-	Kind            string           `json:"kind"`
-	Risk            Risk             `json:"risk"`
-	DryRun          DryRunCapability `json:"dryRun"`
+	SummaryTemplate string `json:"summaryTemplate,omitempty"`
+	// RequiredArgs 同样走摘要线：规划 prompt 靠它写 args，等执行期才发现缺字段就太晚。
+	RequiredArgs []string         `json:"requiredArgs,omitempty"`
+	Kind         string           `json:"kind"`
+	Risk         Risk             `json:"risk"`
+	DryRun       DryRunCapability `json:"dryRun"`
 }
 
 type eventSummary struct {
@@ -497,6 +535,26 @@ func (m *Module) build() error {
 	}
 	if len(m.Actions) == 0 {
 		return errors.New("module.Actions 不能为空")
+	}
+
+	if m.TicketMode == "" {
+		m.TicketMode = strings.ToLower(strings.TrimSpace(os.Getenv(EnvTicketMode)))
+		if m.TicketMode == "" {
+			m.TicketMode = TicketModeEnforce
+		}
+	}
+	if m.TicketMode != TicketModeEnforce && m.TicketMode != TicketModeWarn {
+		return fmt.Errorf("%s=%q 非法，只能是 %s 或 %s", EnvTicketMode, m.TicketMode,
+			TicketModeEnforce, TicketModeWarn)
+	}
+	if len(m.TrustedKeys) == 0 {
+		if path := strings.TrimSpace(os.Getenv(EnvTrustedKeys)); path != "" {
+			keys, err := protocol.LoadKeySetFile(path)
+			if err != nil {
+				return fmt.Errorf("读取 %s=%s 失败：%w", EnvTrustedKeys, path, err)
+			}
+			m.TrustedKeys = keys
+		}
 	}
 
 	m.index = make(map[string]*actionMeta, len(m.Actions))
@@ -542,6 +600,9 @@ func (m *Module) build() error {
 		required, err := requiredOf(a.InputSchema)
 		if err != nil {
 			return fmt.Errorf("action %q 的 inputSchema 不可用：%w", a.ID, err)
+		}
+		if err := checkRequiredArgs(a, required); err != nil {
+			return err
 		}
 		if len(bytes.TrimSpace(a.OutputSchema)) == 0 {
 			return fmt.Errorf("action %q 必须声明 outputSchema（action.schema.json 的 required）", a.ID)
@@ -646,6 +707,18 @@ func checkIdempotency(a *Action, required []string) error {
 	return nil
 }
 
+// checkRequiredArgs 把「声明与契约不一致」挡在启动期：requiredArgs 必须是
+// inputSchema.required 的子集。不挡的话，模块会装上一个 agent 永远规划不出
+// 合法 args 的动作——错误会推迟到执行期的 400，排障成本高一个数量级。
+func checkRequiredArgs(a *Action, required []string) error {
+	for _, name := range a.RequiredArgs {
+		if !slices.Contains(required, name) {
+			return fmt.Errorf("action %q 的 requiredArgs 含 %q，但它不在 inputSchema.required %v 里（声明与契约不一致）", a.ID, name, required)
+		}
+	}
+	return nil
+}
+
 // checkCompensation 校验补偿声明的词法。argMap 的键随动作语义变化，故不封闭。
 func checkCompensation(a *Action) error {
 	c := a.Compensation
@@ -735,6 +808,10 @@ type handler struct {
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
+	// 业务页面：不在协议面上（不协商 Tenon-Version、不要求 token），
+	// 与宿主侧的 GET / 与 /ui/… 同一口径（interfaces.md §4）。
+	case path == "/" || strings.HasPrefix(path, "/ui/"):
+		h.serveUI(w, r)
 	case path == "/healthz":
 		h.serveHealth(w, r)
 	case path == "/readyz":
@@ -745,6 +822,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveEvents(w, r)
 	case h.resetEnabled && path == adminResetPath:
 		h.serveReset(w, r)
+	case path == "/tenon/audit/local":
+		h.serveAuditLocal(w, r)
 	case strings.HasPrefix(path, "/tenon/actions/"):
 		h.serveAction(w, r, strings.TrimPrefix(path, "/tenon/actions/"))
 	default:
@@ -822,7 +901,30 @@ func (h *handler) serveManifest(w http.ResponseWriter, r *http.Request) {
 		writeTenonError(w, *perr)
 		return
 	}
-	m := h.m
+	writeJSON(w, http.StatusOK, h.m.manifestOf())
+}
+
+// ManifestJSON 返回 GET /.well-known/tenon 的响应体字节（module-manifest.schema.json）。
+//
+// 导出是给模块侧的注册客户端用的：注册报文里的 module.manifest 必须与这个端点同形
+// 同内容，否则 host 侧的声明哈希校验会拿两份不同的东西去比（一份来自端点、一份来自
+// 注册报文）。所以这里刻意不提供「另写一个摘要生成器」的选项——摘要只有这一份实现，
+// 能力发现与注册申报才不可能分叉。
+//
+// 返回错误只会来自定义自检（与 Handler() 同一条判据）或编组失败，两者都是接入方 bug。
+func (m *Module) ManifestJSON() ([]byte, error) {
+	if err := m.prepare(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(m.manifestOf())
+}
+
+// manifestOf 组装摘要级能力清单。serveManifest 与 ManifestJSON 共用它：两条路径
+// 输出的字节必须一致，否则同一个 manifest 会算出两个声明哈希。
+//
+// 调用方必须已通过 prepare()（Handler 与 ManifestJSON 都保证了这一点）：Actions 的
+// TimeoutMs 兜底与词法校验都在那里完成。
+func (m *Module) manifestOf() manifest {
 	out := manifest{
 		Tenon:        protocol.Version,
 		Module:       moduleInfo{ID: m.id(), Version: m.Version, Title: m.Title},
@@ -835,19 +937,23 @@ func (h *handler) serveManifest(w http.ResponseWriter, r *http.Request) {
 		a := &m.Actions[i]
 		out.Actions = append(out.Actions, actionSummary{
 			ID: a.ID, Version: a.Version, Title: a.Title, Kind: a.Kind,
-			Risk: a.Risk, DryRun: a.DryRun, SummaryTemplate: a.SummaryTemplate,
+			Risk: a.Risk, DryRun: a.DryRun,
+			SummaryTemplate: a.SummaryTemplate, RequiredArgs: a.RequiredArgs,
 		})
 	}
 	for _, ev := range m.Events {
 		out.Events = append(out.Events, eventSummary{Type: ev, Version: DefaultEventVersion})
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out
 }
 
 // capabilitiesOf 声明可选能力标签。dry-run 只有在「有回调且确有动作支持」时
 // 才出现，否则声明的能力会与实现对不上（module-manifest.schema.json 的 DryRunCapability 说明）。
 func capabilitiesOf(m *Module) []string {
-	caps := make([]string, 0, 2)
+	// ticket 只在 enforce 下声明：warn 模式的模块仍然会执行无票请求，
+	// 对一致性套件来说它与"没有票据机制"是同一件事。
+	caps := make([]string, 0, 3)
+
 	if m.DryRun != nil {
 		for i := range m.Actions {
 			if m.Actions[i].DryRun.Supported {
@@ -855,6 +961,9 @@ func capabilitiesOf(m *Module) []string {
 				break
 			}
 		}
+	}
+	if m.TicketMode == TicketModeEnforce {
+		caps = append(caps, "ticket")
 	}
 	return append(caps, "event-replay")
 }
@@ -914,7 +1023,7 @@ func (h *handler) serveActionExecute(w http.ResponseWriter, r *http.Request, met
 
 	if a.Kind != "write" {
 		// read 无幂等语义（semantics.md §5.1）：不查表、不写审计、不要求 Idempotency-Key。
-		h.run(w, r.Context(), a, args, argsHash, "")
+		h.run(w, r.Context(), a, args, argsHash, "", nil)
 		return
 	}
 
@@ -925,10 +1034,20 @@ func (h *handler) serveActionExecute(w http.ResponseWriter, r *http.Request, met
 		return
 	}
 
+	// 验票：写动作没有宿主签发的票就不落地。放在幂等查表**之前**，
+	// 否则一张被重放的票只要键相同就能白拿首次结果、看起来"成功了"。
+	// 持锁之后再做：ticketUses 与幂等表共享 m.mu。
 	// 写路径持锁执行：同键并发请求只会有一个真正落地，另一个必然命中首次结果。
 	// 代价是写操作串行化；参考实现选正确性，真实实现应改成键级 in-flight 占位。
 	h.m.mu.Lock()
 	defer h.m.mu.Unlock()
+
+	tk, rej := h.m.checkTicket(r, args, a.ID, time.Now().UTC())
+	if rej != nil {
+		if h.rejectTicket(w, rej, a.ID) {
+			return
+		}
+	}
 
 	if rec, ok := h.m.idem[key]; ok {
 		if rec.actionID != a.ID || rec.argsHash != argsHash {
@@ -948,14 +1067,14 @@ func (h *handler) serveActionExecute(w http.ResponseWriter, r *http.Request, met
 		return
 	}
 
-	h.run(w, r.Context(), a, args, argsHash, key)
+	h.run(w, r.Context(), a, args, argsHash, key, tk)
 }
 
 // run 执行一次已经通过契约校验的调用，并写出响应。
 //
 // 写操作要求调用方持有 m.mu：幂等记录与审计追加都要串行化，否则同键并发会
 // 产生两次副作用、审计行也会交错。
-func (h *handler) run(w http.ResponseWriter, ctx context.Context, a *Action, args json.RawMessage, argsHash, idemKey string) {
+func (h *handler) run(w http.ResponseWriter, ctx context.Context, a *Action, args json.RawMessage, argsHash, idemKey string, tk *protocol.Ticket) {
 	now := time.Now().UTC()
 	out, perr := h.m.Handle(ctx, a.ID, args)
 	var body []byte
@@ -975,7 +1094,7 @@ func (h *handler) run(w http.ResponseWriter, ctx context.Context, a *Action, arg
 		// 幂等记录先落、审计后写。审计写失败时响应改成 retryable/AUDIT_WRITE_FAILED，
 		// 但幂等记录**保留首次真实结果**——宿主带同一个键重试会拿到真实结论，
 		// 不会重复副作用，也不会把「已落库」误判成「从未发生」。
-		if err := h.record(a, argsHash, idemKey, body, status, perr, now); err != nil {
+		if err := h.record(a, argsHash, idemKey, body, status, perr, now, tk); err != nil {
 			writeTenonError(w, protocol.NewError(protocol.ClassRetryable, "AUDIT_WRITE_FAILED",
 				"模块侧审计写入失败，拒绝确认本次结果："+err.Error()))
 			return
@@ -985,7 +1104,7 @@ func (h *handler) run(w http.ResponseWriter, ctx context.Context, a *Action, arg
 }
 
 // record 落幂等记录并追加一行模块侧审计；返回值只表示审计写失败。
-func (h *handler) record(a *Action, argsHash, idemKey string, body []byte, status int, perr *protocol.Error, now time.Time) error {
+func (h *handler) record(a *Action, argsHash, idemKey string, body []byte, status int, perr *protocol.Error, now time.Time, tk *protocol.Ticket) error {
 	h.m.idem[idemKey] = &idemRecord{
 		actionID: a.ID,
 		argsHash: argsHash,
@@ -1004,6 +1123,16 @@ func (h *handler) record(a *Action, argsHash, idemKey string, body []byte, statu
 	if perr != nil {
 		rec.Result = "error"
 		rec.ErrorCode = perr.Code
+	}
+	// 票据是两侧对账的 join 键：没有它，宿主只能按幂等键猜。
+	if tk != nil {
+		rec.AuditID = tk.AuditID
+		rec.PlanID = tk.PlanID
+		rec.StepID = tk.StepID
+		rec.TicketID = tk.TicketID
+		if tk.ApprovedBy != nil {
+			rec.ApprovedBy = *tk.ApprovedBy
+		}
 	}
 	return h.m.appendAudit(rec)
 }
@@ -1289,20 +1418,21 @@ func (m *Module) auditPath() string {
 
 // appendAudit 追加一行 JSON。调用方负责串行化（写路径与事件路径都持 m.mu）。
 func (m *Module) appendAudit(rec auditRecord) error {
-	line, err := json.Marshal(rec)
-	if err != nil {
+	m.auditMu.Lock()
+	defer m.auditMu.Unlock()
+	if err := m.ensureChain(); err != nil {
 		return err
 	}
-	line = append(line, '\n')
-	f, err := os.OpenFile(m.auditPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
+	rec.Seq = m.auditSeq
+	rec.PrevHash = m.auditHead
+	rec.Hash = chainHash(m.auditHead, rec)
+	if err := m.writeAuditLine(rec); err != nil {
 		return err
 	}
-	if _, err := f.Write(line); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	// 只有真正落盘之后才推进 head：写失败还前进，下一次哈希就会指向一行不存在的内容。
+	m.auditHead = rec.Hash
+	m.auditSeq++
+	return nil
 }
 
 // auditWritable 是就绪探针的一部分：能创建并追加才算审计可用。

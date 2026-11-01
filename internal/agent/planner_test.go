@@ -385,3 +385,69 @@ func TestPromptStatesExpectedDiffShape(t *testing.T) {
 		}
 	}
 }
+
+// 规划 prompt 必须给出「这个动作要什么字段」：2026-10-27 真模型就漏了 referenceNo，
+// 预演直接 400。标题也一并给——只给 id 时模型无法判断语义。
+func TestPromptRendersActionTitleAndRequiredArgs(t *testing.T) {
+	in := PlanInput{
+		Event: DomainEvent{EventID: "evt_1", Type: "quote.completed", CorrelationID: "cor:quote/Q-1"},
+		Modules: []ModuleDigest{{
+			ID:      "inventory",
+			Actions: []string{"inventory.DeductStock"},
+			ActionMeta: map[string]ActionMeta{
+				"inventory.DeductStock": {Title: "扣减库存", RequiredArgs: []string{"sku", "qty", "referenceNo"}},
+			},
+		}},
+	}
+	got := userPrompt(in)
+	want := "    - inventory.DeductStock（扣减库存；必填：qty, referenceNo, sku）"
+	if !strings.Contains(got, want) {
+		t.Fatalf("prompt 缺动作元信息，期望包含 %q，实际：\n%s", want, got)
+	}
+
+	// 老模块只有 id（没有 ActionMeta）：仍然只渲染 id，不得出现空的括号。
+	bare := userPrompt(PlanInput{
+		Event:   DomainEvent{EventID: "evt_1", Type: "quote.completed", CorrelationID: "cor:quote/Q-1"},
+		Modules: []ModuleDigest{{ID: "inventory", Actions: []string{"inventory.GetStock"}}},
+	})
+	if !strings.Contains(bare, "    - inventory.GetStock\n") {
+		t.Fatalf("无元信息时应只渲染 id：\n%s", bare)
+	}
+}
+
+// expectedModules 是请求回合粗筛的词表来源；解析坏了会让新业务的 skill 永远选不中。
+func TestLoadSkillsParsesExpectedModules(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) {
+		t.Helper()
+		sub := filepath.Join(dir, name)
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatalf("建目录失败：%v", err)
+		}
+		if err := os.WriteFile(filepath.Join(sub, "SKILL.md"), []byte(content), 0o600); err != nil {
+			t.Fatalf("写文件失败：%v", err)
+		}
+	}
+	write("warehouse", `---
+name: warehouse-replenish
+tenon:
+  subscribes: ["warehouse.low-stock"]
+  expectedModules: ["warehouse", "inventory"]
+---
+
+补货流程正文。
+`)
+
+	store, err := LoadSkills(dir)
+	if err != nil {
+		t.Fatalf("加载失败：%v", err)
+	}
+	all := store.All()
+	if len(all) != 1 {
+		t.Fatalf("应加载 1 份，得到 %d", len(all))
+	}
+	got := all[0].ExpectedModules
+	if len(got) != 2 || got[0] != "warehouse" || got[1] != "inventory" {
+		t.Fatalf("expectedModules 解析不对：%+v", got)
+	}
+}

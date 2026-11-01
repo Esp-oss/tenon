@@ -4,6 +4,10 @@
 #
 # 为什么要浏览器：R5 断言的是**渲染结果**（可见文本里没有 action id、details 默认收起），
 # 读源码只能猜。这里用 Edge 的 --remote-debugging-port 驱动，零额外依赖。
+#
+# R1（模块动态注册）之后：TENON_MODULES 已删除，模块靠 TENON_HOST 自注册 + 每 5s 心跳；
+# 宿主靠 TENON_HMAC_SECRET_FILE 验签（缺则拒绝启动，D7）、靠 TENON_REGISTRY_EVENTS 落
+# 注册事件链。所以「模块起好了」的判据变成 GET /tenon/modules 里看得到它。
 [CmdletBinding()]
 param(
 	[int]$PendingTimeoutSec = 40,
@@ -47,6 +51,14 @@ if (-not (Test-Path $hmacFile)) {
 	[System.IO.File]::WriteAllText($hmacFile, [System.BitConverter]::ToString($buf).Replace('-', '').ToLowerInvariant())
 }
 
+# R1 自注册的三处接线：模块的 TENON_HOST、宿主的事件链路径、预期可见的模块集合。
+# 事件链每次运行从空链开始：本脚本要可重复，而上一次崩在写盘中间会让末行变成半条记录，
+# 宿主 Open 时会「拒绝接链」直接起不来（那会把「跑第二遍就红」变成常态）。
+$registryEvents = Join-Path $work 'registry-events.jsonl'
+if (Test-Path $registryEvents) { Remove-Item -Force $registryEvents }
+$hostURL = 'http://127.0.0.1:8080'
+$expectedModules = @('inventory', 'procurement', 'quote')
+
 function Start-Svc([string]$name, [hashtable]$envMap) {
 	$exe = Join-Path $bin "$name.exe"
 	$saved = @{}
@@ -75,6 +87,48 @@ function Wait-Ready([string]$name, [string]$url, [int]$timeoutSec = 40) {
 	Fail "$name 未就绪（$url）。stderr：`n$tail"
 }
 
+# Get-VisibleModules 读可见模块清单（GET /tenon/modules = enabled && alive，D5 无 static 例外）。
+# $null 表示这次没读到（宿主没起/正在重启）；空数组表示读到了但一个模块都没注册上。
+# 返回值用 `,@(...)` 包一层：PowerShell 会把空数组压成 $null，不包的话这两种情形就分不开。
+function Get-VisibleModules([string]$baseURL) {
+	try {
+		$resp = Invoke-WebRequest -Uri "$baseURL/tenon/modules" -UseBasicParsing -TimeoutSec 3
+		if ($resp.StatusCode -ne 200) { return $null }
+		return ,@(($resp.Content | ConvertFrom-Json).modules)
+	} catch {
+		return $null
+	}
+}
+
+# Wait-ModulesVisible 轮询 GET /tenon/modules 直到预期模块全部可见。
+#
+# R1 之后这是唯一的「模块在场」判据：/readyz 200 只说明模块自己活着，宿主可能完全不知道
+# 它存在。少了这一步，agent 起回合时看不到 quote/inventory，待批卡就造不出来，而失败
+# 理由会指向「agent 没规划」——方向完全错。
+function Wait-ModulesVisible {
+	param([string]$baseURL, [string[]]$expected, [int]$timeoutSec = 40)
+	$deadline = (Get-Date).AddSeconds($timeoutSec)
+	$last = '还没读到 GET /tenon/modules'
+	while ((Get-Date) -lt $deadline) {
+		$mods = Get-VisibleModules $baseURL
+		if ($null -ne $mods) {
+			$seen = @($mods | ForEach-Object { $_.id })
+			$missing = @($expected | Where-Object { $seen -notcontains $_ })
+			if ($missing.Count -eq 0) { return $seen }
+			$last = "当前可见 [$($seen -join ', ')]，仍缺 [$($missing -join ', ')]"
+		}
+		Start-Sleep -Milliseconds 300
+	}
+	$tails = ''
+	foreach ($name in 'host', 'inventory', 'procurement', 'quote') {
+		$f = Join-Path $logDir "$name.err"
+		if (Test-Path $f) { $tails += "[$name.err]`n$((Get-Content $f -Tail 10 -Encoding UTF8 | Out-String).Trim())`n" }
+	}
+	# 本脚本的宿主**不开** TEST_MODE（入站端点要留着），所以没有管理面全量视图可打。
+	Fail ("等了 $timeoutSec 秒仍未在 GET /tenon/modules 里看到全部预期模块（$($expected -join ', ')）：$last`n" +
+		"注册事件链：$registryEvents`n进程日志尾部：`n$tails")
+}
+
 $procs = @()
 $agentJob = $null
 $edge = $null
@@ -82,9 +136,9 @@ try {
 	$procs += Start-Svc 'llmstub' @{ PORT = '8099' }
 	Wait-Ready 'llmstub' 'http://127.0.0.1:8099/healthz'
 
-	$procs += Start-Svc 'inventory' @{ PORT = '8081'; TENON_MODULE_ID = 'inventory'; TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-inventory.jsonl" }
-	$procs += Start-Svc 'procurement' @{ PORT = '8082'; TENON_MODULE_ID = 'procurement'; TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-procurement.jsonl" }
-	$procs += Start-Svc 'quote' @{ PORT = '8083'; TENON_MODULE_ID = 'quote'; TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-quote.jsonl" }
+	$procs += Start-Svc 'inventory' @{ PORT = '8081'; TENON_MODULE_ID = 'inventory'; TENON_HOST = $hostURL; TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-inventory.jsonl" }
+	$procs += Start-Svc 'procurement' @{ PORT = '8082'; TENON_MODULE_ID = 'procurement'; TENON_HOST = $hostURL; TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-procurement.jsonl" }
+	$procs += Start-Svc 'quote' @{ PORT = '8083'; TENON_MODULE_ID = 'quote'; TENON_HOST = $hostURL; TENON_HMAC_SECRET_FILE = $hmacFile; TENON_MODULE_AUDIT_PATH = "$work/audit-quote.jsonl" }
 	Wait-Ready 'inventory' 'http://127.0.0.1:8081/readyz'
 	Wait-Ready 'procurement' 'http://127.0.0.1:8082/readyz'
 	Wait-Ready 'quote' 'http://127.0.0.1:8083/readyz'
@@ -92,13 +146,16 @@ try {
 	# 不开 TEST_MODE：入站端点要留着（agent 每 tick 会 poll 它们，404 只是噪音但没必要）。
 	$procs += Start-Svc 'host' @{
 		PORT = '8080'; TENON_STRICT_RULES = '1'
-		TENON_MODULES = 'quote=http://127.0.0.1:8083,inventory=http://127.0.0.1:8081,procurement=http://127.0.0.1:8082'
+		TENON_HMAC_SECRET_FILE = $hmacFile; TENON_REGISTRY_EVENTS = $registryEvents
 		TENON_USERS_FILE = 'config/users.dev.json'; TENON_SESSION_SECRET = 'dev'
 		TENON_SKILLS_DIR = 'skills'; TENON_POLICY_FILE = 'config/policies.dev.json'
 		TENON_GRANT_FILE = 'config/grants.dev.json'; TENON_INBOUND_DIR = "$work/inbound"
 		TENON_AUDIT_PATH = "$work/audit-host.jsonl"; TENON_UI_DIR = 'ui'
 	}
 	Wait-Ready 'host' 'http://127.0.0.1:8080/readyz'
+	# 端口通 ≠ 注册完：模块不在宿主清单里，agent 就规划不出 DeductStock，待批卡永远不出现。
+	$visible = Wait-ModulesVisible -baseURL $hostURL -expected $expectedModules -timeoutSec 40
+	Write-Host "✓ 三模块已自注册并可见：$($visible -join ', ')" -ForegroundColor Green
 
 	$resultFile = Join-Path $work 'agent-result.jsonl'
 	if (Test-Path $resultFile) { Remove-Item -Force $resultFile }

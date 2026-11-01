@@ -2,10 +2,40 @@
   "name": "@tenon/dsh-plugin-module-host",
   "version": "0.0.0",
   "private": true,
-  "description": "cordis 插件：把 defineModule({id, actions, events}) 挂进 dsh，注册 dsh tool、订阅事件、写审计并支持 HMR 热插拔",
+  "description": "DSH 插件：把 tenon_action(module, action, args) 经 host 闸门落到真实模块，产出两段审计",
   "type": "module",
-  "files": ["dist"],
-  "scripts": {},
-  "peerDependencies": { "@deepseek-ai/cordis": ">=3" },
-  "engines": { "node": ">=22" }
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./orchestrate": {
+      "types": "./dist/orchestrate.d.ts",
+      "default": "./dist/orchestrate.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "pnpm --filter @tenon/core run build && tsc -p tsconfig.json",
+    "test": "npm run build && node --test \"dist/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@tenon/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.4"
+  }
 }

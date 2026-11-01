@@ -72,7 +72,9 @@ flowchart TB
     X -.横切.-> MOD
 ```
 
-**协议住在规范里，宿主与运行时都可替换。** 协议层不 import 任何宿主类型：本轮的参考宿主是 Go 的 `cmd/host`，参考运行时是 `cmd/agent`；dsh 插件的进程内宿主是 M1 的另一种接入形态，不是前提。
+**协议住在规范里，宿主与运行时都可替换。** 协议层不 import 任何宿主类型：本轮的参考宿主是 Go 的 `cmd/host`，参考运行时是 `cmd/agent`。
+
+> **谁是驱动已定为决策**：[`docs/adr/0001-driver-dsh-vs-go.md`](docs/adr/0001-driver-dsh-vs-go.md) —— **DSH 做业务宿主**（回合/工具/会话/技能/审批 UI），**Tenon 控制平面仍由 Go `cmd/host` 权威提供**，`cmd/agent` 降为一致性参考实现（只服务 C/D1，不再加功能），自制 `ui/` 冻结为 demo。改动方向前先改 ADR，不要在代码里悄悄分叉。
 
 ## 语言选型：按层选，不按偏好选
 
@@ -127,7 +129,7 @@ tools/lint/       C10 反模式扫描器（Go）
 internal/         协议实现对外的全部内核：protocol / spec / module / controlplane / llm / agent / d1
 cmd/              host（控制平面）、agent（AI 运行时）、quote / inventory / procurement（模块）、tenon（工具）
 skills/           业务流程知识：每个子目录一份 SKILL.md（订阅声明 + 业务语义正文）
-packages/         @tenon/core 类型 + dsh 插件（TypeScript，M1 的进程内路径，本轮未接）
+packages/         @tenon/core（协议类型与工具，TS）。dsh 插件的职责边界见 docs/designs/dsh-adapter-boundaries/（占位包已按 ADR-0001 删除）
 demo/mini-erp/    demo 的场景说明与 D1 期望形态
 docs/             设计文档、接口文档与架构图
 ```
@@ -154,12 +156,14 @@ docs/             设计文档、接口文档与架构图
 现在能验证到的最小链路（先起模块，再起 host）：
 
 ```bash
-# 1) 先起模块（各自一个终端）
-TENON_MODULE_ID=inventory PORT=8081 go run ./cmd/inventory
-# 2) 再起 host —— 顺序反了业务规则会静默不加载
+# 1) 先起 host（模块要能找到它；模块自注册后 5s 心跳，TENON_MODULES 已删除）
 TENON_USERS_FILE=config/users.dev.json TENON_SESSION_SECRET=dev \
-TENON_INBOUND_DIR=out/inbound TENON_MODULES='inventory=http://127.0.0.1:8081' \
-TENON_SKILLS_DIR=skills go run ./cmd/host
+TENON_INBOUND_DIR=out/inbound TENON_SKILLS_DIR=skills \
+TENON_HMAC_SECRET_FILE=docker/secrets/hmac.key \
+TENON_REGISTRY_EVENTS=out/registry-events.jsonl go run ./cmd/host
+# 2) 再起模块：TENON_HOST 指宿主，模块启动即注册
+TENON_HOST=http://127.0.0.1:8080 TENON_MODULE_ID=inventory PORT=8081 \
+TENON_HMAC_SECRET_FILE=docker/secrets/hmac.key go run ./cmd/inventory
 # 3) agent（需要 LLM 凭据；无凭据时用 stub，见 .githooks 旁的说明或 compose 的 smoke profile）
 TENON_HOST_URL=http://127.0.0.1:8080 TENON_ON_BEHALF_OF=user:alice \
 TENON_AGENT_ID=ag_fulfillment TENON_AGENT_STATE_DIR=out/agent-state \
@@ -221,16 +225,18 @@ go run ./cmd/tenon d1 run --host http://127.0.0.1:8080 \
 | #1 | 修 prompt 前 | `fail` | **判定受阻**：A 轮模型输出连续 2 次没过 `plan.schema.json`，两轮无可比 |
 | #2 | 修 prompt 后 | 当时记 `pass` | **空洞通过**：A 轮只有 `inventory.GetStock`，本就没引用被摘的 `procurement`，两轮差异不是摘除造成的 |
 | #3 | 判据收紧后 | `fail` | B 轮规划出 `inventory.DeductStock` 但**缺 `referenceNo`** → 预演 400 `SCHEMA_MISMATCH` → fail-closed，B 轮 `failed` |
+| #4 | 库存种子改 0 + `requiredArgs` 进 prompt | `fail` | **实质结论**：A 轮 `[inventory.GetStock]`（completed）、B 轮 `[inventory.GetStock]`（completed）——两轮都只做只读探针，序列相同，说明 agent 没在用能力清单完成业务 |
 
-**结论：D1 至今没有被真正判定过一次。** 三种形态各不相同，但都不是「agent 自适应」的证据。
+**结论：D1 第 4 次判出实质结论 `fail`（不再是「判定受阻」）。** 前三次分别卡在「schema 撞墙」「空洞通过」「B 轮非法计划」，这次两轮都跑完了、计划也合法，但**模型只查了库存就收工**——在库 0、需求 12 的场景下它本应规划采购（唯一的写路径），却没有。这暴露的是**计划质量问题（模型不做业务闭环）**，不是契约问题：同一份 prompt 下，对话回合能正确规划「查库存 + 扣 12 件并挂起审批」（见 `scripts/verify-ai.ps1` 的通过记录），事件回合却退化成只读探针。
 
-**根因链（三层，前两层已修，第三层需单独评审）**
+**根因链（四层：前三层已修，第四层是模型行为）**
 
 1. **`expectedDiff` 的形状没写给模型**（已修）：prompt 没说元素必须含 `field`/`from`/`to`，模型自造 `{op, note}`；prompt 说 entity 可写「字符串简写」却没给格式，模型写了裸主键 `"STD-1002"`，而 `EntityRefString` 要求三段 `模块:类型/主键`（`oneOf` 两侧都不匹配时报错文本会误导成「只收对象」）。修法：第 7 条给出两种等价写法的占位示例 + 明说「只写主键是错的」，`TestPromptStatesExpectedDiffShape` 锁住。
 2. **判据会被计划质量架空**（已修）：A 轮若不含被摘模块的动作，「B 轮不碰它」是白送的。现在这种空洞通过记 **`inconclusive`**（新增第三态）而不是 `pass`，用例 `TestD1InconclusiveWhenADidNotUseRemovedModule` 锁住；退出码仍为非 0，不会被 CI 当成合格。
-3. **prompt 不带入参契约**（未修，需评审）：动作清单只列 action id（`internal/agent/planner.go` 的「可调动作」块），模型不知道 `DeductStock` 需要 `referenceNo`，写动作必然靠猜——#3 的 400 就是它。要让 D1 可判定，得把每个动作的**最小入参契约**（`required` 字段名与类型）带进 prompt，或让规划器按需拉 `GET /tenon/actions/{id}`。这是设计变更（上下文成本 vs 计划合法率），不在本轮边界内。
+3. **prompt 不带入参契约**（已修）：`requiredArgs` 已进摘要线并渲染进 prompt（`actionMetaSuffix`），模块侧加载期断言 `⊆ inputSchema.required`。证据：修之前真模型写 `DeductStock` 漏 `referenceNo`（#3 的 400）；修之后对话回合能规划出合法 args 并挂起。
+4. **模型在事件回合不做业务闭环**（未修，属模型/场景层面）：`#4` 里 A/B 都只查库存。可能的下一步：强化 skill 正文的流程约束、或让 D1 场景的「必须采购」更显式（例：事件里直接给出缺口数量）。这已不是契约问题，改它属于「调 prompt/场景」，按本轮边界先记录不实施。
 
-> 本轮边界是「只判不调」：已修的两层都是**让判定成为可能**的缺陷（不是为了让结果变绿），第三层会让判定继续受阻，但它改变的是 prompt 的信息量与上下文成本，必须单独评审。用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
+> 本轮边界是「只判不调」：前三层修的都是**让判定成为可能**的缺陷；第四层是模型的计划质量，改它容易把 D1 做成假命题，必须单独评审。用规则式规划器让 D1「通过」就是把核心命题做成假命题——宁可不判定。
 
 ### 其它检查
 
@@ -242,7 +248,21 @@ docker compose -f compose.m0.yaml config --quiet
 
 ### 还没做的
 
-dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、`requests-index.jsonl` 的 GC/归档策略（它是治理状态，不能随便删，但也没有上限）、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`tenon.request` 帧**至今没有 schema**（只在 prose 与 CHANGELOG 里）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、撤销与补偿（`ReleaseStock` 未接）、`amend`（JSON Patch 改 step 后再批）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
+dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、共驾 WS（Go 标准库无 WS 服务端，目前只有 REST 轮询）、模块侧 `X-Tenon-Grant` 真校验（M0.5 没有 grant 签发）、模块侧审计对账端点、入站帧的 `frames.schema.json` 全量校验（现在只校验 `type`）、`tenon.request` 帧**至今没有 schema**（只在 prose 与 CHANGELOG 里）、`durable` 的粘性（一次落盘失败后会一直报 `false` 直到重启）、撤销与补偿（`ReleaseStock` 未接）、`amend`（JSON Patch 改 step 后再批）、`-race` 并发验证（本机 `CGO_ENABLED=0` 且无 gcc/clang）、容器端到端 `up`。
+
+> **对话发起的小量扣减（`qty ≤ 10`）会转人工**：平台策略没有登记该区间（fail-closed 的必然结果），业务员说「扣 5 件」时会挂起给仓管批。随时可以加一条 `pol-inventory-deduct-auto-small` 改成自动，但那是一次产品语义变更，需单独决定。
+
+> **Go host 的接收侧与 `versioning.md` §3.2 不一致**：§3.2 要求「消费方遇到未知字段必须忽略并继续」，但 `internal/spec` 的校验入口按 `additionalProperties: false` 直接拒绝（2026-10-27 加 `requiredArgs` 时，`additional properties 'requiredArgs' not allowed` 就是现场）。TS 侧（`@tenon/core` 的 `src/validate`）已按「接收侧宽松、一致性侧严格」双视图实现；**Go 侧待对齐**，修它要动校验入口并评估既有用例，需单独评估。
+
+> **DSH 已经能驱动一次真实业务，但还不是产品形态**：`packages/dsh-plugin-module-host` 注册三个工具——`tenon_action`（自动执行或转为待批）、`tenon_pending`（列待批）、`tenon_resume`（续跑）。`approve` 现在是**真挂起**：整份计划落盘到 adapter 状态目录、写一条计划级 `dispatched` 审计（I7 三步），批准走 DSH 回合内的 `ctx.approval`（只有 `allowed-once` 才执行），执行时沿用原 `planId` 与幂等键，step 级两段审计带 `approvedBy`。验收可回归：`node scripts/verify-module-host.mjs`（96 条断言，真 host + 真 inventory + 真 confirm 帧 + 假 answerer；含 P0-1 签票链路与「批准后唤醒」）。
+>
+> **仍然缺的三件事**：① 公告板可见性与**批准消费**都已实现，但要显式配 agent 凭据（`agentUser`/`agentPassword` 或 `agentToken`）——那是权限，缺省关闭；消费方式是**只读不 ack**（[spec §10.3](docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md)），重启后会重读旧帧，靠归档幂等挡住；**入站治理已补**：确认帧超过 `TENON_INBOUND_CONFIRM_TTL`（缺省 1h）清掉，origin 凭证按 `TENON_ORIGIN_RETENTION`（缺省 7 天）+ 上限修剪，仍被公告板引用的凭证不丢；② `approvedBy` 现在有**两条来源**：回合内经 DSH 审批时来自部署配置（Q2 未定前的临时绑定），公告板路径来自宿主验过的 token claims——后者才是 Q2 想要的答案，前者要等 Q2 定；③ 真机上「在 DSH 里点批准」未验证（本机审批策略 disabled），但「在公告板上点批准→业务执行」已用真 host 的 confirm 帧证明。设计与裁决见 [`docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md`](docs/superpowers/specs/2026-10-29-tenon-approve-suspend-resume-design.md)。
+>
+> **批准后的自动唤醒（M1 剩余项，2026-11-01 补上）**：挂起时按 planId 记下 `exec.agent`，confirm 真正落地后用 `agent.followup` 把结论送回提出计划的会话（`packages/dsh-plugin-module-host/src/wake.ts`）。**限制**：句柄只在同一进程存活期内有效；插件重启后业务照常完成，但聊天里不会自动冒出一句话——不猜持久句柄，是这个限制存在的原因。
+>
+> 历史状态（已过期，保留上下文）：全仓曾**没有一行 dsh/cordis 代码**，操作业务的是 Go 的 `cmd/agent` + `cmd/host` + 模块。模块侧硬耦合已解一半：R1 已落地动态注册 + 心跳 + 失联自动摘除（`TENON_MODULES` 已删除，见 `docs/superpowers/specs/2026-10-27-tenon-module-registration-design.md`）；请求回合的 skill 粗筛词表也已在 2026-10-27 去掉硬编码（`knownModuleNames` 删除，改由 skill frontmatter 的 `tenon.expectedModules` / `tenon.subscribes` 自行声明）——所以「新增业务 = 加模块 + 加 skill」，不再改 agent 代码。R1–R3 / Q1–Q3 的原始记录在 [`docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md`](docs/superpowers/specs/2026-10-27-tenon-acceptance-and-module-registration.md)。
+
+> **生产安全边界尚未落地**：Tenon 侧没有 `os/exec`（业务动作只有 HTTP），「在服务器留后门」的风险**全部来自 DSH 自带工具面**（`pwsh`/`bash`/`fs` 写/`web`）。当前开发环境是 `danger-full-access` + 审批关闭，**不是生产配置**。生产已定为「只挂 Tenon 业务工具」（威胁模型档位 A），门禁用 `node scripts/check-profile-capabilities.mjs <profile>` 一条命令判定（现有 `web` profile 会报 20 项、`headless` 14 项，证明它真的会红）。细节见 [`docs/superpowers/specs/2026-10-27-tenon-security-threat-model.md`](docs/superpowers/specs/2026-10-27-tenon-security-threat-model.md)。
 
 > 页面已交付（`TENON_UI_DIR=ui`，无构建链静态页）：白话来自身份化模板，技术信息在折叠区。**可回归的验收**：`powershell -NoProfile -File scripts/verify-ui.ps1`——它起 stub 全链路、造一张待批卡，再用 Edge(CDP) 断言「卡面只有人话、技术信息默认收起、非审批人没有批准按钮」，并落两张截图到 `out/ui-verify/`。
 
@@ -259,7 +279,8 @@ dsh/cordis 原生宿主与进程内接入路径（D18 的 deferred 部分）、�
 | **M1 切片 1（已完成）** | host 入站面：落盘入站队列 / dev 身份 / `origin` 进策略 / 业务级规则 / 待批公告板 / 同源静态页 | 入站与策略侧用例全绿 |
 | **M1 切片 2（已完成）** | agent 侧：消费入站队列 / 挂起落盘（I7 三次写）/ 审批人角色通道 / 恢复执行 / 去重账本 / 公告板终态 | 端到端真跑通：投一句话 → 挂起 → bob 批准 → 真扣库存 → 归档 done |
 | **M1 切片 3 / P3（已完成）** | 白话：模块声明 `summaryTemplate` → 能力发现带回 → agent 渲染（失败退「标题+参数」）→ 公告板带 `detail` → 页面折叠 | `scripts/verify-ui.ps1` 在 Edge 里 7 条断言 × 2 身份全过：卡面只有人话、技术信息默认收起、非审批人无批准按钮 |
-| M1（剩余） | 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 + D1 判定阻塞项（prompt 不带入参契约） | 高风险路径必须人工；对账能发现篡改 |
+| **M1 切片 4 / DSH 驱动（已完成）** | DSH 侧 `module-host`：`tenon_action` / `tenon_pending` / `tenon_resume`；`approve` 真挂起（落盘 + 计划级审计 + I7 三步）、回合内经 DSH 审批、按原 planId 与幂等键续跑；待批上公告板 + **只读不 ack** 地消费 `tenon.confirm`（公告板上点批准即执行，批准人来自宿主 token）；**P0-1 票据迁移**（执行前向宿主换票，不再自己写步骤级 dispatched）；**批准后唤醒**（按 planId 记会话句柄，confirm 落地后 `agent.followup` 回灌结论） | `node scripts/verify-module-host.mjs` 96 条断言全过（真 host + 真 inventory + 真 confirm 帧 + 假 answerer）；`pnpm check` 全绿 |
+| M1（剩余） | 补偿 UI 的 amend + 共驾 WS + grant 真校验 + 审计对账 + D1 判定阻塞项（prompt 不带入参契约）；Q2 身份绑定 | 高风险路径必须人工；对账能发现篡改 |
 | M2 | HTTP 侧车 SDK + MCP 双向 + 非 TS 示例 | 非 TS 模块跑通全套用例 |
 | M3 | skill 仓库 + 轨迹蒸馏 + 发布审计/回滚 | 新流程只改 skill 即可上线 |
 

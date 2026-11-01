@@ -10,7 +10,8 @@
 //	  （Deps.State 为 nil）时 approve 仍转人工——这是 M0.5 行为的保留路径
 //	3 grants:evaluate     → 逐 action 全部先过（不允许即转人工）
 //	4 每个 write 的 :dry-run（**404 也转人工**：模块不实现预演不等于免检；
-//	  结论不是 verified 同样转人工——fail-closed，见设计文档 §8 降级矩阵）
+//	  pending/unsupported 同样转人工——fail-closed，见设计文档 §8 降级矩阵。
+//	  unsafe 例外：带裁决有界重规划，用尽仍不可行才转人工，理由见 dryRun 闸门那段注释）
 //	5 需要审批 → 挂起（I7 三次落盘；结局仍是 needs_human + PendingPlanID，
 //	  三态封闭不新增第四态）。否则每步执行前写 stage=dispatched 审计
 //	  （非 200 立即终止，本次调用数必须为 0）
@@ -18,7 +19,12 @@
 //	7 写 stage=result 审计
 //	8 按错误分类处理：retryable 退避重试（幂等键不变）；business_rejection 重新规划；
 //	  policy_denied 立即转人工（不换路）；其余当 bug 失败
-//	9 发 Intent 帧（open + highlight；没有前端接入时帧丢失而业务结果不变）
+//
+// 除上述一次性流程外，一个回合可能发生两类「带信息再来一轮」（各有预算）：
+//   - 预演判 unsafe：模块算出这一步在当前状态下不成立，裁决回填后重规划（maxReplans）；
+//   - 一整轮只有只读动作：事实已到手但处置还没开始，把事实回填后重规划
+//     （maxObservationRounds）；用尽仍无写动作则转人工——读结果不是完成。
+//     9 发 Intent 帧（open + highlight；没有前端接入时帧丢失而业务结果不变）
 //
 // 三条 fail-closed 规则贯穿全文件：
 //   - 宿主不可达 → 不做任何写，结局 failed（宁可不做，也不要做出没有审计的写）；
@@ -49,6 +55,21 @@ const (
 	// maxReplans 是 business_rejection 触发的**重新规划**上限：即最多 1 次初始规划 +
 	// 2 次重规划。它是「撞同一面墙」的止损，不是重试次数。
 	maxReplans = 2
+	// maxObservationRounds 是「只有只读动作」之后的重新规划上限：1 次初始 + 2 次观察回填。
+	//
+	// 它不是重试次数，而是「把事实交回去再想一次」的机会。用完仍拿不出写动作，说明缺的
+	// 是处置能力（能力清单里没有能完成业务的写动作），该转人工而不是继续读下去。
+	maxObservationRounds = 2
+	// observationLimit 是回填进 prompt 的单条只读响应字符上限。响应体可能是 KB 量级，
+	// 事实块必须远小于一次 prompt 的预算。
+	observationLimit = 2000
+
+	// replanReason* 是 PlanInput.ReplanReason 的取值：它决定 prompt 里那段反馈的措辞。
+	// 两种原因不能共用一段文案——「换一条路」和「给出处置」是两件不同的事。
+	replanReasonRejection   = "rejection"
+	replanReasonObservation = "observation"
+	replanReasonBlocked     = "blocked"
+
 	// maxRetries 是 retryable 的退避重试上限：同一步最多执行 1+maxRetries 次，
 	// 每次都用同一个幂等键，所以重复执行不会产生重复副作用（semantics.md §5）。
 	maxRetries = 3
@@ -64,15 +85,21 @@ const (
 	snippetLimit = 300
 	// badgeLimit 是 Intent 帧 badge 的字符上限（frames.schema.json：maxLength 120）。
 	badgeLimit = 120
+	// messageLimit 是随 Intent 帧发给界面的一句结论的上限。它比 badge 长，因为
+	// 这句话要解释「为什么」（例如哪个动作被哪条策略拒了），但也不是日志全文。
+	messageLimit = 300
 
 	// 以下取值来自 spec/0.1 的 schema（policy / plan / frames），本文件只引用字符串，
 	// 不复制它们的语义定义。
-	outcomeAuto     = "auto"     // policy.schema.json 的 outcome：可自动执行
-	outcomeApprove  = "approve"  // policy.schema.json 的 outcome：等人工批准，agent 只能挂起
-	outcomeDeny     = "deny"     // policy.schema.json 的 outcome：转人工，不得换路
-	kindRead        = "read"     // plan.schema.json 的 kind
-	kindWrite       = "write"    // plan.schema.json 的 kind
-	dryRunVerified  = "verified" // plan.schema.json 的 DryRunStatus：唯一允许自动执行的值
+	outcomeAuto    = "auto"     // policy.schema.json 的 outcome：可自动执行
+	outcomeApprove = "approve"  // policy.schema.json 的 outcome：等人工批准，agent 只能挂起
+	outcomeDeny    = "deny"     // policy.schema.json 的 outcome：转人工，不得换路
+	kindRead       = "read"     // plan.schema.json 的 kind
+	kindWrite      = "write"    // plan.schema.json 的 kind
+	dryRunVerified = "verified" // plan.schema.json 的 DryRunStatus：唯一允许自动执行的值
+	// dryRunUnsafe 是「这一步在当前状态下不成立」——事实性裁决，不是治理拒绝。
+	// 它值得回填一轮：模块刚刚算出了新的信息（DAG 里没有任何别的途径能拿到它）。
+	dryRunUnsafe    = "unsafe"
 	frameTypeIntent = "tenon.intent"
 	// auditStage* 与 internal/controlplane/audit 的两段写一致（dispatched / result）。
 	auditStageDispatched = "dispatched"
@@ -152,6 +179,11 @@ type Deps struct {
 	// 用 nil 而不是空串表达「没有」：NewStateStore("") 会报错（§0.1.6），
 	// 装配时把空串传进来只会在第一轮挂起时炸掉，而不是在装配时炸掉。
 	State *StateStore
+	// Token 取宿主签发的 agent token，供 /tenon/tickets:issue 鉴权。
+	//
+	// 为 nil 表示「没有凭据」：写动作会 fail-closed（不签票、不执行），
+	// 读动作与规划不受影响。
+	Token func(ctx context.Context) (string, error)
 }
 
 // Run 跑完一个回合并返回结局。它**不返回 error**：三种结局已经涵盖了「要不要人来」
@@ -194,6 +226,50 @@ type runner struct {
 	modules map[string]string
 	taken   []string // 真正执行过的动作
 	planID  string   // 当前（或最近一次被接受的）计划标识，结局与 Intent 帧都用它
+	// observations 是本回合只读步骤实际取回的事实，逐轮累积后回填进下一轮 prompt。
+	observations []Observation
+	// observationRounds 是已经用掉的「观察回填」次数（上限 maxObservationRounds）。
+	observationRounds int
+	// planRounds 是本回合已经发生的规划次数（含重规划），只用于日志：D1 失败时
+	// 「模型看过事实没有」与「重规划了几轮」是两条不同的结论，日志里必须能分开看。
+	planRounds int
+}
+
+// replanKind 说明「为什么还要再规划一轮」。
+type replanKind int
+
+const (
+	// replanNone 表示这一轮已经给出结局，不再规划。
+	replanNone replanKind = iota
+	// replanRejection 表示业务拒绝：换一条路。
+	replanRejection
+	// replanObservation 表示这一轮只有只读动作：事实到手了，处置还没开始。
+	replanObservation
+	// replanBlocked 表示预演判 unsafe：某个写动作在当前状态下不成立，整轮一步没执行。
+	replanBlocked
+)
+
+// replanFeedback 是「进入下一轮」的理由。
+//
+// 为什么不是一段字符串：两种理由要写进 prompt 的是不同的话（换路 vs 给处置），
+// 而且预算也不同（业务拒绝数的是 maxReplans，只读数的是 maxObservationRounds）。
+type replanFeedback struct {
+	kind replanKind
+	text string
+}
+
+// reason 映射成 PlanInput.ReplanReason（replanNone 返回空串）。
+func (f replanFeedback) reason() string {
+	switch f.kind {
+	case replanRejection:
+		return replanReasonRejection
+	case replanObservation:
+		return replanReasonObservation
+	case replanBlocked:
+		return replanReasonBlocked
+	default:
+		return ""
+	}
 }
 
 // run 是外层循环：能力发现 → （规划 → 闸门 → 执行）最多 1+maxReplans 轮。
@@ -225,26 +301,43 @@ func (r *runner) run(ctx context.Context) RunResult {
 		skillText = r.deps.Skills.TextFor(r.event.Type)
 	}
 
-	feedback := ""
-	for round := 0; round <= maxReplans; round++ {
-		res, rejection := r.round(ctx, PlanInput{
-			Event:     r.event,
-			SkillText: skillText,
-			Modules:   digest,
-			Feedback:  feedback,
+	// 两种「再来一轮」共用这一个循环，但各有各的预算：业务拒绝数 maxReplans，
+	// 只读回填数 maxObservationRounds（后者在 round 内部判定，到顶就当场转人工）。
+	// 每轮要么给出结局、要么消耗掉一次预算，所以循环必然收敛。
+	feedback := replanFeedback{}
+	replans := 0
+	for {
+		res, next := r.round(ctx, PlanInput{
+			Event:        r.event,
+			SkillText:    skillText,
+			Modules:      digest,
+			Feedback:     feedback.text,
+			ReplanReason: feedback.reason(),
+			Observations: r.observations,
 			// 事件回合这里是 nil：prompt 不得凭空多出一个空指令块（Task 6 的判据）。
 			Request: r.request,
 		})
-		if rejection == "" {
+		if next.kind == replanNone {
 			return r.finish(ctx, res)
 		}
-		feedback = rejection
+		// 业务拒绝与预演 unsafe 共用同一份「换计划」预算：都是「这一份计划不可行」，
+		// 分开计两套上限只会让最坏轮次变成 1+2+2，而收益是同一种东西。
+		if next.kind == replanRejection || next.kind == replanBlocked {
+			replans++
+			if replans > maxReplans {
+				cause := "business_rejection"
+				if next.kind == replanBlocked {
+					cause = "预演 unsafe"
+				}
+				return r.finish(ctx, RunResult{
+					Outcome: OutcomeNeedsHuman,
+					Detail: fmt.Sprintf("%s 重新规划 %d 轮后仍未通过（1 次初始 + %d 次重规划），转人工：%s",
+						cause, maxReplans, maxReplans, next.text),
+				})
+			}
+		}
+		feedback = next
 	}
-	return r.finish(ctx, RunResult{
-		Outcome: OutcomeNeedsHuman,
-		Detail: fmt.Sprintf("business_rejection 重新规划 %d 轮后仍未通过（1 次初始 + %d 次重规划），转人工：%s",
-			maxReplans, maxReplans, feedback),
-	})
 }
 
 // finish 补齐结局里的公共字段并发出 Intent 帧。
@@ -264,9 +357,9 @@ func (r *runner) finish(ctx context.Context, res RunResult) RunResult {
 
 // round 是「规划 → 闸门 → 执行」的一轮。
 //
-// 返回第二值非空表示这一轮被 business_rejection 拒绝，需要带着这条原因重新规划；
+// 返回的第二值 kind 非 replanNone 表示这一轮要求再来一轮规划（业务拒绝、或只读轮次）；
 // 其余结局都由第一值表达。
-func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
+func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, replanFeedback) {
 	plan, err := r.deps.Planner.Plan(ctx, in)
 	if err != nil {
 		var gap *capabilityGapError
@@ -274,15 +367,20 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 			// 能力不足不是崩溃：模型要求了清单里没有的动作，人需要知道缺什么。
 			r.planID = gap.PlanID
 			return RunResult{Outcome: OutcomeNeedsHuman, PlanID: gap.PlanID,
-				Detail: "能力不足，转人工（模型要求的动作不在动态清单里）：" + err.Error()}, ""
+				Detail: "能力不足，转人工（模型要求的动作不在动态清单里）：" + err.Error()}, replanFeedback{}
 		}
 		return RunResult{Outcome: OutcomeFailed,
-			Detail: "规划失败（" + planSchemaName + " 是判据）：" + err.Error()}, ""
+			Detail: "规划失败（" + planSchemaName + " 是判据）：" + err.Error()}, replanFeedback{}
 	}
 
 	// trigger 校正为真实触发源：它是审计与对账的锚点，模型抄错不该让整轮失败。
 	plan.Trigger = PlanTrigger{EventID: r.event.EventID, CorrelationID: r.correlationID}
 	r.planID = plan.PlanID
+	// 一行说清这一轮规划的形状：D1 排查时，「模型没看到事实」与「看到了仍然这么规划」
+	// 是两条完全不同的结论，而它们在结果行里长得一样（都只有一串 action id）。
+	r.planRounds++
+	log.Printf("agent: 第 %d 轮规划 planId=%s 只读=%v 事实=%d 条 动作=%v",
+		r.planRounds, plan.PlanID, allReadOnly(plan.Steps), len(in.Observations), actionIDs(plan.Steps))
 
 	// 闸门 2：策略。整份计划取最严（宿主实现）。
 	//
@@ -292,12 +390,18 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 	policy, err := r.evaluatePolicies(ctx, plan)
 	if err != nil {
 		return RunResult{Outcome: OutcomeFailed,
-			Detail: "策略评估不可用（fail-closed，不做任何写）：" + err.Error()}, ""
+			Detail: "策略评估不可用（fail-closed，不做任何写）：" + err.Error()}, replanFeedback{}
 	}
 	if policy.Outcome == outcomeDeny {
-		return RunResult{Outcome: OutcomeNeedsHuman,
-			Detail: fmt.Sprintf("策略闸门拒绝：outcome=%s decidedBy=%v reasons=%v（转人工，不换路绕过）",
-				policy.Outcome, policy.DecidedBy, policy.Reasons)}, ""
+		// 把计划动作写进 detail：只写「被拒绝」而不写「谁被拒」，排障只能靠猜
+		// （2026-10-27 的真实教训：结果行里 动作=[]，不知道是哪个动作触发了 deny）。
+		detail := fmt.Sprintf("策略闸门拒绝：outcome=%s decidedBy=%v reasons=%v",
+			policy.Outcome, policy.DecidedBy, policy.Reasons)
+		if note := planActionsNote(plan); note != "" {
+			detail += " " + note
+		}
+		detail += "（转人工，不换路绕过）"
+		return RunResult{Outcome: OutcomeNeedsHuman, Detail: detail}, replanFeedback{}
 	}
 	// policy.schema.json 是封闭枚举，但宿主的响应不受本包控制：除 auto/approve 之外的
 	// 任何取值（含空串）都按「没放行」处理——不猜它是不是 approve，也不让它掉进执行。
@@ -305,7 +409,7 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 	if policy.Outcome != outcomeAuto && !needApproval {
 		return RunResult{Outcome: OutcomeNeedsHuman,
 			Detail: fmt.Sprintf("策略闸门未放行：outcome=%s decidedBy=%v reasons=%v（转人工，不换路绕过）",
-				policy.Outcome, policy.DecidedBy, policy.Reasons)}, ""
+				policy.Outcome, policy.DecidedBy, policy.Reasons)}, replanFeedback{}
 	}
 
 	// 闸门 3：授权。逐 action 全部先过——先执行几个再撞授权拒绝，等于留下半截副作用。
@@ -314,12 +418,12 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 		grant, err := r.evaluateGrant(ctx, step)
 		if err != nil {
 			return RunResult{Outcome: OutcomeFailed,
-				Detail: "授权评估不可用（fail-closed，不做任何写）：" + err.Error()}, ""
+				Detail: "授权评估不可用（fail-closed，不做任何写）：" + err.Error()}, replanFeedback{}
 		}
 		if !grant.Allowed {
 			return RunResult{Outcome: OutcomeNeedsHuman,
 				Detail: fmt.Sprintf("授权闸门拒绝动作 %s：reason=%s（转人工，不换路绕过）",
-					step.Action, grant.Reason)}, ""
+					step.Action, grant.Reason)}, replanFeedback{}
 		}
 		grantIDs[step.StepID] = grant.MatchedGrantID
 	}
@@ -335,17 +439,33 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 		status, found, err := r.dryRun(ctx, step)
 		if err != nil {
 			return RunResult{Outcome: OutcomeFailed,
-				Detail: "预演失败（fail-closed，不做任何写）：" + err.Error()}, ""
+				Detail: "预演失败（fail-closed，不做任何写）：" + err.Error()}, replanFeedback{}
 		}
 		if !found {
 			return RunResult{Outcome: OutcomeNeedsHuman,
 				Detail: fmt.Sprintf("动作 %s 的模块未实现预演（404）：按降级矩阵强制转人工，"+
-					"不能把「没实现端点」当成「免检」", step.Action)}, ""
+					"不能把「没实现端点」当成「免检」", step.Action)}, replanFeedback{}
+		}
+		if status == dryRunUnsafe {
+			// unsafe 是**事实性**裁决：模块按当前状态算出来这一步不成立（例如可用量不足）。
+			// 直接转人工等于把它刚算出的事实丢掉——D1 实测里模型在还没读库存时就规了扣减，
+			// 预演判 unsafe 后整轮放弃，A/B 两轮序列因此完全相同，看上去像「没用能力清单」。
+			//
+			// 所以给一次带裁决的重新规划（预算与业务拒绝共用）。为什么这不是「绕路」：
+			// 换出来的写动作要自己再过一遍预演，没有哪一步能跳过它。
+			return RunResult{Outcome: OutcomeNeedsHuman,
+					Detail: fmt.Sprintf("预演结论为 unsafe：动作 %s 在当前状态下不成立，本轮一步未执行，重新规划",
+						step.Action)},
+				replanFeedback{kind: replanBlocked,
+					text: fmt.Sprintf("动作 %s 的预演结论是 unsafe：模块判定它在当前状态下不成立"+
+						"（这一步没有被执行过，也没有留下任何副作用）。", step.Action)}
 		}
 		if status != dryRunVerified {
+			// pending / unsupported 等其余非 verified 结论保持 fail-closed：那不是
+			// 「这一步不成立」，而是「说不清」——说不清就该由人来判，不是再赌一轮。
 			return RunResult{Outcome: OutcomeNeedsHuman,
 				Detail: fmt.Sprintf("预演结论为 %q（只有 %s 允许自动执行）：动作 %s，转人工",
-					status, dryRunVerified, step.Action)}, ""
+					status, dryRunVerified, step.Action)}, replanFeedback{}
 		}
 	}
 
@@ -358,27 +478,27 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 		if r.deps.State == nil {
 			return RunResult{Outcome: OutcomeNeedsHuman,
 				Detail: fmt.Sprintf("策略闸门要求审批（outcome=%s decidedBy=%v），但没有挂起通道（Deps.State 为空）：转人工",
-					policy.Outcome, policy.DecidedBy)}, ""
+					policy.Outcome, policy.DecidedBy)}, replanFeedback{}
 		}
 		// 元信息取本轮规划用的同一份发现结果（PlanInput.Modules 已带 ActionMeta）：
 		// 渲染与规划看的是同一张能力清单，不会出现「计划里的动作渲染不出模板」。
 		pending, err := r.buildPending(plan, policy, actorMeta(in.Modules))
 		if err != nil {
-			return RunResult{Outcome: OutcomeNeedsHuman, Detail: err.Error()}, ""
+			return RunResult{Outcome: OutcomeNeedsHuman, Detail: err.Error()}, replanFeedback{}
 		}
 		if err := suspend(ctx, r.deps.State, r.deps, pending); err != nil {
 			return RunResult{Outcome: OutcomeNeedsHuman,
-				Detail: "挂起失败（不留半截 pending）：" + err.Error()}, ""
+				Detail: "挂起失败（不留半截 pending）：" + err.Error()}, replanFeedback{}
 		}
 		id := pending.PlanID
 		return RunResult{Outcome: OutcomeNeedsHuman, PlanID: id, PendingPlanID: &id,
-			Detail: fmt.Sprintf("已挂起等待审批：planId=%s 需要 %v", id, pending.RequiredRoles)}, ""
+			Detail: fmt.Sprintf("已挂起等待审批：planId=%s 需要 %v", id, pending.RequiredRoles)}, replanFeedback{}
 	}
 
 	// 闸门 5–7：按依赖顺序执行，每步各写两段审计。
 	ordered, err := orderSteps(plan.Steps)
 	if err != nil {
-		return RunResult{Outcome: OutcomeFailed, Detail: "计划的 steps 无法定序：" + err.Error()}, ""
+		return RunResult{Outcome: OutcomeFailed, Detail: "计划的 steps 无法定序：" + err.Error()}, replanFeedback{}
 	}
 	for _, step := range ordered {
 		gate := gateDecision{
@@ -394,17 +514,76 @@ func (r *runner) round(ctx context.Context, in PlanInput) (RunResult, string) {
 			r.taken = append(r.taken, step.Action)
 		case verdictBusinessRejection:
 			// 重新规划：不在这里判上限，上限由外层循环持有。
-			return RunResult{Outcome: OutcomeNeedsHuman, Detail: verdict.detail}, verdict.feedback
+			return RunResult{Outcome: OutcomeNeedsHuman, Detail: verdict.detail},
+				replanFeedback{kind: replanRejection, text: verdict.feedback}
 		case verdictPolicyDenied:
-			return RunResult{Outcome: OutcomeNeedsHuman, Detail: verdict.detail}, ""
+			return RunResult{Outcome: OutcomeNeedsHuman, Detail: verdict.detail}, replanFeedback{}
 		case verdictRetryableExhausted:
-			return RunResult{Outcome: OutcomeFailed, Detail: verdict.detail}, ""
+			return RunResult{Outcome: OutcomeFailed, Detail: verdict.detail}, replanFeedback{}
 		default:
-			return RunResult{Outcome: OutcomeFailed, Detail: verdict.detail}, ""
+			return RunResult{Outcome: OutcomeFailed, Detail: verdict.detail}, replanFeedback{}
 		}
 	}
+
+	// 只读不是完成（D1）：事件是「事情已经发生，需要一个处置」，而一整轮只有读动作时
+	// 事实才刚到手、处置还没开始。把它当成 completed 回报，就是「什么都没做却宣布做完了」。
+	//
+	// 这不是为了迁就测试：`quote.completed` 的载荷里没有库存快照，「够就扣、不够就采购」
+	// 是只有运行期才看得见的分支。模型一次要给出一份完整动作序列，所以它必然先读；不给
+	// 它第二轮，它永远走不到第二步。带回来的事实进下一轮 prompt，第二轮才有据可依。
+	//
+	// 请求回合同样套这条：人说「把货扣了」，只读一轮就报 completed 等于「我查了库存，办完了」
+	// ——2026-10-31 的本地演示里就是这样，一次静默无动作看起来跟办成了一模一样。
+	// 代价是纯查询会多花一次规划；但那个方向的错很轻（多问一次模型），另一个方向的错很重
+	// （业务没发生却显示完成）。两害相权，宁可多问一轮。
+	if allReadOnly(ordered) {
+		if r.observationRounds >= maxObservationRounds {
+			if r.request != nil {
+				// 请求回合到此为止：指令的范围是人给的，「只问一句」是合法指令。但结局必须
+				// 把「没有产生业务动作」写出来，别让静默无动作冒充办完。
+				return RunResult{Outcome: OutcomeCompleted,
+					Detail: fmt.Sprintf("只读完成：连续 %d 轮只有只读动作、没有产生任何业务动作"+
+						"（指令若是要办的事，这就等于没办）。最后一份计划：%s",
+						r.observationRounds, planActionsNote(plan))}, replanFeedback{}
+			}
+			return RunResult{Outcome: OutcomeNeedsHuman,
+				Detail: fmt.Sprintf("连续 %d 轮只读、没有产生任何业务动作（事实已回填仍规划不出写动作）："+
+					"能力清单里没有能完成这笔业务的写动作，转人工。最后一份计划：%s",
+					r.observationRounds, planActionsNote(plan))}, replanFeedback{}
+		}
+		r.observationRounds++
+		return RunResult{Outcome: OutcomeNeedsHuman,
+				Detail: fmt.Sprintf("第 %d 轮只有只读动作（%d 步），进入下一轮规划", r.observationRounds, len(ordered))},
+			replanFeedback{kind: replanObservation,
+				text: fmt.Sprintf("上一轮（planId=%s）执行的全部是只读动作，清单里的写动作一个都没用到。",
+					plan.PlanID)}
+	}
+
 	return RunResult{Outcome: OutcomeCompleted,
-		Detail: fmt.Sprintf("计划全部执行成功：%d 步", len(ordered))}, ""
+		Detail: fmt.Sprintf("计划全部执行成功：%d 步", len(ordered))}, replanFeedback{}
+}
+
+// actionIDs 按计划声明顺序取出动作 id，供日志用（不要用集合：顺序本身就是信息）。
+func actionIDs(steps []PlanStep) []string {
+	out := make([]string, 0, len(steps))
+	for _, step := range steps {
+		out = append(out, step.Action)
+	}
+	return out
+}
+
+// allReadOnly 判断一份已定序的计划是不是「一步写动作都没有」。
+// 空计划返回 false：零步计划没有可执行语义（闸门 2 已经把它判 deny），不该被读成「只读」。
+func allReadOnly(steps []PlanStep) bool {
+	if len(steps) == 0 {
+		return false
+	}
+	for _, step := range steps {
+		if step.Kind != kindRead {
+			return false
+		}
+	}
+	return true
 }
 
 // buildPending 把 plan 与本轮的闸门结论打包成一份 pending。
@@ -459,7 +638,6 @@ func (r *runner) buildPending(plan Plan, policy policyEvaluation, meta map[strin
 }
 
 // actorMeta 把本轮发现结果压平成 action id → 元信息，供渲染器按 step 查。
-//
 // 模块间 action id 全局唯一（module.action 的格式），所以不需要再带模块维度；
 // 同一 id 重复出现只可能来自注册表脏数据，后者覆盖前者不影响渲染的可读性。
 func actorMeta(modules []ModuleDigest) map[string]ActionMeta {
@@ -470,6 +648,21 @@ func actorMeta(modules []ModuleDigest) map[string]ActionMeta {
 		}
 	}
 	return out
+}
+
+// planActionsNote 把计划里的动作按步骤顺序列出来，供拒绝/失败时写进 detail。
+// 用 step 顺序而不是排序：排障时要能对上计划原文。
+// 空计划返回空串——「计划为空」与「计划里全是未覆盖动作」是两种不同的失败，
+// 不要在 detail 里留一句「计划动作=[]」把它们混成一种。
+func planActionsNote(plan Plan) string {
+	if len(plan.Steps) == 0 {
+		return ""
+	}
+	actions := make([]string, 0, len(plan.Steps))
+	for _, step := range plan.Steps {
+		actions = append(actions, step.Action)
+	}
+	return "计划动作=[" + strings.Join(actions, ", ") + "]"
 }
 
 // hasApproverRole 判断策略是否真的给了审批人角色（空白条目不算）。
@@ -484,7 +677,7 @@ func hasApproverRole(roles []string) bool {
 
 // ---------- 能力发现 ----------
 
-// moduleEntry 是 GET /tenon/modules 的一行。注意它是**管理面视图**，含 enabled=false。
+// moduleEntry 是 GET /tenon/modules 的一行。宿主只返回**可见**模块（enabled && alive）；enabled 字段保留是为了兼容旧宿主，新宿主不会再吐 false。
 type moduleEntry struct {
 	ID      string `json:"id"`
 	BaseURL string `json:"baseURL"`
@@ -543,9 +736,10 @@ func (r *runner) manifestActions(ctx context.Context, baseURL string) ([]string,
 	}
 	var manifest struct {
 		Actions []struct {
-			ID              string `json:"id"`
-			Title           string `json:"title"`
-			SummaryTemplate string `json:"summaryTemplate"`
+			ID              string   `json:"id"`
+			Title           string   `json:"title"`
+			SummaryTemplate string   `json:"summaryTemplate"`
+			RequiredArgs    []string `json:"requiredArgs"`
 		} `json:"actions"`
 	}
 	if err := json.Unmarshal(raw, &manifest); err != nil {
@@ -559,7 +753,7 @@ func (r *runner) manifestActions(ctx context.Context, baseURL string) ([]string,
 			continue
 		}
 		ids = append(ids, id)
-		meta[id] = ActionMeta{Title: a.Title, SummaryTemplate: a.SummaryTemplate}
+		meta[id] = ActionMeta{Title: a.Title, SummaryTemplate: a.SummaryTemplate, RequiredArgs: a.RequiredArgs}
 	}
 	return ids, meta, nil
 }
@@ -587,7 +781,13 @@ type policyEvaluation struct {
 // evaluatePolicies 交整份计划去求值：宿主的粒度是「整份 plan 取最严」，
 // 所以在 agent 侧逐个 step 求值再自己合并是另一种语义，不能替代它。
 func (r *runner) evaluatePolicies(ctx context.Context, plan Plan) (policyEvaluation, error) {
-	status, raw, err := r.postJSON(ctx, r.host+"/tenon/policies:evaluate", map[string]any{"plan": plan}, nil)
+	// triggerEventId 必须带上：宿主拿它查来源登记表，命中 → origin=request（对话发起），
+	// 未命中 → origin=event。漏了它，宿主一律按事件驱动判，**所有「对话发起」类策略
+	// 永远不命中**——症状是「人在对话里要的事」被判 NO_POLICY_MATCH_DEFAULT_DENY，
+	// 而同一份计划由事件触发就没问题（2026-10-31 本地演示：带采购的计划就这样被拒）。
+	// 来源只能由宿主判定、agent 不得自报（spec §3.11），所以这里只递交触发源 id。
+	status, raw, err := r.postJSON(ctx, r.host+"/tenon/policies:evaluate",
+		map[string]any{"plan": plan, "triggerEventId": r.event.EventID}, nil)
 	if err != nil {
 		return policyEvaluation{}, fmt.Errorf("POST /tenon/policies:evaluate 失败：%w", err)
 	}
@@ -616,6 +816,13 @@ func (r *runner) evaluateGrant(ctx context.Context, step PlanStep) (grantEvaluat
 		"onBehalfOf": r.deps.OnBehalfOf,
 		"action":     step.Action,
 		"args":       rawOrEmptyObject(step.Args),
+		// 预检不记账（interfaces.md §4.2.1：配额在签票时扣一次）。
+		//
+		// 这条不是优化而是正确性：宿主的 grants:evaluate 缺省「预检即扣」以兼容 0.1，
+		// 不显式传 false 的话，一次写动作会被扣两次（预检一次、签票一次），重试还会
+		// 继续扣——2026-10-31 本地演示实测：一张待批卡批准失败后按秒重试 90 秒，
+		// 窗口配额 100 被 12/次扣穿，最终以 QUOTA_EXCEEDED 归档。
+		"charge": false,
 	}
 	status, raw, err := r.postJSON(ctx, r.host+"/tenon/grants:evaluate", body, nil)
 	if err != nil {
@@ -733,17 +940,27 @@ func (r *runner) executeStep(ctx context.Context, plan Plan, step PlanStep, gate
 				return stepVerdict{kind: verdictFailed, detail: "上下文在重试退避期间被取消"}
 			}
 		}
-		auditID := newID("aud_")
-
-		// 闸门 5：dispatched 审计必须先落盘。写失败 → 立即终止，绝不发出调用。
-		dispatched := r.auditFor(plan, step, auditID, auditStageDispatched, gate, inputHash, idemKey)
-		if err := r.postAudit(ctx, dispatched); err != nil {
-			return stepVerdict{kind: verdictFailed,
-				detail: "dispatched 审计写失败，拒绝执行（本步没有发出任何调用）：" + err.Error()}
+		// 闸门 5：写动作必须先拿到宿主签发的票据。签票这一步同时完成三件事：
+		// 策略+授权判定、写 dispatched 审计、给出本次执行的 auditId。
+		//
+		// 顺序不能再由 agent 自己拼：0.2.0 起步骤级 dispatched 只由宿主在签票时写，
+		// agent 自己写会被 403 拒掉——这正是不再"先写审计再调用"的原因。
+		headers := map[string]string{}
+		auditID := ""
+		if step.Kind == kindWrite {
+			ticket, gotAuditID, err := r.issueTicket(ctx, plan, step)
+			if err != nil {
+				return stepVerdict{kind: verdictFailed,
+					detail: "取不到执行票据，拒绝执行（本步没有发出任何调用）：" + err.Error()}
+			}
+			headers[protocol.HeaderTicket] = ticket
+			auditID = gotAuditID
+		} else {
+			// 读动作没有副作用，不需要票据；它也不进审计链。
+			auditID = newID("aud_")
 		}
 
-		// 闸门 6：执行。写动作带幂等键，读动作不带。
-		headers := map[string]string{}
+		// 闸门 6：执行。写动作带幂等键与票据，读动作都不带。
 		if idemKey != "" {
 			headers[protocol.HeaderIdempotencyKey] = idemKey
 		}
@@ -764,6 +981,11 @@ func (r *runner) executeStep(ctx context.Context, plan Plan, step PlanStep, gate
 				"ok", hashPayload(raw), "")); aerr != nil {
 				return stepVerdict{kind: verdictFailed,
 					detail: "result 审计写失败（调用已执行，但审计链不完整）：" + aerr.Error()}
+			}
+			// 只读步骤的返回值就是这一轮的全部收获：把它原样留下来，供下一轮规划使用。
+			// 写动作不留：它的响应是执行结果（单号、结余），不是「做决策所需的事实」。
+			if step.Kind == kindRead {
+				r.observeRead(step.Action, raw)
 			}
 			return stepVerdict{kind: verdictOK}
 		}
@@ -792,6 +1014,15 @@ func (r *runner) executeStep(ctx context.Context, plan Plan, step PlanStep, gate
 		}
 	}
 	return last
+}
+
+// observeRead 记下一条只读步骤的实际返回，供下一轮规划使用。
+//
+// 截断到 observationLimit：事实块是 prompt 的一段，不是日志；一个返回整张库存表的
+// 模块不应该把整轮预算吃掉。截断按 rune 走，不会切坏汉字。
+func (r *runner) observeRead(action string, body []byte) {
+	excerpt := truncateRunes(strings.TrimSpace(string(body)), observationLimit)
+	r.observations = append(r.observations, Observation{Action: action, Body: excerpt})
 }
 
 // classifyFailure 把一次非 2xx 响应归到四类错误之一。
@@ -946,6 +1177,61 @@ func (r *runner) entities() []json.RawMessage {
 }
 
 // postAudit 追加一条审计记录。非 200 一律当失败：宿主承诺「200 即已落盘」。
+// ticketIssueRequest 是 POST /tenon/tickets:issue 的请求体。
+// Args 用 RawMessage：签发端对**原始字节**求摘要，重新序列化会让票在模块侧验不过。
+type ticketIssueRequest struct {
+	PlanID     string          `json:"planId"`
+	StepID     string          `json:"stepId"`
+	Action     string          `json:"action"`
+	Args       json.RawMessage `json:"args"`
+	Agent      string          `json:"agent"`
+	OnBehalfOf string          `json:"onBehalfOf"`
+}
+
+type ticketIssueReply struct {
+	Ticket  string `json:"ticket"`
+	AuditID string `json:"auditId"`
+	Exp     int64  `json:"exp"`
+}
+
+// issueTicket 向宿主要一张执行票据。返回票与本次执行的 auditId（审计已由宿主落盘）。
+//
+// 没有凭据就不签、也不降级为无票执行：签票端要求 agent 角色 token，
+// 这条路径如果能在缺 token 时"放过去"，票据机制就等于没上。
+func (r *runner) issueTicket(ctx context.Context, plan Plan, step PlanStep) (string, string, error) {
+	if r.deps.Token == nil {
+		return "", "", errors.New("未装配宿主凭据（Deps.Token）：签票需要 agent token")
+	}
+	token, err := r.deps.Token(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("获取宿主 token 失败：%w", err)
+	}
+	req := ticketIssueRequest{
+		PlanID:     plan.PlanID,
+		StepID:     step.StepID,
+		Action:     step.Action,
+		Args:       rawOrEmptyObject(step.Args),
+		Agent:      r.deps.AgentID,
+		OnBehalfOf: r.deps.OnBehalfOf,
+	}
+	status, raw, err := r.postJSON(ctx, r.host+"/tenon/tickets:issue", req,
+		map[string]string{"Authorization": "Bearer " + token})
+	if err != nil {
+		return "", "", fmt.Errorf("POST /tenon/tickets:issue 失败：%w", err)
+	}
+	if status != http.StatusOK {
+		return "", "", fmt.Errorf("签票返回 %d：%s", status, snippet(raw))
+	}
+	var reply ticketIssueReply
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return "", "", fmt.Errorf("签票响应不是 {ticket,auditId,exp}：%w", err)
+	}
+	if reply.Ticket == "" || reply.AuditID == "" {
+		return "", "", errors.New("签票响应缺 ticket 或 auditId")
+	}
+	return reply.Ticket, reply.AuditID, nil
+}
+
 func (r *runner) postAudit(ctx context.Context, rec auditRecord) error {
 	status, raw, err := r.postJSON(ctx, r.host+"/tenon/audit", rec, nil)
 	if err != nil {
@@ -965,6 +1251,20 @@ type intentFrame struct {
 	IntentID string         `json:"intentId"`
 	PlanID   string         `json:"planId"`
 	Actions  []intentAction `json:"actions"`
+	// Outcome 与 Message 是本回合的**结论**，给人看的那一句。
+	//
+	// 光有 actions 的话，界面只能表达「该高亮哪个对象」，表达不了「为什么」。而一回合
+	// 常常没有公告板条目（策略/授权拒绝、预演拦截、能力不足、或 auto 直接执行完了），
+	// 于是对话页上人只看到自己那句话、agent 一声不响（2026-11-01 实测反馈）。
+	// 结论走 Intent 帧是最短的路径：这条通道本来就是 agent → 界面，宿主原样转发。
+	Outcome string `json:"outcome,omitempty"`
+	Message string `json:"message,omitempty"`
+	// RequestID 是这一回合由哪句人话发起（事件驱动回合为空）。
+	//
+	// 界面上「我说了什么」与「agent 回了什么」必须能配对。只靠 planId 配不上：
+	// 没有待批卡的回合（被闸门拒、auto 直接执行完）根本不产生卡片，planId 无处可查，
+	// 于是那句话下面只能显示兜底文案，真正的结论却飘在列表末尾，同一回合看着像两次回复。
+	RequestID string `json:"requestId,omitempty"`
 }
 
 // intentAction 是一条界面动作：只表达「应进入什么状态」，不含选择器与坐标。
@@ -997,6 +1297,12 @@ func (r *runner) sendIntent(ctx context.Context, res RunResult) string {
 			frame.Actions = append(frame.Actions,
 				intentAction{Kind: "highlight", Target: target, Badge: truncateRunes(badgeFor(res.Outcome), badgeLimit)})
 		}
+	}
+	// 结论必须随帧走：截断到 messageLimit，因为这是一句给人读的摘要，不是日志搬运。
+	frame.Outcome = string(res.Outcome)
+	frame.Message = truncateRunes(strings.TrimSpace(res.Detail), messageLimit)
+	if r.request != nil {
+		frame.RequestID = r.request.RequestID
 	}
 	status, raw, err := r.postJSON(ctx, r.host+"/tenon/intents", frame, nil)
 	if err != nil {

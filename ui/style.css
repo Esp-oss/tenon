@@ -279,6 +279,36 @@ main {
 .tech-list li { margin: 2px 0; }
 .tech-list code { word-break: break-all; }
 
+/* 业务系统入口：审批人点开就能核对「批准之后库存到底减了没有」。
+   与对话页同源不同端口，所以是绝对地址（见 app.js 的 MODULE_PAGES）。 */
+.biz-nav { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+.biz-nav a {
+  color: var(--muted); text-decoration: none; font-size: 12px;
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px;
+}
+.biz-nav a:hover { color: var(--ink); border-color: #c9cfd8; background: #f4f6f9; }
+.module-links a { color: var(--accent); }
+
+/* 共驾提议（只读）：agent 每回合一条，按时间铺开。
+   气泡不追求聊天气泡的圆角感——这里的信息结构是「结论 / 待批」，
+   左边框比圆角更能表达层级。不挂按钮：这里的每一条都不可操作。 */
+.intent-log {
+  max-height: 340px; overflow-y: auto; display: grid; gap: 8px;
+  padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2, #fafbfc);
+}
+.intent-log .empty { margin: 0; }
+.bubble { border-radius: 8px; padding: 8px 10px; border: 1px solid var(--line); background: #fff; }
+.bubble.user { border-left: 3px solid var(--accent); }
+.bubble.agent { border-left: 3px solid #9aa4b2; background: #fbfcfd; }
+.bubble.agent.ok { border-left-color: #2da44e; }
+.bubble.agent.warn { border-left-color: #d29922; }
+.bubble.agent.wait { border-left-color: #6e7781; }
+.bubble.agent.bad { border-left-color: #cf222e; }
+.bubble-who { font-size: 11px; color: var(--muted); margin-bottom: 2px; }
+.bubble-text { white-space: pre-wrap; word-break: break-word; }
+.bubble-meta { margin-top: 4px; font-size: 11px; color: var(--muted); }
+.decide-hint { font-size: 12px; }
+
 @media (max-width: 640px) {
   .topbar { padding: 12px; }
   main { padding: 12px 12px 32px; }

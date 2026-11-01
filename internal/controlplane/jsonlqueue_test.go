@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestJSONLQueueRoundTrip(t *testing.T) {
@@ -185,5 +186,65 @@ func TestJSONLQueueWritesMeta(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"seq":1`) {
 		t.Fatalf("meta 内容不对：%s", raw)
+	}
+}
+
+// 确认帧从不 ack（设计 §10.2 选项 A），过期的必须清掉：
+// 否则它们会占满共享容量，把用户原话从尾部挤掉——丢的是业务请求，不是提示。
+func TestJSONLQueueDropsExpiredConfirms(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbound.jsonl")
+	q, err := newJSONLQueue(path, 1024)
+	if err != nil {
+		t.Fatalf("打开失败：%v", err)
+	}
+	defer q.Close()
+
+	now := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	q.now = func() time.Time { return now }
+	q.confirmRetention = time.Hour
+
+	q.Push(json.RawMessage(`{"type":"tenon.request","text":"把 STD-1001 的 12 件库存扣掉"}`))
+	q.Push(json.RawMessage(`{"type":"tenon.confirm","planId":"pln_x","decision":"approve"}`))
+
+	now = now.Add(2 * time.Hour)
+	q.Push(json.RawMessage(`{"type":"tenon.request","text":"查一下库存"}`))
+
+	frames, _, dropped := q.Since(0)
+	if len(frames) != 2 || dropped != 1 {
+		t.Fatalf("过期确认应被清掉：len=%d dropped=%d frames=%+v", len(frames), dropped, frames)
+	}
+	if frames[0].Seq != 1 || frames[1].Seq != 3 {
+		t.Fatalf("被清掉的应只有 seq=2（确认帧），实际保留：%+v", frames)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读文件失败：%v", err)
+	}
+	if strings.Contains(string(raw), "tenon.confirm") {
+		t.Fatalf("清理后文件里不该还有确认帧：%s", raw)
+	}
+}
+
+// 旧版本写下的记录没有 receivedAt：升级不能把它们当成「超期」清掉。
+func TestJSONLQueueKeepsLegacyConfirmsWithoutTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inbound.jsonl")
+	legacy := `{"seq":1,"frame":{"type":"tenon.confirm","planId":"pln_old","decision":"approve"}}` + "\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("写旧格式文件失败：%v", err)
+	}
+	q, err := newJSONLQueue(path, 16)
+	if err != nil {
+		t.Fatalf("打开失败：%v", err)
+	}
+	defer q.Close()
+
+	now := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	q.now = func() time.Time { return now.Add(24 * time.Hour) }
+	q.confirmRetention = time.Minute
+
+	q.Push(json.RawMessage(`{"type":"tenon.request","n":2}`))
+	frames, _, dropped := q.Since(0)
+	if len(frames) != 2 || dropped != 0 {
+		t.Fatalf("无时间戳的旧确认帧必须保留：len=%d dropped=%d", len(frames), dropped)
 	}
 }

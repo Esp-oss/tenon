@@ -14,6 +14,9 @@
 //	PORT                     监听端口或地址；未设置时用本模块约定的 8082
 //	TENON_MODULE_ID          manifest.module.id 与审计 module 字段的覆盖值
 //	TENON_HMAC_SECRET_FILE   事件投递验签密钥文件（读不到就拒绝投递）
+//	TENON_HOST               宿主基地址（如 http://127.0.0.1:8080）；设置后向宿主注册并心跳，
+//	                         未设置则不注册（本地单模块调试），启动时会打一行警告
+//	TENON_HEARTBEAT_INTERVAL 心跳间隔覆盖值（time.ParseDuration 形式，仅测试/演示用；缺省 5s）
 //	TENON_MODULE_AUDIT_PATH  模块侧审计 JSONL，缺省 ./audit-procurement.jsonl
 //
 // purchase.requested 只出现在 manifest 的能力摘要里：0.1 没有定义「模块 → 宿主」
@@ -28,8 +31,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"tenon.dev/internal/module"
 	"tenon.dev/internal/protocol"
@@ -44,6 +49,8 @@ const (
 	defaultPort = "8082"
 
 	actionCreatePurchaseRequest = "procurement.CreatePurchaseRequest"
+	// actionListPurchaseRequests 是只读台账：备货页面要显示已经开过哪些申请。
+	actionListPurchaseRequests = "procurement.ListPurchaseRequests"
 )
 
 func main() {
@@ -53,9 +60,12 @@ func main() {
 		Title:    moduleTitle,
 		Version:  moduleVersion,
 		TestMode: os.Getenv("TENON_TEST_MODE") == "1", // D1 的 A/B 两轮要靠 /tenon/admin/reset 造同输入
-		Actions:  []module.Action{createPurchaseRequestAction()},
-		Events:   []string{"purchase.requested"},
-		Handle:   store.handle,
+		Actions: []module.Action{
+			createPurchaseRequestAction(),
+			listPurchaseRequestsAction(),
+		},
+		Events: []string{"purchase.requested"},
+		Handle: store.handle,
 		// DryRun 刻意留空：C8 要的是「模块没实现预演」这个真实状态，
 		// 而不是实现了却报告 unsupported。
 		DryRun: nil,
@@ -66,6 +76,12 @@ func main() {
 	addr := mod.Addr()
 	if _, ok := os.LookupEnv(module.EnvPort); !ok {
 		addr = ":" + defaultPort
+	}
+	// 注册推送先起（Start 立即返回），端口随后在 ListenAndServeAt 里绑定：宿主在
+	// 「已注册但还没 bind」的极短窗口里拨过来会失败，但那个窗口只有本函数里几行代码。
+	// 注册失败一律不阻塞业务（设计 spec §8.4）：这里只记一行日志，模块照常提供端点。
+	if _, err := mod.StartRegistry(context.Background(), module.BaseURLForAddr(addr)); err != nil {
+		log.Printf("procurement: 注册客户端未启动，宿主将看不到本模块：%v", err)
 	}
 	if err := mod.ListenAndServeAt(addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("procurement: %v", err)
@@ -78,6 +94,7 @@ func createPurchaseRequestAction() module.Action {
 		Version:         "0.1.0",
 		Title:           "创建采购申请",
 		SummaryTemplate: "缺 {qty} 件 {sku}，发起采购申请（单据 {referenceNo}）",
+		RequiredArgs:    []string{"sku", "qty", "referenceNo"},
 		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
@@ -110,18 +127,58 @@ func createPurchaseRequestAction() module.Action {
 	}
 }
 
+// listPurchaseRequestsAction 供备货页面渲染台账：只读、无副作用、不需要票据。
+func listPurchaseRequestsAction() module.Action {
+	return module.Action{
+		ID:              actionListPurchaseRequests,
+		Version:         "0.1.0",
+		Title:           "采购申请台账",
+		SummaryTemplate: "列出全部采购申请",
+		Kind:            "read",
+		InputSchema:     json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{}}`),
+		OutputSchema: json.RawMessage(`{
+  "type": "object",
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["requestNo", "sku", "qty", "referenceNo", "createdAt"],
+        "properties": {
+          "requestNo": {"type": "string", "minLength": 1},
+          "sku": {"type": "string", "minLength": 1},
+          "qty": {"type": "integer", "minimum": 1},
+          "referenceNo": {"type": "string", "minLength": 1},
+          "createdAt": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}`),
+		Risk:      module.Risk{Level: "low", Reversible: true},
+		TimeoutMs: 30000,
+		DryRun:    module.DryRunCapability{Supported: false},
+	}
+}
+
 // store 是内存态的采购申请台账，故意不持久化（demo 关心协议行为）。
 type store struct {
 	mu sync.Mutex
 	// seq 只用于生成单号；重复提交走 byReference 回放，不会消耗新号。
 	seq         int
 	byReference map[string]string // businessKey → 首次生成的采购申请号
+	// requests 是台账明细：列表页要显示「买了什么、给哪张单买的」，
+	// 只留 businessKey → 单号 的映射是不够的（页面拿不到数量与来源单）。
+	requests []purchaseRequest
 }
 
 func (s *store) handle(ctx context.Context, actionID string, args json.RawMessage) (json.RawMessage, *protocol.Error) {
 	switch actionID {
 	case actionCreatePurchaseRequest:
 		return s.create(args)
+	case actionListPurchaseRequests:
+		return s.list()
 	default:
 		return nil, contractViolation("UNKNOWN_ACTION", "采购模块不提供动作 "+actionID)
 	}
@@ -153,7 +210,39 @@ func (s *store) create(args json.RawMessage) (json.RawMessage, *protocol.Error) 
 	s.seq++
 	requestNo := fmt.Sprintf("PR-%04d", s.seq)
 	s.byReference[key] = requestNo
+	s.requests = append(s.requests, purchaseRequest{
+		RequestNo:   requestNo,
+		SKU:         in.SKU,
+		Qty:         in.Qty,
+		ReferenceNo: in.ReferenceNo,
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+	})
 	return mustJSON(createOutput{RequestNo: requestNo}), nil
+}
+
+// list 返回按申请号排序的台账。排序在服务端做：页面不为了稳定顺序再排一次。
+func (s *store) list() (json.RawMessage, *protocol.Error) {
+	s.mu.Lock()
+	// 用空切片而不是 nil：nil 会序列化成 null，而 schema 说 items 是数组。
+	// 「没有申请」与「字段缺失」在页面和消费方眼里必须是两件事。
+	items := make([]purchaseRequest, len(s.requests))
+	copy(items, s.requests)
+	s.mu.Unlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].RequestNo < items[j].RequestNo })
+	return mustJSON(listOutput{Items: items}), nil
+}
+
+// purchaseRequest 是台账的一行。
+type purchaseRequest struct {
+	RequestNo   string `json:"requestNo"`
+	SKU         string `json:"sku"`
+	Qty         int    `json:"qty"`
+	ReferenceNo string `json:"referenceNo"`
+	CreatedAt   string `json:"createdAt"`
+}
+
+type listOutput struct {
+	Items []purchaseRequest `json:"items"`
 }
 
 type createInput struct {

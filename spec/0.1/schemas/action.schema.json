@@ -26,6 +26,16 @@
       "type": "string",
       "maxLength": 200
     },
+    "requiredArgs": {
+      "description": "调用该动作至少要给的字段名（取自本动作 inputSchema.required 的子集）。摘要线只有字段名、没有类型：类型由模块侧入参校验兜住，这样才是「摘要先看、完整按需」（D15）。",
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+      }
+    },
     "kind": {
       "description": "读写分类，必填。read 无副作用，不得声明 idempotency；write 有副作用，必须声明 idempotency。C1 用例按此分支断言。",
       "type": "string",

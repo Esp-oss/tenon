@@ -22,6 +22,9 @@ import (
 
 // newTestHost 构造带默认策略/授权的控制平面：规则与授权均与 config/*.dev.json 同构，
 // 注册表里有 inventory 与 procurement，测试面（admin）关闭。
+//
+// 模块走「先 Upsert 再起服务」：TENON_MODULES 与 Config.Modules 都已移除（D5），
+// 生产与测试都只有注册表这一条路，测试夹具不该保留一条生产没有的注入捷径。
 func newTestHost(t *testing.T) *Server {
 	t.Helper()
 	grants, subjects := testGrants()
@@ -30,11 +33,21 @@ func newTestHost(t *testing.T) *Server {
 		Grants:    grants,
 		Subjects:  subjects,
 		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
-		Modules: []registry.ModuleEntry{
-			{ID: "inventory", BaseURL: "http://127.0.0.1:8081"},
-			{ID: "procurement", BaseURL: "http://127.0.0.1:8082"},
-		},
+		Registry: registryWith(t,
+			registry.ModuleEntry{ID: "inventory", BaseURL: "http://127.0.0.1:8081"},
+			registry.ModuleEntry{ID: "procurement", BaseURL: "http://127.0.0.1:8082"},
+		),
 	})
+}
+
+// registryWith 建一个已登记若干模块的注册表，供夹具把模块交给 Config.Registry。
+func registryWith(t *testing.T, entries ...registry.ModuleEntry) *registry.Registry {
+	t.Helper()
+	reg := registry.NewRegistry()
+	for _, e := range entries {
+		reg.Upsert(e)
+	}
+	return reg
 }
 
 // newTestServer 装配一个 Server 并登记清理。
@@ -481,10 +494,13 @@ func TestAuditWriteQueryAndChain(t *testing.T) {
 	srv := newTestHost(t)
 	ts := serveHost(t, srv)
 
+	// 步骤级 dispatched 自 0.2.0 起只能由签发票据时产生（见 ticket_test.go），
+	// 所以这里用计划级 dispatched（stepId 为空）来验两段写与哈希链——它正是挂起/续跑
+	// 链路使用的那一对记录，仍然由 agent 写。
 	records := []string{
-		`{"auditId":"aud_7a","stage":"dispatched","planId":"pln_7","stepId":"s1","action":"inventory.DeductStock"}`,
+		`{"auditId":"aud_7a","stage":"dispatched","planId":"pln_7","stepId":"","action":"plan"}`,
 		`{"auditId":"aud_7b","stage":"result","planId":"pln_7","stepId":"s1","action":"inventory.DeductStock","result":{"ok":true}}`,
-		`{"auditId":"aud_8a","stage":"dispatched","planId":"pln_8","stepId":"s1","action":"procurement.CreatePurchaseRequest"}`,
+		`{"auditId":"aud_8a","stage":"dispatched","planId":"pln_8","stepId":"","action":"plan"}`,
 	}
 	for _, rec := range records {
 		if st, body := postJSON(t, ts.URL+"/tenon/audit", rec); st != 200 || !strings.Contains(body, `"ok":true`) {
@@ -612,6 +628,69 @@ func TestModulesEmptyRegistryIsEmptyArray(t *testing.T) {
 	}
 }
 
+// TestModulesEndpointShowsOnlyVisible 固定 §3.3 的可见性口径：GET /tenon/modules
+// 只返回 `enabled && alive`，**没有 static 例外**（D5）。
+//
+// 断言刻意走**端点**而不是 srv.Registry().Enabled()：注册表内部语义另有用例守着，
+// 而「这一行用的是 Enabled() 还是 List()」只有过端点才测得出来——把 serveModules 改回
+// List() 时，只测内部语义的用例会照样全绿。
+func TestModulesEndpointShowsOnlyVisible(t *testing.T) {
+	reg := registryWith(t,
+		registry.ModuleEntry{ID: "inventory", BaseURL: "http://127.0.0.1:8081"},
+		registry.ModuleEntry{ID: "procurement", BaseURL: "http://127.0.0.1:8082"},
+	)
+	srv := newTestServer(t, Config{
+		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
+		// 开测试面是为了用真实的 admin 端点做「人工摘除」，不在夹具里另开后门。
+		TestMode: true,
+		Registry: reg,
+	})
+	ts := serveHost(t, srv)
+
+	visible := func() []string {
+		t.Helper()
+		st, body := getJSON(t, ts.URL+"/tenon/modules")
+		if st != http.StatusOK {
+			t.Fatalf("GET /tenon/modules 状态码 = %d（原文 %s）", st, body)
+		}
+		var resp modulesResponse
+		decodeInto(t, body, &resp)
+		out := make([]string, 0, len(resp.Modules))
+		for _, m := range resp.Modules {
+			out = append(out, m.ID)
+		}
+		return out
+	}
+
+	wantStrings(t, "刚注册的可见清单", visible(), []string{"inventory", "procurement"})
+
+	// 人工摘除 → 从可见清单消失，但条目仍留在注册表里（摘除 ≠ 未登记）。
+	if st, body := postJSON(t, ts.URL+"/tenon/admin/modules",
+		`{"id":"procurement","enabled":false}`); st != http.StatusOK {
+		t.Fatalf("摘除失败：%d %s", st, body)
+	}
+	wantStrings(t, "摘除后的可见清单", visible(), []string{"inventory"})
+	if got := len(reg.List()); got != 2 {
+		t.Fatalf("摘除不应删除条目：List 得到 %d 条", got)
+	}
+
+	// 心跳断绝 → TTL 扫过变 lost → 同样不可见（不心跳就是不可见，没有例外）。
+	reg.DebugSetLastSeen("inventory", time.Now().Add(-time.Minute))
+	reg.Sweep(time.Now())
+	wantStrings(t, "失联后的可见清单", visible(), []string{})
+
+	// 恢复：人工 enable 只解开一个条件，TTL 已过仍是 lost —— 必须再有心跳。
+	if st, body := postJSON(t, ts.URL+"/tenon/admin/modules",
+		`{"id":"inventory","enabled":true}`); st != http.StatusOK {
+		t.Fatalf("恢复失败：%d %s", st, body)
+	}
+	wantStrings(t, "只 enable 未心跳", visible(), []string{})
+	if ok, reason := reg.Touch("inventory", ""); !ok {
+		t.Fatalf("心跳应成功，得到 reason=%q", reason)
+	}
+	wantStrings(t, "心跳恢复后", visible(), []string{"inventory"})
+}
+
 // TestAdminModulesRequiresTestMode 固定测试面的边界：TEST_MODE 关闭时端点「不存在」。
 func TestAdminModulesRequiresTestMode(t *testing.T) {
 	srv := newTestHost(t) // TestMode 默认 false
@@ -624,6 +703,123 @@ func TestAdminModulesRequiresTestMode(t *testing.T) {
 	if code := tenonError(t, body).Code; code != "UNKNOWN_ENDPOINT" {
 		t.Fatalf("错误码 = %q，期望 UNKNOWN_ENDPOINT（原文 %s）", code, body)
 	}
+	// 读同理：全量视图也是测试面，非测试态必须一起消失（否则生产能看见被摘除的模块）。
+	st, body = getJSON(t, ts.URL+"/tenon/admin/modules")
+	if st != http.StatusNotFound {
+		t.Fatalf("非测试模式下 GET 应回 404，得到 %d（原文 %s）", st, body)
+	}
+}
+
+// TestAdminModulesGetReturnsFullView 固定两个视图的分野：admin GET 给全量（含
+// enabled=false），GET /tenon/modules 只给可见（enabled && alive）。
+//
+// D1 的 B 轮靠它区分「条目还在、只是被摘除」与「条目根本不存在」——后者在可见视图里
+// 无法与前者区分。
+func TestAdminModulesGetReturnsFullView(t *testing.T) {
+	reg := registryWith(t,
+		registry.ModuleEntry{ID: "inventory", BaseURL: "http://127.0.0.1:8081"},
+		registry.ModuleEntry{ID: "procurement", BaseURL: "http://127.0.0.1:8082"},
+	)
+	srv := newTestServer(t, Config{
+		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
+		TestMode:  true,
+		Registry:  reg,
+	})
+	ts := serveHost(t, srv)
+
+	if st, body := postJSON(t, ts.URL+"/tenon/admin/modules",
+		`{"id":"procurement","enabled":false}`); st != http.StatusOK {
+		t.Fatalf("摘除失败：%d %s", st, body)
+	}
+
+	st, body := getJSON(t, ts.URL+"/tenon/admin/modules")
+	if st != http.StatusOK {
+		t.Fatalf("GET 管理面应 200，得到 %d（原文 %s）", st, body)
+	}
+	var admin modulesResponse
+	decodeInto(t, body, &admin)
+	if len(admin.Modules) != 2 {
+		t.Fatalf("管理面应给全量 2 条（含被摘除的），得到 %d：%s", len(admin.Modules), body)
+	}
+	found := false
+	for _, m := range admin.Modules {
+		if m.ID == "procurement" {
+			found = true
+			if m.Enabled {
+				t.Fatalf("procurement 在管理面应显示 enabled=false：%+v", m)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("被摘除的模块必须仍在管理面可见（摘除 ≠ 未登记）：%s", body)
+	}
+
+	// 可见视图：被摘除的那个必须消失。
+	_, body = getJSON(t, ts.URL+"/tenon/modules")
+	var visible modulesResponse
+	decodeInto(t, body, &visible)
+	if len(visible.Modules) != 1 || visible.Modules[0].ID != "inventory" {
+		t.Fatalf("可见视图应只剩 inventory，得到 %s", body)
+	}
+}
+
+// TestReplacePoliciesTakesEffect 固定「补校验通过 → 规则真的参与求值」（裁决 ①a 的
+// 最后一步）：替换后的引擎立刻生效，非法规则集不会把闸门换成一半。
+func TestReplacePoliciesTakesEffect(t *testing.T) {
+	srv := newTestServer(t, Config{
+		Policies: []policy.PolicyRule{{
+			PolicyID: "p-deny",
+			Priority: 100,
+			Match:    policy.PolicyMatch{Module: "inventory", Actions: []string{"inventory.GetStock"}},
+			Outcome:  policy.OutcomeDeny,
+		}},
+		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
+	})
+	ts := serveHost(t, srv)
+	body := planBody(`{"stepId":"s1","action":"inventory.GetStock","args":{"sku":"STD-1002"}}`)
+	outcome := func() string {
+		t.Helper()
+		st, raw := postJSON(t, ts.URL+"/tenon/policies:evaluate", body)
+		if st != http.StatusOK {
+			t.Fatalf("求值失败：%d %s", st, raw)
+		}
+		var resp policy.PolicyEvaluation
+		decodeInto(t, raw, &resp)
+		return resp.Outcome
+	}
+
+	if got := outcome(); got != policy.OutcomeDeny {
+		t.Fatalf("替换前应为 deny，得到 %q", got)
+	}
+
+	auto := []policy.PolicyRule{{
+		PolicyID: "biz-late",
+		Priority: 1,
+		Match:    policy.PolicyMatch{Module: "inventory", Actions: []string{"inventory.GetStock"}},
+		Outcome:  policy.OutcomeAuto,
+	}}
+	if err := srv.ReplacePolicies(auto); err != nil {
+		t.Fatalf("替换规则集失败：%v", err)
+	}
+	if got := outcome(); got != policy.OutcomeAuto {
+		t.Fatalf("替换后应为 auto（新规则必须真的进入求值路径），得到 %q", got)
+	}
+
+	// 非法规则集：拒绝替换，且旧引擎继续服务（不能把闸门换成一半）。
+	if err := srv.ReplacePolicies([]policy.PolicyRule{{PolicyID: "bad", Outcome: "maybe"}}); err == nil {
+		t.Fatal("非法规则集必须拒绝替换")
+	}
+	if got := outcome(); got != policy.OutcomeAuto {
+		t.Fatalf("拒绝替换后应沿用旧规则（auto），得到 %q", got)
+	}
+
+	// readyz 报告的规则条数也要跟着走（否则运维看到的是替换前的数字）。
+	_, raw := getJSON(t, ts.URL+"/readyz")
+	var ready map[string]any
+	decodeInto(t, raw, &ready)
+	if got, _ := ready["policies"].(float64); int(got) != len(auto) {
+		t.Fatalf("readyz 的 policies = %v，期望 %d（%s）", ready["policies"], len(auto), raw)
+	}
 }
 
 // TestAdminModulesEnabledSemantics 固定 enabled 的 *bool 语义：省略=不改开关，显式
@@ -632,7 +828,7 @@ func TestAdminModulesEnabledSemantics(t *testing.T) {
 	srv := newTestServer(t, Config{
 		AuditPath: filepath.Join(t.TempDir(), "audit.jsonl"),
 		TestMode:  true,
-		Modules:   []registry.ModuleEntry{{ID: "inventory", BaseURL: "http://127.0.0.1:8081"}},
+		Registry:  registryWith(t, registry.ModuleEntry{ID: "inventory", BaseURL: "http://127.0.0.1:8081"}),
 	})
 	ts := serveHost(t, srv)
 	enabledIDs := func() []string {
@@ -944,8 +1140,12 @@ func TestLoadDevConfigFiles(t *testing.T) {
 		wantApprovers []string
 		wantReasons   []string
 	}{
+		// 试点口径（2026-11-01）：审批人加上了发起人自己的角色 role:warehouse_clerk，
+		// 于是业务员自己点「允许执行」即可，不需要第二个人。四眼原则在这条路径上失效，
+		// 只用于闭环验证；恢复四眼把 config/policies.dev.json 的 approvers 改回单一角色，
+		// 代码不用动。仓管仍在列表里，原来的双人路径没有被删掉。
 		{"inventory.DeductStock", `{"sku":"STD-1001","qty":12}`, policy.OutcomeApprove,
-			[]string{"role:warehouse_manager"}, []string{policy.ReasonApprovalRequired}},
+			[]string{"role:warehouse_clerk", "role:warehouse_manager"}, []string{policy.ReasonApprovalRequired}},
 		{"inventory.DeductStock", `{"sku":"STD-1001","qty":3}`, policy.OutcomeDeny,
 			[]string{}, []string{policy.ReasonNoMatch}},
 		// 平台级不再对事件驱动的采购单无条件 approve（否则它会把业务级阈值整份压住，
@@ -1000,7 +1200,9 @@ func TestLoadDevConfigFiles(t *testing.T) {
 		t.Fatalf("对话发起（origin=request）的采购单必须 approve，得到 %s", reqRaw)
 	}
 	wantStrings(t, "decidedBy", asked.DecidedBy, []string{"plat-request-needs-human"})
-	wantStrings(t, "approvers", asked.Approvers, []string{"role:procurement_manager"})
+	// 采购单同样按试点口径：业务员本人也能点（role:warehouse_clerk），采购经理仍可批。
+	wantStrings(t, "approvers", asked.Approvers,
+		[]string{"role:warehouse_clerk", "role:procurement_manager"})
 	wantStrings(t, "reasons", asked.Reasons, []string{policy.ReasonApprovalRequired})
 
 	// 读 + 写的多步 plan：读步骤（auto）不得把整份 plan 拉到 deny，最终仍取写步骤的 approve。

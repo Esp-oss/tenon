@@ -15,6 +15,9 @@
 //	PORT                     监听端口或地址；未设置时用本模块约定的 8083
 //	TENON_MODULE_ID          manifest.module.id 与审计 module 字段的覆盖值
 //	TENON_HMAC_SECRET_FILE   事件投递验签密钥文件（读不到就拒绝投递）
+//	TENON_HOST               宿主基地址（如 http://127.0.0.1:8080）；设置后向宿主注册并心跳，
+//	                         未设置则不注册（本地单模块调试），启动时会打一行警告
+//	TENON_HEARTBEAT_INTERVAL 心跳间隔覆盖值（time.ParseDuration 形式，仅测试/演示用；缺省 5s）
 //	TENON_MODULE_AUDIT_PATH  模块侧审计 JSONL，缺省 ./audit-quote.jsonl
 //
 // 业务状态是内存里的 报价单号 → 报价单，故意不持久化：这个 demo 要证明的是
@@ -33,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -50,6 +54,8 @@ const (
 
 	actionCreateStandardPartQuote = "quote.CreateStandardPartQuote"
 	actionGetQuote                = "quote.GetQuote"
+	// actionListQuotes 是只读列表：GetQuote 要单号，而业务页面没有单号。
+	actionListQuotes = "quote.ListQuotes"
 
 	// eventQuoteCompleted 是本模块唯一的产出事件类型：manifest 的事件摘要、
 	// skill 的订阅点（tenon.subscribes）与 agent 的触发源都取这个字面量。
@@ -81,6 +87,12 @@ func main() {
 	if _, ok := os.LookupEnv(module.EnvPort); !ok {
 		addr = ":" + defaultPort
 	}
+	// 注册推送先起（Start 立即返回），端口随后在 ListenAndServeAt 里绑定：宿主在
+	// 「已注册但还没 bind」的极短窗口里拨过来会失败，但那个窗口只有本函数里几行代码。
+	// 注册失败一律不阻塞业务（设计 spec §8.4）：这里只记一行日志，模块照常提供端点。
+	if _, err := mod.StartRegistry(context.Background(), module.BaseURLForAddr(addr)); err != nil {
+		log.Printf("quote: 注册客户端未启动，宿主将看不到本模块：%v", err)
+	}
 	if err := mod.ListenAndServeAt(addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("quote: %v", err)
 	}
@@ -97,6 +109,7 @@ func newQuoteModule(store *quoteStore) *module.Module {
 		Actions: []module.Action{
 			createStandardPartQuoteAction(),
 			getQuoteAction(),
+			listQuotesAction(),
 		},
 		Events: []string{eventQuoteCompleted},
 		Handle: store.handle,
@@ -116,6 +129,7 @@ func createStandardPartQuoteAction() module.Action {
 		Version:         "0.1.0",
 		Title:           "创建标准件报价单",
 		SummaryTemplate: "按报价单 {quoteNo} 生成需求",
+		RequiredArgs:    []string{"quoteNo", "lines"},
 		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
@@ -205,8 +219,52 @@ func getQuoteAction() module.Action {
 	}
 }
 
-// ---------- 业务状态 ----------
+// listQuotesAction 让业务页面看到全部报价单：GetQuote 只能按单号问，页面没有单号。
+//
+// 仍是动作协议的一部分（不是页面专用接口）：页面显示的值与 agent 读到的是同一份状态。
+func listQuotesAction() module.Action {
+	return module.Action{
+		ID:          actionListQuotes,
+		Version:     "0.1.0",
+		Title:       "报价单列表",
+		Kind:        "read",
+		InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{}}`),
+		OutputSchema: json.RawMessage(`{
+  "type": "object",
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["quoteNo", "quoteId", "status", "lines"],
+        "properties": {
+          "quoteNo": {"type": "string", "minLength": 1},
+          "quoteId": {"type": "string", "minLength": 1},
+          "status": {"type": "string", "enum": ["completed"]},
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["sku", "qty"],
+              "properties": {
+                "sku": {"type": "string", "minLength": 1},
+                "qty": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`),
+		Risk:      module.Risk{Level: "low", Reversible: true},
+		TimeoutMs: 30000,
+		DryRun:    module.DryRunCapability{Supported: false},
+	}
+}
 
+// ---------- 业务状态 ----------
 // quoteStore 是内存态的报价单台账。
 //
 // 两层幂等：框架层按 Idempotency-Key 去重（请求级），本层按 quoteNo 去重
@@ -235,6 +293,8 @@ func (s *quoteStore) handle(ctx context.Context, actionID string, args json.RawM
 		return s.create(args)
 	case actionGetQuote:
 		return s.get(args)
+	case actionListQuotes:
+		return s.list()
 	default:
 		return nil, contractViolation("UNKNOWN_ACTION", "报价模块不提供动作 "+actionID)
 	}
@@ -299,6 +359,20 @@ func (s *quoteStore) create(args json.RawMessage) (json.RawMessage, *protocol.Er
 	return mustJSON(createQuoteOutput{QuoteID: rec.QuoteID, Status: rec.Status}), nil
 }
 
+// list 返回按单号排序的全部报价单（排序在服务端做，页面不为了稳定顺序再排一次）。
+func (s *quoteStore) list() (json.RawMessage, *protocol.Error) {
+	s.mu.Lock()
+	items := make([]quoteRecord, 0, len(s.byNo))
+	for _, rec := range s.byNo {
+		// 明细拷一份：台账在别的 goroutine 里还会被读，返回的切片不该共享底层数组。
+		rec.Lines = append([]quoteLine(nil), rec.Lines...)
+		items = append(items, rec)
+	}
+	s.mu.Unlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].QuoteNo < items[j].QuoteNo })
+	return mustJSON(listQuotesOutput{Items: items}), nil
+}
+
 func (s *quoteStore) get(args json.RawMessage) (json.RawMessage, *protocol.Error) {
 	var in getQuoteInput
 	if perr := decodeArgs(args, &in); perr != nil {
@@ -355,6 +429,10 @@ type quoteRecord struct {
 	QuoteID string      `json:"quoteId"`
 	Status  string      `json:"status"`
 	Lines   []quoteLine `json:"lines"`
+}
+
+type listQuotesOutput struct {
+	Items []quoteRecord `json:"items"`
 }
 
 type createQuoteInput struct {

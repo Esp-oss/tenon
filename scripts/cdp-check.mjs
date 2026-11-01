@@ -1,14 +1,15 @@
 // 用 Edge 的 CDP 做一次真浏览器验证（零依赖：Node 24 自带 WebSocket）。
 //
-// 断言的是「折叠是否真的生效」——这些结论读代码只能猜，必须让浏览器把 DOM 渲染出来：
+// 断言的是「渲染结果」，读代码只能猜，必须让浏览器把 DOM 渲染出来：
 //   1. 卡面可见文本里有业务人话（扣减 … 库存 12 件），
-//   2. 卡面可见文本里**没有** action id / planId（R5），
-//   3. <details class="tech"> 存在且默认收起（open=false），
-//   4. 展开后技术原文里才有 action id。
+//   2. 卡面可见文本里**没有** action id（R5）；planId 只允许出现在「批准 pln_…」指令里，
+//   3. 卡内**没有任何 button**——2026-11-01 起批准只走 dsh，看板再放按钮就是第二个写入口，
+//   4. <details class="tech"> 存在且默认收起（open=false），展开后技术原文里才有 action id。
 // 顺带截一张图，人工复核构图。
 //
-// 用法：node out/cdp-check.mjs <baseUrl> <debugPort> <token> <screenshotPath> [user] [rolesCsv] [expectApprove]
+// 用法：node out/cdp-check.mjs <baseUrl> <debugPort> <token> <screenshotPath> [user] [rolesCsv]
 // roles 用逗号分隔而不是 JSON：Windows 的 PowerShell 把参数交给原生程序时会剥掉双引号（实测）。
+// 第 7 个参数（旧版的 expectApprove）已不再使用：本页对所有角色都不给按钮。
 import fs from 'node:fs';
 
 const [
@@ -18,7 +19,6 @@ const [
   shotPath = 'out/ui-card.png',
   user = 'bob',
   rolesCsv = 'role:warehouse_manager',
-  expectApprove = '1',
 ] = process.argv.slice(2);
 
 if (!token) {
@@ -109,11 +109,14 @@ await sleep(400);
 const inspectExpr = `(() => {
   const tech = document.querySelector('details.tech');
   const cards = document.querySelectorAll('article.card');
+  const card = cards[0] || null;
   return JSON.stringify({
     cardCount: cards.length,
     techCount: document.querySelectorAll('details.tech').length,
     techOpen: tech ? tech.open : null,
+    cardButtons: card ? card.querySelectorAll('button').length : null,
     approveButtons: document.querySelectorAll('button[data-act="approve"]').length,
+    cardText: card ? card.innerText : '',
     visibleText: document.body.innerText
   });
 })()`;
@@ -121,15 +124,17 @@ const inspect = await send('Runtime.evaluate', { expression: inspectExpr, return
 const data = JSON.parse(inspect.result.result.value);
 
 const visible = data.visibleText || '';
-const wantApprove = expectApprove === '1';
+const cardText = data.cardText || '';
 const checks = {
   hasCard: data.cardCount >= 1,
   hasPlain: visible.includes('扣减') && visible.includes('库存') && visible.includes('STD-1001'),
+  // action id 不得出现在卡面；planId 例外——它只出现在「批准 pln_…」这句可复制指令里。
   noActionIdVisible: !visible.includes('DeductStock') && !visible.includes('inventory.'),
-  noPlanIdVisible: !visible.includes('pln_'),
+  // 2026-11-01 收口：卡内零按钮（任何人都不例外），批准只走 dsh。
+  noButtonsInCard: data.cardButtons === 0,
+  noApproveButton: data.approveButtons === 0,
+  cardPointsToDsh: cardText.includes('dsh') && cardText.includes('批准 pln_'),
   detailCollapsed: data.techOpen === false,
-  // 审批人看到按钮；非审批人（clerk）只能用文字被告知「需要什么角色」，不该有可点的批准。
-  approveMatchesRole: wantApprove ? data.approveButtons >= 1 : data.approveButtons === 0,
 };
 
 const shot = await send('Page.captureScreenshot', { format: 'png' });

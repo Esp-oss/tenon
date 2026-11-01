@@ -39,7 +39,8 @@ func newSuspendFixture(t *testing.T, hostURL string) (*StateStore, Pending, Deps
 	if err != nil {
 		t.Fatalf("建 store 失败：%v", err)
 	}
-	deps := Deps{Host: hostURL, AgentID: "ag_test", OnBehalfOf: "user:alice", HTTP: http.DefaultClient}
+	deps := Deps{Host: hostURL, AgentID: "ag_test", OnBehalfOf: "user:alice", HTTP: http.DefaultClient,
+		Token: func(context.Context) (string, error) { return "tok-test", nil }}
 	return store, samplePending(), deps
 }
 

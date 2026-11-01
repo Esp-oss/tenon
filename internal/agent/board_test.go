@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"tenon.dev/internal/protocol"
 	"testing"
 	"time"
 )
@@ -303,4 +304,30 @@ func TestBoardPayloadOmitsMissingDetail(t *testing.T) {
 func toString(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// 公告板必须带步骤摘要：宿主靠它冻结"人批准的那一版参数"。
+// 只推 label/detail 的话，签票时没有任何可比对的依据，T6 形同虚设。
+func TestBoardPayloadCarriesStepHashes(t *testing.T) {
+	args := []byte(`{"referenceNo":"E2E-001","sku":"STD-1001","qty":12}`)
+	p := Pending{
+		PlanID:  "pln_steps",
+		Summary: "补货",
+		Plan: Plan{Steps: []PlanStep{
+			{StepID: "s1", Action: "inventory.DeductStock", Args: args},
+			{StepID: "s2", Action: "procurement.CreatePurchaseRequest", Args: []byte(`{"qty":1}`)},
+		}},
+	}
+	got := boardPayload(p, StateAwaitingApproval)
+	steps, ok := got["steps"].([]map[string]any)
+	if !ok || len(steps) != 2 {
+		t.Fatalf("应推 2 条步骤摘要，实际 %#v", got["steps"])
+	}
+	if steps[0]["stepId"] != "s1" || steps[0]["argsHash"] != protocol.ArgsHash(args) {
+		t.Fatalf("步骤摘要不对：%#v", steps[0])
+	}
+	// 参数原文不能上板：公告板是 agent 推的展示数据，不是业务数据出口。
+	if _, leaked := steps[0]["args"]; leaked {
+		t.Fatal("不许把参数原文推上公告板")
+	}
 }

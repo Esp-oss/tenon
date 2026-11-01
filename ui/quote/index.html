@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>报价 · Tenon 业务台</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2024; --muted:#6b7280; --line:#e3e6ea;
+          --accent:#2f6fed; --ok:#15803d; --warn:#b45309; --err:#b91c1c;
+          --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{background:var(--card);border-bottom:1px solid var(--line);padding:12px 20px;
+         display:flex;align-items:baseline;gap:18px;flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+  header .sub{color:var(--muted);font-size:12px}
+  nav{margin-left:auto;display:flex;gap:4px}
+  nav a{color:var(--muted);text-decoration:none;padding:4px 10px;border-radius:6px;font-size:13px}
+  nav a:hover{background:#eef1f5;color:var(--ink)}
+  nav a.on{background:#e8efff;color:var(--accent);font-weight:600}
+  main{max-width:980px;margin:20px auto 60px;padding:0 20px;display:grid;gap:16px}
+  section.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  section.card>h2{margin:0 0 12px;font-size:13px;font-weight:650;color:var(--muted);
+                  letter-spacing:.4px;text-transform:uppercase}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px}
+  td.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:0}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#e7f6ec;color:var(--ok)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  label{display:grid;gap:4px;font-size:12px;color:var(--muted)}
+  input,textarea,button{font:inherit;color:var(--ink);background:#fff;border:1px solid var(--line);
+                        border-radius:7px;padding:7px 10px}
+  input:focus,textarea:focus{outline:2px solid #cfe0ff;border-color:var(--accent)}
+  textarea{width:100%;min-height:62px;resize:vertical}
+  button{cursor:pointer;background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
+  button.ghost{background:#fff;color:var(--ink);border-color:var(--line);font-weight:500}
+  a.ghost-link{font:inherit;color:var(--ink);text-decoration:none;background:#fff;border:1px solid var(--line);border-radius:7px;padding:7px 12px;font-weight:500}
+  .hint{color:var(--muted);font-size:12px}
+  #status{font-size:12px;color:var(--muted)}
+  #error{display:none;border:1px solid #f3c9c9;background:#fdf1f1;color:var(--err);
+         border-radius:8px;padding:10px 12px;font-size:13px;white-space:pre-wrap}
+  footer{text-align:center;color:var(--muted);font-size:12px;margin-top:6px}
+  code{font-family:var(--mono);font-size:12px;background:#f2f4f7;padding:1px 5px;border-radius:4px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Tenon 业务台 · 报价</h1>
+  <span class="sub">模块 <code>quote</code> · 端口 8083</span>
+  <nav>
+    <a href="http://127.0.0.1:8081/">库存</a>
+    <a href="http://127.0.0.1:8082/">备货</a>
+    <a class="on" href="http://127.0.0.1:8083/">报价</a>
+    <a href="http://127.0.0.1:3080/" target="_blank" rel="noreferrer">Agent 对话（dsh）</a>
+    <a href="http://127.0.0.1:8080/ui/registry.html">注册中心</a>
+  </nav>
+</header>
+
+<main>
+  <div id="error"></div>
+
+  <section class="card">
+    <h2>报价单（只读真值）</h2>
+    <table>
+      <thead><tr><th>报价单号</th><th>ID</th><th>状态</th><th>明细</th></tr></thead>
+      <tbody id="q-body"><tr><td colspan="4" class="hint">读取中…</td></tr></tbody>
+    </table>
+    <p class="hint" style="margin:10px 0 0">
+      数据来自 <code>quote.ListQuotes</code>。新建报价单会往发件箱写一条 <code>quote.completed</code>，
+      agent 轮询到它才会开履约回合——这是「AI 提议」的触发点。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>去 dsh 里说这句话</h2>
+    <p class="hint" style="margin:0 0 8px">
+      对话只有一个入口：dsh 容器（<code>127.0.0.1:3080</code>）。本页<strong>不投递任何请求</strong>——
+      同一句话从两个地方发出去，agent 会收到两条一样的指令。
+    </p>
+    <label style="margin-bottom:8px">话术（复制后粘到 dsh 对话框）
+      <textarea id="text" readonly>新建报价单 Q-LOCAL-2，STD-1001 要 6 件</textarea>
+    </label>
+    <div class="row">
+      <button id="copy">复制话术</button>
+      <a class="ghost-link" href="http://127.0.0.1:3080/" target="_blank" rel="noreferrer">打开 dsh</a>
+      <span id="status" class="hint">建单成功后，dsh 里会出现这一步的提议与选项卡片。</span>
+    </div>
+    <p class="hint" style="margin:8px 0 0">
+      打不开 dsh（只显示 <code>dsh web authentication required</code>）不是链接坏了：dsh 的入口是它启动时打印的
+      <strong>带 <code>?token=…</code> 的那条 URL</strong>，开一次才会种下 30 天的 cookie；之后这个地址直接可用。
+    </p>
+  </section>
+
+  <footer>页面不参与 Tenon-Version 协商、不要求 token；写操作只能由宿主签票后执行。</footer>
+</main>
+
+<script>
+// 本页只有一条网络路径：读模块自己的动作。没有 HOST、没有 token、没有请求帧——
+// 对话与批准都归 dsh，页面不再持有任何写入口。
+const READ = '/tenon/actions/quote.ListQuotes';
+const $ = (id) => document.getElementById(id);
+
+function showError(msg) { const e = $('error'); e.textContent = msg; e.style.display = 'block'; }
+function clearError() { $('error').style.display = 'none'; }
+
+async function call(path, init) {
+  const res = await fetch(path, init);
+  const raw = await res.text();
+  let data = null;
+  try { data = raw ? JSON.parse(raw) : null; } catch (_) {}
+  if (!res.ok) {
+    const msg = (data && data.tenonError && data.tenonError.message) || raw || ('HTTP ' + res.status);
+    throw new Error('HTTP ' + res.status + '：' + msg);
+  }
+  return data;
+}
+
+function linesText(lines) {
+  return (lines || []).map((l) => l.sku + ' × ' + l.qty).join('，');
+}
+
+async function loadList() {
+  try {
+    const data = await call(READ, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Tenon-Version': '0.1' },
+      body: '{}',
+    });
+    const items = (data && data.items) || [];
+    $('q-body').innerHTML = items.length
+      ? items.map((q) => '<tr><td><code>' + q.quoteNo + '</code></td><td class="num">' + q.quoteId +
+          '</td><td><span class="pill">' + q.status + '</span></td><td>' + linesText(q.lines) + '</td></tr>').join('')
+      : '<tr><td colspan="4" class="hint">还没有报价单</td></tr>';
+    clearError();
+  } catch (err) {
+    showError('读取报价单失败：' + err.message);
+  }
+}
+
+// 复制话术：这不是"提交"，只是把同一句话搬到 dsh 里去说。
+// 非安全上下文（http + 非 localhost）没有 navigator.clipboard，退回"选中 + Ctrl+C"，
+// 而不是静默失败——按钮点了没反应比复制不了更让人困惑。
+async function copyPrompt() {
+  const box = $('text');
+  try {
+    await navigator.clipboard.writeText(box.value);
+    $('status').textContent = '已复制。粘到 dsh 对话框里发送即可。';
+  } catch (_) {
+    box.select();
+    $('status').textContent = '已选中文本，按 Ctrl+C 复制（该上下文不允许脚本写剪贴板）。';
+  }
+}
+
+$('copy').addEventListener('click', copyPrompt);
+loadList();
+setInterval(loadList, 3000);
+</script>

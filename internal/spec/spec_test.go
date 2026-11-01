@@ -14,17 +14,18 @@ func mustLoad(t *testing.T) *Set {
 	return s
 }
 
-// TestLoadAllSchemas 锁定「九类契约 + common」共 10 份，缺一份就说明真源被动了。
+// TestLoadAllSchemas 锁定「九类契约 + common + 执行票据」共 11 份，缺一份就说明真源被动了。
 func TestLoadAllSchemas(t *testing.T) {
 	s := mustLoad(t)
 	names := s.Names()
-	if len(names) != 10 {
-		t.Fatalf("期望 10 份 schema，实际 %d：%v", len(names), names)
+	if len(names) != 11 {
+		t.Fatalf("期望 11 份 schema，实际 %d：%v", len(names), names)
 	}
 	for _, want := range []string{
 		"common.schema.json", "module-manifest.schema.json", "action.schema.json",
 		"domain-event.schema.json", "plan.schema.json", "frames.schema.json",
 		"grant.schema.json", "policy.schema.json", "audit-event.schema.json", "error.schema.json",
+		"ticket.schema.json",
 	} {
 		if _, err := s.Schema(want); err != nil {
 			t.Errorf("缺少 %s: %v", want, err)
@@ -210,5 +211,44 @@ func TestSummaryTemplateInBothShapes(t *testing.T) {
 		`"kind": "write", "summaryTemplate": "扣减 {sku} 库存 {qty} 件",`, 1)
 	if err := s.Validate("action.schema.json", []byte(action)); err != nil {
 		t.Fatalf("完整 Action 应接受 summaryTemplate：%v", err)
+	}
+}
+
+// requiredArgs 是「调用这个动作至少要给哪些字段」：摘要线（agent 唯一读的）与完整 Action
+// 两处都要认，且必须是字符串数组、不能重复。
+func TestRequiredArgsInBothShapes(t *testing.T) {
+	s := mustLoad(t)
+
+	manifest := `{
+	  "tenon":"0.1",
+	  "module":{"id":"inventory","version":"1.4.0","title":"库存"},
+	  "actions":[{"id":"inventory.DeductStock","version":"1.0.0","title":"扣减",
+	              "kind":"write","risk":{"level":"medium","reversible":true},
+	              "dryRun":{"supported":true},
+	              "requiredArgs":["sku","qty","referenceNo"]}],
+	  "events":[],"transports":["http"],"capabilities":["dry-run"]
+	}`
+	if err := s.Validate("module-manifest.schema.json", []byte(manifest)); err != nil {
+		t.Fatalf("摘要线应接受 requiredArgs：%v", err)
+	}
+
+	duplicated := strings.Replace(manifest,
+		`"requiredArgs":["sku","qty","referenceNo"]`,
+		`"requiredArgs":["sku","sku"]`, 1)
+	if err := s.Validate("module-manifest.schema.json", []byte(duplicated)); err == nil {
+		t.Fatal("requiredArgs 重复元素必须被拒（uniqueItems）")
+	}
+
+	nonString := strings.Replace(manifest,
+		`"requiredArgs":["sku","qty","referenceNo"]`,
+		`"requiredArgs":[1,2]`, 1)
+	if err := s.Validate("module-manifest.schema.json", []byte(nonString)); err == nil {
+		t.Fatal("requiredArgs 必须是字符串数组")
+	}
+
+	action := strings.Replace(validWriteAction, `"kind": "write",`,
+		`"kind": "write", "requiredArgs": ["sku","qty"],`, 1)
+	if err := s.Validate("action.schema.json", []byte(action)); err != nil {
+		t.Fatalf("完整 Action 应接受 requiredArgs：%v", err)
 	}
 }

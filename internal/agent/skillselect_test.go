@@ -7,8 +7,9 @@ import (
 
 func TestSelectSkillsByText(t *testing.T) {
 	skills := []Skill{
-		{Name: "quote-to-fulfillment", Body: "报价完成后核对 inventory 库存，缺口走 procurement。"},
-		{Name: "procurement-only", Body: "只管 procurement 的采购单。"},
+		// R1 之后词表来自 skill 自己声明的 expectedModules（不再有硬编码 knownModuleNames）。
+		{Name: "quote-to-fulfillment", ExpectedModules: []string{"inventory", "procurement"}, Body: "报价完成后核对 inventory 库存，缺口走 procurement。"},
+		{Name: "procurement-only", ExpectedModules: []string{"procurement"}, Body: "只管 procurement 的采购单。"},
 		{Name: "unrelated", Body: "和库存无关。"},
 	}
 	got := SelectSkills(skills, "Q-2026-0417 这单货不够，先扣现有的，缺的发起采购", "inventory", 2)
@@ -19,8 +20,8 @@ func TestSelectSkillsByText(t *testing.T) {
 
 func TestSelectSkillsDeterministicOrder(t *testing.T) {
 	skills := []Skill{
-		{Name: "b-skill", Body: "inventory procurement"},
-		{Name: "a-skill", Body: "inventory procurement"},
+		{Name: "b-skill", ExpectedModules: []string{"inventory", "procurement"}, Body: "inventory procurement"},
+		{Name: "a-skill", ExpectedModules: []string{"inventory", "procurement"}, Body: "inventory procurement"},
 	}
 	first := SelectSkills(skills, "inventory 缺货", "inventory", 2)
 	second := SelectSkills(skills, "inventory 缺货", "inventory", 2)
@@ -74,5 +75,30 @@ func TestTextForSelected(t *testing.T) {
 	// 一份都没选中：空串，让 userPrompt 走它自己的「本次没有匹配」分支。
 	if got := store.TextForSelected(nil); got != "" {
 		t.Fatalf("没选中任何 skill 时应返回空串，得到 %q", got)
+	}
+}
+
+// 这条用例就是「新业务只加模块 + 加 skill」的机械证明：
+// warehouse 这个模块在 agent 代码里从未出现过，但 skill 声明了它，粗筛就能命中。
+func TestSelectSkillsSupportsNewModuleWithoutCodeChange(t *testing.T) {
+	skills := []Skill{
+		{Name: "warehouse-replenish", ExpectedModules: []string{"warehouse"}, Body: "补货流程"},
+		{Name: "quote-to-fulfillment", ExpectedModules: []string{"inventory", "procurement"}, Body: "报价履约"},
+	}
+
+	got := SelectSkills(skills, "warehouse 里 3 号货架要补 20 件", "", 2)
+	if len(got) != 1 || got[0].Name != "warehouse-replenish" {
+		t.Fatalf("新模块的 skill 应被选中，得到 %+v", got)
+	}
+
+	// 没提到它时不该被选中（词表是 skill 自己声明的，不是「凡是 skill 都算命中」）。
+	if again := SelectSkills(skills, "今天天气不错", "", 2); len(again) != 0 {
+		t.Fatalf("未提及时不应命中，得到 %+v", again)
+	}
+
+	// 订阅前缀同样能作为模块词表（事件型订阅）。
+	bySub := []Skill{{Name: "wh-by-sub", Subscribes: []string{"warehouse.low-stock"}, Body: "补货"}}
+	if picked := SelectSkills(bySub, "warehouse 缺货了", "", 2); len(picked) != 1 {
+		t.Fatalf("订阅前缀应能推导模块名，得到 %+v", picked)
 	}
 }

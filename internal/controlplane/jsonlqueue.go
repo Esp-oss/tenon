@@ -8,7 +8,18 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
+
+// defaultConfirmRetention 是「未 ack 的确认帧」在入站队列里的保留期。
+//
+// 为什么只清确认帧、不清请求帧：公告板批准走的是「只读不 ack」（设计 §10.2 选项 A），
+// 确认帧会一直留在队列里。队列容量 1024 是**共享**的，确认帧攒多了就会把用户原话
+// 从尾部挤掉——那正是「队列看起来有界、真正丢的却是业务请求」。确认帧对应的卡
+// 15 分钟就过期，留 1 小时足够消费方轮询，过期后留着只占位。
+//
+// 用户原话不设保留期：丢了不会有人报错，业务员只会以为提过。它们只受容量约束。
+const defaultConfirmRetention = time.Hour
 
 // jsonlQueue 是落盘的入站队列：一行一帧，ack 后重写存活部分。
 //
@@ -21,6 +32,10 @@ type jsonlQueue struct {
 	seq      int64
 	frames   []queuedFrame
 	dropped  int64
+
+	// now 是可注入时钟（测试用）；confirmRetention 见 defaultConfirmRetention。
+	now              func() time.Time
+	confirmRetention time.Duration
 
 	// broken 记住第一次落盘失败：队列已不可信，让 Close() 把它暴露出来。
 	broken error
@@ -44,7 +59,8 @@ func newJSONLQueue(path string, capacity int) (*jsonlQueue, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("controlplane: 创建入站队列目录失败：%w", err)
 	}
-	q := &jsonlQueue{path: path, capacity: capacity, frames: make([]queuedFrame, 0, capacity)}
+	q := &jsonlQueue{path: path, capacity: capacity, frames: make([]queuedFrame, 0, capacity),
+		now: time.Now, confirmRetention: defaultConfirmRetention}
 	q.metaPath = path + ".meta"
 	if err := q.load(); err != nil {
 		return nil, err
@@ -175,7 +191,10 @@ func (q *jsonlQueue) Push(frame json.RawMessage) int64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.seq++
-	q.frames = append(q.frames, queuedFrame{Seq: q.seq, Frame: frame})
+	q.frames = append(q.frames, queuedFrame{Seq: q.seq, Frame: frame, ReceivedAt: q.now().UTC()})
+	// 先清过期确认帧，再按容量裁：反过来的话，一批确认帧会先把用户原话挤掉，
+	// 然后才轮到本该被清掉的自己。
+	q.sweepLocked()
 	for len(q.frames) > q.capacity {
 		q.frames = q.frames[1:]
 		q.dropped++
@@ -191,6 +210,44 @@ func (q *jsonlQueue) Push(frame json.RawMessage) int64 {
 		q.saveMeta()
 	}
 	return q.seq
+}
+
+// sweepLocked 丢掉超过保留期的 `tenon.confirm` 帧（调用方持 q.mu）。
+//
+// 只动确认帧：请求帧是「人说过的话」，不设保留期；它们只受容量约束。
+// 旧版本写下的记录没有 ReceivedAt（零值），一律保留——升级不能误删历史帧。
+func (q *jsonlQueue) sweepLocked() {
+	if q.confirmRetention <= 0 {
+		return
+	}
+	now := q.now()
+	kept := q.frames[:0]
+	removed := 0
+	for _, rec := range q.frames {
+		if rec.ReceivedAt.IsZero() || now.Sub(rec.ReceivedAt) <= q.confirmRetention ||
+			frameTypeOf(rec.Frame) != inboundTypeConfirm {
+			kept = append(kept, rec)
+			continue
+		}
+		removed++
+	}
+	q.frames = kept
+	if removed > 0 {
+		q.dropped += int64(removed)
+		log.Printf("controlplane: 清掉 %d 条超过保留期（%s）的确认帧；确认不 ack，过期后只会占位，累计丢弃 %d",
+			removed, q.confirmRetention, q.dropped)
+	}
+}
+
+// frameTypeOf 只读帧的 type 字段；坏帧返回空串（按「不认识」处理，不参与清理）。
+func frameTypeOf(raw json.RawMessage) string {
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return ""
+	}
+	return probe.Type
 }
 
 // Since 返回序号严格大于 after 的帧，并给出下一次应当传入的游标与累计丢弃数。

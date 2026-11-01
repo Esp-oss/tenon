@@ -347,6 +347,29 @@ func TestScanTreeSkipsSpec(t *testing.T) {
 	}
 }
 
+// TestScanTreeSkipsOut 覆盖 out/ 跳过：它是 .gitignore 的构建/验收产物。
+//
+// 具体场景：verify-ui 在 out/ui-verify/edge-profile 下留一份 Edge 用户目录，
+// 里面第三方扩展的 JS 会被规则 1 命中。不跳过 out/ 的话，每跑一次 UI 验收，
+// 门禁就红一次，而真正该扫的源码是零命中。
+func TestScanTreeSkipsOut(t *testing.T) {
+	dir := t.TempDir()
+	const body = "# 步骤\n\n1. 库存不足时调用 `inventory.DeductStock`。\n"
+	writeTemp(t, dir, "out/SKILL.md", body)
+	writeTemp(t, dir, "normal/SKILL.md", body)
+
+	findings, err := ScanTree(dir)
+	if err != nil {
+		t.Fatalf("ScanTree(%s): %v", dir, err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("想要 1 条命中（out/ 下的那份被跳过），得到 %d 条：%+v", len(findings), findings)
+	}
+	if findings[0].File != "normal/SKILL.md" {
+		t.Errorf("File = %q，想要 %q", findings[0].File, "normal/SKILL.md")
+	}
+}
+
 // TestScanTreeScope 覆盖作用域判定：同名内容，skill 文档报、普通文档不报；
 // 扩展名不认识的文件不扫；root 不存在返回错误。
 func TestScanTreeScope(t *testing.T) {

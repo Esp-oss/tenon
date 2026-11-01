@@ -9,6 +9,9 @@
 //	PORT                     监听端口或地址；未设置时用本模块约定的 8081
 //	TENON_MODULE_ID          manifest.module.id 与审计 module 字段的覆盖值
 //	TENON_HMAC_SECRET_FILE   事件投递验签密钥文件（读不到就拒绝投递）
+//	TENON_HOST               宿主基地址（如 http://127.0.0.1:8080）；设置后向宿主注册并心跳，
+//	                         未设置则不注册（本地单模块调试），启动时会打一行警告
+//	TENON_HEARTBEAT_INTERVAL 心跳间隔覆盖值（time.ParseDuration 形式，仅测试/演示用；缺省 5s）
 //	TENON_MODULE_AUDIT_PATH  模块侧审计 JSONL，缺省 ./audit-inventory.jsonl
 //	TENON_INVENTORY_SEED     初始库存，格式 SKU:qty,SKU:qty，缺省 STD-1001:120,STD-1002:3
 //
@@ -26,6 +29,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +49,9 @@ const (
 	actionGetStock     = "inventory.GetStock"
 	actionDeductStock  = "inventory.DeductStock"
 	actionReleaseStock = "inventory.ReleaseStock"
+	// actionListStock 是**只读**的全量快照：业务页面与看板要显示真值，而 GetStock
+	// 一次只能问一个 SKU。它没有副作用、不需要票据，也不参与任何写路径。
+	actionListStock = "inventory.ListStock"
 
 	// envSeed 覆盖初始库存，便于演示「库存不足 → 转采购」的分支。
 	envSeed     = "TENON_INVENTORY_SEED"
@@ -67,6 +74,7 @@ func main() {
 		TestMode: os.Getenv("TENON_TEST_MODE") == "1", // D1 的 A/B 两轮要靠 /tenon/admin/reset 造同输入
 		Actions: []module.Action{
 			getStockAction(),
+			listStockAction(),
 			deductStockAction(),
 			releaseStockAction(),
 		},
@@ -81,6 +89,12 @@ func main() {
 	if _, ok := os.LookupEnv(module.EnvPort); !ok {
 		addr = ":" + defaultPort
 	}
+	// 注册推送先起（Start 立即返回），端口随后在 ListenAndServeAt 里绑定：宿主在
+	// 「已注册但还没 bind」的极短窗口里拨过来会失败，但那个窗口只有本函数里几行代码。
+	// 注册失败一律不阻塞业务（设计 spec §8.4）：这里只记一行日志，模块照常提供端点。
+	if _, err := mod.StartRegistry(context.Background(), module.BaseURLForAddr(addr)); err != nil {
+		log.Printf("inventory: 注册客户端未启动，宿主将看不到本模块：%v", err)
+	}
 	if err := mod.ListenAndServeAt(addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("inventory: %v", err)
 	}
@@ -94,6 +108,7 @@ func getStockAction() module.Action {
 		Version:         "0.1.0",
 		Title:           "查询在库量",
 		SummaryTemplate: "查询 {sku} 在库量",
+		RequiredArgs:    []string{"sku"},
 		Kind:            "read",
 		InputSchema: json.RawMessage(`{
   "type": "object",
@@ -117,12 +132,48 @@ func getStockAction() module.Action {
 	}
 }
 
+// listStockAction 供业务页面渲染库存表：一次返回全部 SKU 的在库量。
+//
+// 仍然走动作协议（而不是加一个 /ui 专用接口）：页面看到的值必须和执行用的是同一套
+// 状态与同一份契约，否则「页面显示 108、执行时却是 96」这种偏差没人能解释。
+func listStockAction() module.Action {
+	return module.Action{
+		ID:              actionListStock,
+		Version:         "0.1.0",
+		Title:           "库存快照",
+		SummaryTemplate: "列出全部 SKU 的在库量",
+		Kind:            "read",
+		InputSchema:     json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{}}`),
+		OutputSchema: json.RawMessage(`{
+  "type": "object",
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["sku", "onHand"],
+        "properties": {
+          "sku": {"type": "string"},
+          "onHand": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  }
+}`),
+		Risk:      module.Risk{Level: "low", Reversible: true},
+		TimeoutMs: 30000,
+		DryRun:    module.DryRunCapability{Supported: false},
+	}
+}
+
 func deductStockAction() module.Action {
 	return module.Action{
 		ID:              actionDeductStock,
 		Version:         "0.1.0",
 		Title:           "扣减库存",
 		SummaryTemplate: "扣减 {sku} 库存 {qty} 件（单据 {referenceNo}）",
+		RequiredArgs:    []string{"sku", "qty", "referenceNo"},
 		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
@@ -169,6 +220,7 @@ func releaseStockAction() module.Action {
 		Version:         "0.1.0",
 		Title:           "回补库存（扣减的补偿动作）",
 		SummaryTemplate: "回补 {sku} 库存 {qty} 件（单据 {referenceNo}）",
+		RequiredArgs:    []string{"sku", "qty", "referenceNo"},
 		Kind:            "write",
 		InputSchema: json.RawMessage(`{
   "type": "object",
@@ -257,6 +309,8 @@ func (s *store) handle(ctx context.Context, actionID string, args json.RawMessag
 	switch actionID {
 	case actionGetStock:
 		return s.getStock(args)
+	case actionListStock:
+		return s.listStock()
 	case actionDeductStock:
 		return s.applyStock(args, false)
 	case actionReleaseStock:
@@ -281,6 +335,18 @@ func (s *store) getStock(args json.RawMessage) (json.RawMessage, *protocol.Error
 		return nil, unknownSKU(in.SKU)
 	}
 	return mustJSON(getStockOutput{OnHand: onHand}), nil
+}
+
+// listStock 返回按 SKU 排序的全量快照（排序在服务端做：页面不该为了稳定顺序再排一次）。
+func (s *store) listStock() (json.RawMessage, *protocol.Error) {
+	s.mu.Lock()
+	items := make([]stockItem, 0, len(s.onHand))
+	for sku, qty := range s.onHand {
+		items = append(items, stockItem{SKU: sku, OnHand: qty})
+	}
+	s.mu.Unlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].SKU < items[j].SKU })
+	return mustJSON(listStockOutput{Items: items}), nil
 }
 
 // applyStock 同时实现扣减与回补：两者只差方向，业务级幂等口径完全一致。
@@ -389,6 +455,16 @@ type getStockInput struct {
 
 type getStockOutput struct {
 	OnHand int `json:"onHand"`
+}
+
+// stockItem 是库存快照的一行。
+type stockItem struct {
+	SKU    string `json:"sku"`
+	OnHand int    `json:"onHand"`
+}
+
+type listStockOutput struct {
+	Items []stockItem `json:"items"`
 }
 
 type stockWriteInput struct {

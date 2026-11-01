@@ -19,7 +19,8 @@
 // 而不是「执行了几个」，也因此 A 轮允许结局是 needs_human：D1 不要求 A 轮跑完。
 //
 // 前置条件（缺一样就会立刻失败并把原因写进报告）：
-//   - 宿主以 TENON_TEST_MODE=1 启动（POST /tenon/admin/modules 否则不存在）；
+//   - 宿主以 TENON_TEST_MODE=1 启动（GET/POST /tenon/admin/modules 否则不存在）；
+//     摘除模块与回读全量注册表都走这条仅测试态的端点；
 //   - 每个模块也以测试态启动（POST /tenon/admin/reset 否则 404，两轮输入就无法相同）；
 //   - agent 以 TENON_RESULT_FILE=<path> 启动，且与本 runner 的 --agent-result 一致。
 //
@@ -88,7 +89,10 @@ const (
 
 	adminModulesPath = "/tenon/admin/modules"
 	adminResetPath   = "/tenon/admin/reset"
-	modulesPath      = "/tenon/modules"
+	// modulesPath 是 agent 的可见视图（enabled && alive）。verifyDisabled **不读它**：
+	// 被摘除的模块在这个视图里根本不存在，无法区分「摘除」与「未登记」。保留这个常量
+	// 是为了让桩宿主与用例能表达「可见视图里没有它」这一事实。
+	modulesPath = "/tenon/modules"
 
 	// maxBodyBytes 是响应体上限：注册表与动作出参都是 KB 量级。
 	maxBodyBytes = 1 << 20
@@ -399,13 +403,19 @@ func (r *runner) disableModules(ctx context.Context) error {
 //
 // 只信 admin 端点的 200 是不够的：摘除没生效时 B 轮会因为别的原因失败（例如序列
 // 相同），理由就会指向 agent，而真正的问题在注册表。这里先把它钉死。
+//
+// 读的是 **GET /tenon/admin/modules**（全量视图，仅 TENON_TEST_MODE=1 挂载），不是
+// GET /tenon/modules：后者的语义是「agent 能看见什么」（enabled && alive），模块被摘除
+// 之后它根本不在响应里——那样「被摘除」与「从未登记」就无法区分，而本函数要断言的正是
+// 「条目还在、只是 enabled=false」。admin 端点与 POST 摘除是同一份 List() 视图。
 func (r *runner) verifyDisabled(ctx context.Context) error {
-	status, raw, err := r.get(ctx, r.cfg.Host+modulesPath)
+	status, raw, err := r.get(ctx, r.cfg.Host+adminModulesPath)
 	if err != nil {
-		return fmt.Errorf("GET %s 失败：%w", modulesPath, err)
+		return fmt.Errorf("GET %s 失败：%w", adminModulesPath, err)
 	}
 	if status != http.StatusOK {
-		return fmt.Errorf("GET %s 返回 %d：%s", modulesPath, status, snippet(raw))
+		return fmt.Errorf("GET %s 返回 %d：%s（宿主是否以 TENON_TEST_MODE=1 启动？）",
+			adminModulesPath, status, snippet(raw))
 	}
 	var resp struct {
 		Modules []struct {
@@ -414,7 +424,7 @@ func (r *runner) verifyDisabled(ctx context.Context) error {
 		} `json:"modules"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return fmt.Errorf("GET %s 的响应不是合法 JSON：%w", modulesPath, err)
+		return fmt.Errorf("GET %s 的响应不是合法 JSON：%w", adminModulesPath, err)
 	}
 	enabled := make(map[string]bool, len(resp.Modules))
 	for _, m := range resp.Modules {
@@ -423,7 +433,7 @@ func (r *runner) verifyDisabled(ctx context.Context) error {
 	for _, id := range r.removed {
 		on, found := enabled[id]
 		if !found {
-			return fmt.Errorf("注册表里没有模块 %q：它既不在场也谈不上被摘除", id)
+			return fmt.Errorf("管理面注册表里没有模块 %q：它既不在场也谈不上被摘除", id)
 		}
 		if on {
 			return fmt.Errorf("模块 %q 仍是 enabled=true：摘除没有落到注册表上", id)

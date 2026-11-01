@@ -330,9 +330,9 @@ func TestResumeExecutesAllStepsWithApprovedBy(t *testing.T) {
 		t.Fatalf("应归档 done，得到 %q", st)
 	}
 	// Step 0c：subject 要跟着 pending 回来，否则 effects.entities 退化成空数组。
-	dispatched := env.StepAudit(auditStageDispatched)
+	dispatched := env.StepAudit(auditStageResult)
 	if dispatched == nil {
-		t.Fatalf("缺步骤级 dispatched 审计")
+		t.Fatalf("缺步骤级 result 审计")
 	}
 	effects, _ := dispatched["effects"].(map[string]any)
 	entities, _ := effects["entities"].([]any)
@@ -342,7 +342,7 @@ func TestResumeExecutesAllStepsWithApprovedBy(t *testing.T) {
 	// 恢复不复用 round()：不重新规划、不重跑预演，闸门各一次、步骤两段、计划级一段收尾。
 	want := []string{
 		"policies:evaluate", "grants:evaluate",
-		"audit:dispatched", "execute", "audit:result",
+		"tickets:issue", "execute", "audit:result",
 		"audit:result",
 	}
 	if got := env.Trace[seeded:]; !equalSeq(got, want) {
@@ -382,9 +382,9 @@ func TestResumeStepAuditsCarryApprover(t *testing.T) {
 				"（schema：outcome=approve 时非空），实际 %#v", stage, decision["approvedBy"])
 		}
 	}
-	// 一步计划 = 一条 dispatched + 一条 result，两段都要带上审批人。
-	if stepRecords != 2 {
-		t.Fatalf("一步计划应有 2 条步骤级审计（dispatched + result），实际 %d 条", stepRecords)
+	// 一步计划只剩一条步骤级 result：dispatched 自 0.2.0 起由宿主在签票时写，
+	if stepRecords != 1 {
+		t.Fatalf("一步计划应有 1 条步骤级 result（dispatched 由宿主签票时写），实际 %d 条", stepRecords)
 	}
 
 	// 计划级 dispatched（suspend 写的）：此刻没人批过，必须仍是 null。

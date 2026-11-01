@@ -19,6 +19,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"tenon.dev/internal/protocol"
 )
 
 // boardExpiry 决定条目上写哪个 expiresAt。
@@ -77,6 +79,19 @@ func boardPayloadAt(p Pending, state PendingState, now time.Time) map[string]any
 	}
 	if p.RequestID != nil {
 		out["requestId"] = *p.RequestID
+	}
+	// steps 是审批依据，不是展示字段：宿主把它冻结成快照，签票时逐条比对。
+	// 只推摘要不推参数原文——公告板是 agent 推的，不该顺手把业务数据搬上页面。
+	if len(p.Plan.Steps) > 0 {
+		steps := make([]map[string]any, 0, len(p.Plan.Steps))
+		for _, st := range p.Plan.Steps {
+			steps = append(steps, map[string]any{
+				"stepId":   st.StepID,
+				"action":   st.Action,
+				"argsHash": protocol.ArgsHash(st.Args),
+			})
+		}
+		out["steps"] = steps
 	}
 	return out
 }
